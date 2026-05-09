@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+twilio==9.3.7
+google-cloud-bigquery==3.27.0
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
