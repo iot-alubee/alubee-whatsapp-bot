@@ -1,0 +1,16 @@
+.gcloudignore
+.git
+.gitignore
+
+alubee_flask_app/
+firebase-adminsdk.json
+*credentials*.json
+.env
+.env.*
+
+load_users.py
+load_vehicles.py
+*.ipynb
+__pycache__
+.venv
+venv

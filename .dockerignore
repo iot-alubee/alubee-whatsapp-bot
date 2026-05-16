@@ -1,0 +1,26 @@
+# Flask dashboard is a separate Cloud Run service
+alubee_flask_app/
+
+# Credentials — use ADC + IAM on Cloud Run
+firebase-adminsdk.json
+*credentials*.json
+*service*acc*.json
+.env
+.env.*
+
+# Dev / data scripts (not needed in the bot image)
+load_users.py
+load_vehicles.py
+test_firestore.ipynb
+*.ipynb
+
+.git
+.gitignore
+.dockerignore
+.gcloudignore
+__pycache__
+*.py[cod]
+.venv
+venv
+*.md
+!DEPLOY_BOT.md

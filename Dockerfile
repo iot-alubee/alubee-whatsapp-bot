@@ -1,14 +1,15 @@
-FROM python:3.11-slim-bookworm
+# WhatsApp bot — deploy from repo root (not alubee_flask_app)
+FROM python:3.11-slim
 
 WORKDIR /app
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+COPY main.py .
 
-# Cloud Run sets PORT. Proxy headers help Twilio validate signatures (https scheme).
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips='*'
+ENV PORT=8080
+ENV FIREBASE_PROJECT_ID=whatsapp-approval-system
+EXPOSE 8080
+
+CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT}
