@@ -524,10 +524,11 @@ def health():
 
 
 # =========================================================
-# WEBHOOK
+# WEBHOOK (Twilio must POST here; "/" also accepted if URL omits /webhook)
 # =========================================================
 
-@app.post("/webhook")
+@app.api_route("/webhook", methods=["POST"])
+@app.api_route("/", methods=["POST"])
 async def whatsapp_webhook(request: Request):
 
     form_data = await request.form()
