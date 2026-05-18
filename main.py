@@ -122,7 +122,7 @@ CONTENT_SID_OD_REASON = "HXb7fc34d81aedf34cf883b87e40136ee8"
 # Company vehicle yes/no (list items YES, NO)
 CONTENT_SID_COMPANY_VEHICLE = "HX3959a4bf26503ecfad21f0866cac50bd"
 
-# OD approval quick reply (manager + MD): {{1}} name, {{3}} reason, {{4}} dept; buttons Approve / DENY
+# OD approval quick reply (manager + MD): {{1}} name, {{2}} reason, {{4}} dept; buttons APPROVE / DENY
 CONTENT_SID_OD_APPROVAL = "HX78da53a160efba6b6c7c6e23daac0ba5"
 
 # MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
@@ -226,7 +226,7 @@ def _same_whatsapp(a: str, b: str) -> bool:
 
 
 def _approval_reason_text(request_data: dict, reason: str = "") -> str:
-    """Reason line for approval template {{3}} (includes company vehicle if set)."""
+    """Reason line for approval template {{2}} (includes company vehicle if set)."""
     base = (reason or (request_data or {}).get("reason") or "").strip()
     if (request_data or {}).get("uses_company_vehicle") and (
         request_data or {}
@@ -242,11 +242,11 @@ def _od_content_variables(
     request_id,
     department,
 ) -> str:
-    """Twilio od_approval_template: {{1}} employee, {{3}} reason, {{4}} department."""
+    """Twilio od_approval_template: {{1}} employee, {{2}} reason, {{4}} department."""
     return _content_variables_json(
         **{
             "1": _chat_name(employee_name),
-            "3": reason or "",
+            "2": reason or "",
             "4": department or "—",
         }
     )
