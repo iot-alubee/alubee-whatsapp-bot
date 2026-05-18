@@ -35,12 +35,7 @@ VEHICLES = [
     ("V010", "KA 51 AG 3271", "DOST", "FOUR WHEELER"),
     ("V011", "KA 51 AJ 2568", "DOST", "FOUR WHEELER"),
     ("V012", "TN 20 AQ 2004", "SANTRO", "CAR"),
-    ("V013", "KA 51 MC 8774", "SWIFT", "CAR"),
-    ("V014", "TN 70 E 1666", "SANTA FE", "CAR"),
-    ("V015", "KA 51 MK 6465", "IGNIS", "CAR"),
-    ("V016", "KA 41 ME 1111", "BENZ", "CAR"),
-    ("V017", "TN 70 AL 7997", "BREZZA", "CAR"),
-    ("V018", "TN 11 BM 0011", "THAR", "CAR"),
+    ("V013", "TN 70 E 1666", "SANTA FE", "CAR"),
 ]
 
 

@@ -104,17 +104,17 @@ if _running_on_cloud_run() and (
         "TWILIO_WHATSAPP_NUMBER environment variables."
     )
 
-# List picker: main menu after Hi (variable {{1}} = employee name in template body)
-CONTENT_SID_LIST_PICKER_MENU = "HXa158841c1a5f69c9d710c5bee9a3edfc"
+# List picker: request_form_selector ({{1}} = name; items OD_REQUEST, VEHICLE_REQUEST, …)
+CONTENT_SID_LIST_PICKER_MENU = "HX56b7b338c394e71733798f3bf1745150"
 
 # OD reason: quick reply (UNIT_I, UNIT_II, OTHER — if OTHER, user types reason next)
-CONTENT_SID_OD_REASON = "HXb7fc34d81aedf34cf883b87e40136ee8"
+CONTENT_SID_OD_REASON = "HX6fe91fe33ea5c4199a0bf9bc5d3d7e19"
 
 # Company vehicle yes/no (list items YES, NO)
-CONTENT_SID_COMPANY_VEHICLE = "HX3959a4bf26503ecfad21f0866cac50bd"
+CONTENT_SID_COMPANY_VEHICLE = "HX0f96bda3d09c5727cd1d22b665207d27"
 
-# interactive template SID (manager + MD use same Content / buttons)
-CONTENT_SID = "HX78da53a160efba6b6c7c6e23daac0ba5"
+# OD approval quick reply (manager + MD): {{1}} name, {{3}} reason, {{4}} dept; buttons Approve / DENY
+CONTENT_SID_OD_APPROVAL = "HX254119eaa8782170b0000a9390b3000f"
 
 # MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
 MD_WHATSAPP_NUMBER = os.getenv(
@@ -178,6 +178,28 @@ def _list_picker_menu_variables(employee_name) -> str:
     return json.dumps({"1": _chat_name(employee_name)})
 
 
+def _parse_incoming_choice(form_data) -> str:
+    """Prefer list/button IDs from Twilio templates; fall back to Body or numbers."""
+    list_id = (form_data.get("ListId") or "").strip()
+    if list_id:
+        return list_id
+    button_payload = (form_data.get("ButtonPayload") or "").strip()
+    if button_payload:
+        return button_payload
+    body = (form_data.get("Body") or "").strip()
+    if not body:
+        return ""
+    key = body.lower()
+    menu_titles = {
+        "od request": "OD_REQUEST",
+        "vehicle request": "VEHICLE_REQUEST",
+        "leave request": "LEAVE_REQUEST",
+        "permission request": "PERMISSION_REQUEST",
+        "visitor request": "VISITOR_REQUEST",
+    }
+    return menu_titles.get(key, body)
+
+
 def _same_whatsapp(a: str, b: str) -> bool:
     if not a or not b:
         return False
@@ -191,14 +213,50 @@ def _od_content_variables(
     request_id,
     department,
 ) -> str:
-    """Twilio Content variables: 1=name, 2=reason, 3=request id, 4=department (add {{4}} in template)."""
+    """Twilio od_approval_template: {{1}} employee, {{3}} reason, {{4}} department."""
     dept = (department or "").strip() or "—"
     return json.dumps({
         "1": _chat_name(employee_name),
-        "2": reason or "",
-        "3": request_id,
+        "3": reason or "",
         "4": dept,
     })
+
+
+def _set_pending_approval_session(recipient: str, request_id: str) -> None:
+    """Link Approve/DENY taps (fixed button IDs) to this request for manager/MD."""
+    db.collection("sessions").document(recipient).set({
+        "state": "WAITING_APPROVAL_ACTION",
+        "approval_request_id": request_id,
+    })
+
+
+def _resolve_approval_request_id(incoming_msg: str, approver: str):
+    """Return (is_approve, request_id) or (None, None) if not an approval message."""
+    raw = (incoming_msg or "").strip()
+    um = raw.upper()
+    if um.startswith("APPROVE_"):
+        rid = raw.split("_", 1)[1].strip()
+        return (True, rid) if rid else (None, None)
+    if um.startswith("DENY_"):
+        rid = raw.split("_", 1)[1].strip()
+        return (False, rid) if rid else (None, None)
+    if raw in ("Approve", "APPROVE") or um == "APPROVE":
+        snap = db.collection("sessions").document(approver).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            if data.get("state") == "WAITING_APPROVAL_ACTION":
+                rid = (data.get("approval_request_id") or "").strip()
+                if rid:
+                    return True, rid
+    if raw in ("Deny", "DENY") or um == "DENY":
+        snap = db.collection("sessions").document(approver).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            if data.get("state") == "WAITING_APPROVAL_ACTION":
+                rid = (data.get("approval_request_id") or "").strip()
+                if rid:
+                    return False, rid
+    return None, None
 
 
 def _vehicles_currently_out_ids():
@@ -319,7 +377,7 @@ def _notify_md_for_request(request_id: str, request_data: dict):
         tw_msg = client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
             to=MD_WHATSAPP_NUMBER,
-            content_sid=CONTENT_SID,
+            content_sid=CONTENT_SID_OD_APPROVAL,
             content_variables=_od_content_variables(
                 employee_name=request_data.get("employee_name"),
                 reason=request_data.get("reason"),
@@ -327,6 +385,7 @@ def _notify_md_for_request(request_id: str, request_data: dict):
                 department=request_data.get("department"),
             ),
         )
+        _set_pending_approval_session(MD_WHATSAPP_NUMBER, request_id)
         print(
             "MD approval request sent:",
             "to=", MD_WHATSAPP_NUMBER,
@@ -402,7 +461,7 @@ def _submit_od_request(
     client.messages.create(
         from_=TWILIO_WHATSAPP_NUMBER,
         to=manager_number,
-        content_sid=CONTENT_SID,
+        content_sid=CONTENT_SID_OD_APPROVAL,
         content_variables=_od_content_variables(
             employee_name=employee_name,
             reason=reason_for_approval,
@@ -410,6 +469,7 @@ def _submit_od_request(
             department=department,
         ),
     )
+    _set_pending_approval_session(manager_number, request_id)
 
     db.collection("sessions").document(sender).delete()
     msg = "OD is Submitted."
@@ -534,11 +594,9 @@ async def whatsapp_webhook(request: Request):
     form_data = await request.form()
     print("Body:", form_data.get("Body"))
     print("ButtonPayload:", form_data.get("ButtonPayload"))
+    print("ListId:", form_data.get("ListId"))
 
-    incoming_msg = form_data.get("Body", "").strip()
-    button_payload = form_data.get("ButtonPayload", "").strip()
-    if button_payload:
-        incoming_msg = button_payload
+    incoming_msg = _parse_incoming_choice(form_data)
     sender = form_data.get("From", "")
 
     print("===================================")
@@ -645,82 +703,81 @@ async def whatsapp_webhook(request: Request):
 
         else:
 
-            um = incoming_msg.upper()
+            approval = _resolve_approval_request_id(incoming_msg, sender)
+            if approval[0] is not None:
 
-            if um.startswith("APPROVE_") or um.startswith("DENY_"):
+                is_approve, request_id = approval
+                request_ref = db.collection("requests").document(request_id)
+                snap = request_ref.get()
 
-                parts = incoming_msg.split("_", 1)
-                if len(parts) < 2 or not parts[1].strip():
-                    print("Approve/deny: invalid command format")
+                if not snap.exists:
+                    print("Approve/deny: request not found", request_id)
                 else:
-                    request_id = parts[1].strip()
-                    request_ref = db.collection("requests").document(request_id)
-                    snap = request_ref.get()
+                    rd = snap.to_dict()
+                    mgr_pending = rd.get("manager_status") == "PENDING"
+                    md_waiting = (
+                        rd.get("manager_status") == "APPROVED"
+                        and rd.get("md_status") == "PENDING"
+                    )
+                    handled = False
 
-                    if not snap.exists:
-                        print("Approve/deny: request not found", request_id)
-                    else:
-                        rd = snap.to_dict()
-                        is_approve = um.startswith("APPROVE_")
-                        mgr_pending = rd.get("manager_status") == "PENDING"
-                        md_waiting = (
-                            rd.get("manager_status") == "APPROVED"
-                            and rd.get("md_status") == "PENDING"
-                        )
-
-                        if (
-                            md_waiting
-                            and MD_WHATSAPP_NUMBER
-                            and _same_whatsapp(sender, MD_WHATSAPP_NUMBER)
-                        ):
-                            if is_approve:
-                                request_ref.update({
-                                    "md_status": "APPROVED",
-                                    "approved_datetime": _utcnow(),
-                                })
-                                client.messages.create(
-                                    from_=TWILIO_WHATSAPP_NUMBER,
-                                    to=rd["employee"],
-                                    body="Your OD has been Approved.",
-                                )
-                            else:
-                                request_ref.update({"md_status": "DENIED"})
-                                client.messages.create(
-                                    from_=TWILIO_WHATSAPP_NUMBER,
-                                    to=rd["employee"],
-                                    body="Your OD request was not approved.",
-                                )
-
-                        elif mgr_pending and _same_whatsapp(sender, rd.get("manager")):
-                            if is_approve:
-                                if not MD_WHATSAPP_NUMBER:
-                                    print(
-                                        "Manager approve: MD_WHATSAPP_NUMBER not set; "
-                                        "cannot complete flow",
-                                        request_id,
-                                    )
-                                else:
-                                    request_ref.update({
-                                        "manager_status": "APPROVED",
-                                        "md_status": "PENDING",
-                                    })
-                                    _notify_md_for_request(request_id, rd)
-                            else:
-                                request_ref.update({
-                                    "manager_status": "DENIED",
-                                    "md_status": "N/A",
-                                })
-                                client.messages.create(
-                                    from_=TWILIO_WHATSAPP_NUMBER,
-                                    to=rd["employee"],
-                                    body="Your OD request was not approved.",
-                                )
-
-                        else:
-                            print(
-                                "Approve/deny: unauthorized or wrong state",
-                                request_id,
+                    if (
+                        md_waiting
+                        and MD_WHATSAPP_NUMBER
+                        and _same_whatsapp(sender, MD_WHATSAPP_NUMBER)
+                    ):
+                        if is_approve:
+                            request_ref.update({
+                                "md_status": "APPROVED",
+                                "approved_datetime": _utcnow(),
+                            })
+                            client.messages.create(
+                                from_=TWILIO_WHATSAPP_NUMBER,
+                                to=rd["employee"],
+                                body="Your OD has been Approved.",
                             )
+                        else:
+                            request_ref.update({"md_status": "DENIED"})
+                            client.messages.create(
+                                from_=TWILIO_WHATSAPP_NUMBER,
+                                to=rd["employee"],
+                                body="Your OD request was not approved.",
+                            )
+                        handled = True
+
+                    elif mgr_pending and _same_whatsapp(sender, rd.get("manager")):
+                        if is_approve:
+                            if not MD_WHATSAPP_NUMBER:
+                                print(
+                                    "Manager approve: MD_WHATSAPP_NUMBER not set; "
+                                    "cannot complete flow",
+                                    request_id,
+                                )
+                            else:
+                                request_ref.update({
+                                    "manager_status": "APPROVED",
+                                    "md_status": "PENDING",
+                                })
+                                _notify_md_for_request(request_id, rd)
+                        else:
+                            request_ref.update({
+                                "manager_status": "DENIED",
+                                "md_status": "N/A",
+                            })
+                            client.messages.create(
+                                from_=TWILIO_WHATSAPP_NUMBER,
+                                to=rd["employee"],
+                                body="Your OD request was not approved.",
+                            )
+                        handled = True
+
+                    if handled:
+                        db.collection("sessions").document(sender).delete()
+                    else:
+                        print(
+                            "Approve/deny: unauthorized or wrong state",
+                            request_id,
+                        )
 
             else:
 
