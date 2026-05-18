@@ -132,7 +132,7 @@ CONTENT_SID_OD_APPROVAL = "HX78da53a160efba6b6c7c6e23daac0ba5"
 # MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
 MD_WHATSAPP_NUMBER = os.getenv(
     "MD_WHATSAPP_NUMBER",
-    "whatsapp:+917538866308",
+    "whatsapp:+916374941546",
 ).strip()
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
