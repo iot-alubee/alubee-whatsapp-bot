@@ -1,4 +1,4 @@
-# WhatsApp bot — deploy from repo root (not alubee_flask_app)
+# Alubee WhatsApp bot — deploy from this folder only (Google Cloud Run)
 FROM python:3.11-slim
 
 WORKDIR /app
