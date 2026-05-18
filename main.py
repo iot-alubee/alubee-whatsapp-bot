@@ -104,6 +104,10 @@ TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
 TWILIO_WHATSAPP_NUMBER = (
     os.getenv("TWILIO_WHATSAPP_NUMBER") or "whatsapp:+14155238886"
 ).strip()
+# Optional: Messaging Service (MG…) with this WhatsApp sender in its pool — recommended for Content templates
+TWILIO_MESSAGING_SERVICE_SID = (
+    os.getenv("TWILIO_MESSAGING_SERVICE_SID") or ""
+).strip()
 
 if _running_on_cloud_run() and (
     not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_NUMBER
@@ -122,7 +126,7 @@ CONTENT_SID_OD_REASON = "HXb7fc34d81aedf34cf883b87e40136ee8"
 # Company vehicle yes/no (list items YES, NO)
 CONTENT_SID_COMPANY_VEHICLE = "HX3959a4bf26503ecfad21f0866cac50bd"
 
-# OD approval quick reply (manager + MD): {{1}} name, {{2}} reason, {{4}} dept; buttons APPROVE / DENY
+# OD approval quick reply (manager + MD): {{1}} employee, {{2}} dept, {{3}} reason; buttons APPROVE / DENY
 CONTENT_SID_OD_APPROVAL = "HX78da53a160efba6b6c7c6e23daac0ba5"
 
 # MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
@@ -225,14 +229,15 @@ def _same_whatsapp(a: str, b: str) -> bool:
     return a.strip().lower() == b.strip().lower()
 
 
-def _approval_reason_text(request_data: dict, reason: str = "") -> str:
-    """Reason line for approval template {{2}} (includes company vehicle if set)."""
-    base = (reason or (request_data or {}).get("reason") or "").strip()
-    if (request_data or {}).get("uses_company_vehicle") and (
-        request_data or {}
-    ).get("company_vehicle_description"):
-        return f"{base} (Vehicle: {request_data['company_vehicle_description']})"
-    return base
+def _department_for_template(request_data: dict | None = None) -> str:
+    """Approval template {{2}} — employee department from Firestore users / request doc only."""
+    dept = ((request_data or {}).get("department") or "").strip()
+    return dept or "—"
+
+
+def _reason_for_template(request_data: dict | None = None, reason: str = "") -> str:
+    """Approval template {{3}} — OD reason selection (Unit I / Unit II / typed), not department or vehicle."""
+    return (reason or (request_data or {}).get("reason") or "").strip()
 
 
 def _od_content_variables(
@@ -242,14 +247,69 @@ def _od_content_variables(
     request_id,
     department,
 ) -> str:
-    """Twilio od_approval_template: {{1}} employee, {{2}} reason, {{4}} department."""
+    """Twilio od_approval_template: {{1}} employee, {{2}} department, {{3}} reason."""
     return _content_variables_json(
         **{
             "1": _chat_name(employee_name),
-            "2": reason or "",
-            "4": department or "—",
+            "2": department or "—",
+            "3": reason or "",
         }
     )
+
+
+def _twilio_outbound_kwargs(to: str) -> dict:
+    """from_ or Messaging Service — never pass body with content templates."""
+    to = (to or "").strip()
+    if TWILIO_MESSAGING_SERVICE_SID:
+        return {"messaging_service_sid": TWILIO_MESSAGING_SERVICE_SID, "to": to}
+    return {"from_": TWILIO_WHATSAPP_NUMBER, "to": to}
+
+
+def _send_od_approval_template(
+    to: str,
+    *,
+    employee_name,
+    reason,
+    department,
+    request_id: str = "",
+) -> bool:
+    """
+    Manager/MD approval — must use ContentSid (error 63016 if plain body outside 24h).
+    """
+    vars_json = _od_content_variables(
+        employee_name=employee_name,
+        reason=reason,
+        request_id=request_id,
+        department=department,
+    )
+    try:
+        tw_msg = client.messages.create(
+            **_twilio_outbound_kwargs(to),
+            content_sid=CONTENT_SID_OD_APPROVAL,
+            content_variables=vars_json,
+        )
+        err = getattr(tw_msg, "error_code", None)
+        print(
+            "OD approval template:",
+            "to=", to,
+            "request_id=", request_id,
+            "sid=", tw_msg.sid,
+            "status=", tw_msg.status,
+            "error_code=", err,
+            "content_sid=", CONTENT_SID_OD_APPROVAL,
+            "content_variables=", vars_json,
+        )
+        return not err
+    except Exception as e:
+        print(
+            "OD approval template send failed:",
+            "to=", to,
+            "request_id=", request_id,
+            repr(e),
+            "content_sid=", CONTENT_SID_OD_APPROVAL,
+            "content_variables=", vars_json,
+        )
+        return False
 
 
 def _set_pending_approval_session(recipient: str, request_id: str) -> None:
@@ -489,29 +549,14 @@ def _notify_md_for_request(request_id: str, request_data: dict):
     if not MD_WHATSAPP_NUMBER:
         print("MD notify skipped: MD_WHATSAPP_NUMBER not set", request_id)
         return
-    try:
-        tw_msg = client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=MD_WHATSAPP_NUMBER,
-            content_sid=CONTENT_SID_OD_APPROVAL,
-            content_variables=_od_content_variables(
-                employee_name=request_data.get("employee_name"),
-                reason=_approval_reason_text(request_data),
-                request_id=request_id,
-                department=request_data.get("department"),
-            ),
-        )
+    if _send_od_approval_template(
+        MD_WHATSAPP_NUMBER,
+        employee_name=request_data.get("employee_name"),
+        reason=_reason_for_template(request_data),
+        department=_department_for_template(request_data),
+        request_id=request_id,
+    ):
         _set_pending_approval_session(MD_WHATSAPP_NUMBER, request_id)
-        print(
-            "MD approval request sent:",
-            "to=", MD_WHATSAPP_NUMBER,
-            "request_id=", request_id,
-            "sid=", tw_msg.sid,
-            "status=", tw_msg.status,
-            "error_code=", getattr(tw_msg, "error_code", None),
-        )
-    except Exception as e:
-        print("MD notify failed:", request_id, repr(e))
 
 
 def _submit_od_request(
@@ -570,25 +615,20 @@ def _submit_od_request(
 
     print("Request ID:", request_id)
 
-    approval_payload = {
-        "employee_name": employee_name,
-        "department": department,
-        "uses_company_vehicle": uses_company_vehicle,
-        "company_vehicle_description": company_vehicle_description,
-        "reason": reason,
-    }
-    client.messages.create(
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=manager_number,
-        content_sid=CONTENT_SID_OD_APPROVAL,
-        content_variables=_od_content_variables(
-            employee_name=employee_name,
-            reason=_approval_reason_text(approval_payload, reason),
-            request_id=request_id,
-            department=department,
-        ),
-    )
-    _set_pending_approval_session(manager_number, request_id)
+    if _send_od_approval_template(
+        manager_number,
+        employee_name=employee_name,
+        reason=_reason_for_template(reason=reason),
+        department=_department_for_template({"department": department}),
+        request_id=request_id,
+    ):
+        _set_pending_approval_session(manager_number, request_id)
+    else:
+        print(
+            "Manager approval template not delivered; request_id=",
+            request_id,
+            "manager=", manager_number,
+        )
 
     db.collection("sessions").document(sender).delete()
     msg = "OD is Submitted."
