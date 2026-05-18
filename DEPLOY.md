@@ -50,6 +50,11 @@ Cloud Run → service → **Edit revision** → **Variables and secrets**:
 | `TWILIO_WHATSAPP_NUMBER` | Yes | e.g. `whatsapp:+91XXXXXXXXXX` |
 | `FIREBASE_PROJECT_ID` | Yes | `whatsapp-approval-system` (also set in Dockerfile) |
 | `MD_WHATSAPP_NUMBER` | Recommended | MD WhatsApp id for final approval |
+| `TWILIO_MESSAGING_SERVICE_SID` | **Yes (production)** | `MG…` — add **+917397743357** to this service’s sender pool |
+
+Without `TWILIO_MESSAGING_SERVICE_SID`, manager/MD approval templates often fail with **63016** until they send **Hi** (24h session workaround).
+
+**Create Messaging Service:** Twilio → Messaging → Services → Create → Senders → add your WhatsApp number → copy `MGxxxxxxxx`.
 
 **Do not set** on Cloud Run (disabled keys cause JWT errors):
 

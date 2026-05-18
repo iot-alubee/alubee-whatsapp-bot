@@ -104,7 +104,7 @@ TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
 TWILIO_WHATSAPP_NUMBER = (
     os.getenv("TWILIO_WHATSAPP_NUMBER") or "whatsapp:+14155238886"
 ).strip()
-# Optional: Messaging Service (MG…) with this WhatsApp sender in its pool — recommended for Content templates
+# Messaging Service (MG…) + WhatsApp sender in pool — required for templates outside 24h (manager/MD)
 TWILIO_MESSAGING_SERVICE_SID = (
     os.getenv("TWILIO_MESSAGING_SERVICE_SID") or ""
 ).strip()
@@ -136,6 +136,12 @@ MD_WHATSAPP_NUMBER = os.getenv(
 ).strip()
 
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+if _running_on_cloud_run() and not TWILIO_MESSAGING_SERVICE_SID:
+    logger.warning(
+        "TWILIO_MESSAGING_SERVICE_SID is not set. Approval templates to manager/MD "
+        "may fail with error 63016 until they message this number (24h window)."
+    )
 
 
 REQUEST_CANNOT_BE_RAISED_MSG = (
@@ -258,10 +264,14 @@ def _od_content_variables(
 
 
 def _twilio_outbound_kwargs(to: str) -> dict:
-    """from_ or Messaging Service — never pass body with content templates."""
+    """WhatsApp Content API: MG service + from_ sender; never pass body with content_sid."""
     to = (to or "").strip()
     if TWILIO_MESSAGING_SERVICE_SID:
-        return {"messaging_service_sid": TWILIO_MESSAGING_SERVICE_SID, "to": to}
+        return {
+            "messaging_service_sid": TWILIO_MESSAGING_SERVICE_SID,
+            "from_": TWILIO_WHATSAPP_NUMBER,
+            "to": to,
+        }
     return {"from_": TWILIO_WHATSAPP_NUMBER, "to": to}
 
 
@@ -471,8 +481,7 @@ def _send_company_vehicle_yes_no(sender: str) -> bool:
     """Send Company Vehicle? template. Returns True if sent OK."""
     try:
         tw_msg = client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=sender,
+            **_twilio_outbound_kwargs(sender),
             content_sid=CONTENT_SID_COMPANY_VEHICLE,
         )
         print(
@@ -786,8 +795,7 @@ async def whatsapp_webhook(request: Request):
             menu_vars = _list_picker_menu_variables(employee_name)
             try:
                 tw_msg = client.messages.create(
-                    from_=TWILIO_WHATSAPP_NUMBER,
-                    to=sender,
+                    **_twilio_outbound_kwargs(sender),
                     content_sid=CONTENT_SID_LIST_PICKER_MENU,
                     content_variables=menu_vars,
                 )
@@ -838,8 +846,7 @@ async def whatsapp_webhook(request: Request):
 
             try:
                 tw_msg = client.messages.create(
-                    from_=TWILIO_WHATSAPP_NUMBER,
-                    to=sender,
+                    **_twilio_outbound_kwargs(sender),
                     content_sid=CONTENT_SID_OD_REASON,
                 )
                 print(

@@ -2,5 +2,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
-twilio
+twilio>=9.0.0
 firebase-admin
