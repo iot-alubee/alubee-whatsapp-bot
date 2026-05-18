@@ -114,16 +114,16 @@ if _running_on_cloud_run() and (
     )
 
 # List picker: request_form_selector (body uses {{1}} = employee name)
-CONTENT_SID_LIST_PICKER_MENU = "HX36b7b338c394e71733798f3bf1745150"
+CONTENT_SID_LIST_PICKER_MENU = "HXa158841c1a5f69c9d710c5bee9a3edfc"
 
 # OD reason: quick reply (UNIT_I, UNIT_II, OTHER — if OTHER, user types reason next)
-CONTENT_SID_OD_REASON = "HX6fe91feaaea6c4199a0bf9bc5d3d7e19"
+CONTENT_SID_OD_REASON = "HXb7fc34d81aedf34cf883b87e40136ee8"
 
 # Company vehicle yes/no (list items YES, NO)
-CONTENT_SID_COMPANY_VEHICLE = "HX0f96bda3d09d5727cd1d22b665207d27"
+CONTENT_SID_COMPANY_VEHICLE = "HX3959a4bf26503ecfad21f0866cac50bd"
 
 # OD approval quick reply (manager + MD): {{1}} name, {{3}} reason, {{4}} dept; buttons Approve / DENY
-CONTENT_SID_OD_APPROVAL = "HX254119eaa6782170b0000d9390b3000f"
+CONTENT_SID_OD_APPROVAL = "HX78da53a160efba6b6c7c6e23daac0ba5"
 
 # MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
 MD_WHATSAPP_NUMBER = os.getenv(
