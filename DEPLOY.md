@@ -65,8 +65,8 @@ Service → **Edit revision** → **Variables and secrets**:
 |----------|----------|---------|
 | `INTERAKT_API_KEY` | **Yes** | From [Developer settings](https://app.interakt.ai/settings/developer-setting) |
 | `FIREBASE_PROJECT_ID` | Yes | `whatsapp-approval-system` |
-| `MANAGER_WHATSAPP_NUMBER` | Yes | `whatsapp:+919994246682` |
-| `JMD_WHATSAPP_NUMBER` | Yes | `whatsapp:+917339221730` |
+| `JMD_I_WHATSAPP_NUMBER` | Yes | JMD1 employees — `whatsapp:+917339221730` |
+| `JMD_II_WHATSAPP_NUMBER` | Yes | JMD2 employees — `whatsapp:+919659756070` |
 | `MD_WHATSAPP_NUMBER` | Yes | `whatsapp:+917538866308` |
 | `WHATSAPP_SESSION_HOURS` | No | `24` (default) |
 
@@ -92,13 +92,19 @@ Expected JSON includes `"status":"ok"` and `"api_key_set":true`.
 
 ## 6. Sync code before redeploy
 
-After editing `../main.py` or `../interakt_api.py` locally:
+After editing `../main.py` or `../interakt_api.py` locally, copy into this folder and keep the Cloud Run bootstrap in `main.py` (ADC on Cloud Run, optional `.env` when testing this folder locally):
 
 ```powershell
-Copy-Item ..\main.py .\main.py
-Copy-Item ..\interakt_api.py .\interakt_api.py
+cd "path\to\alubee-whatsapp-bot-system\Interakt\Production"
+Copy-Item ..\main.py .\main.py -Force
+Copy-Item ..\interakt_api.py .\interakt_api.py -Force
+# Restore Production-only blocks in main.py: _running_on_cloud_run, _init_firebase, health runtime
 ```
 
-Then re-apply Cloud Run–specific changes in this folder’s `main.py` if you maintain them only here, or keep Cloud Run logic in the parent and copy wholesale.
+Or deploy from this folder after it has been synced (current `main.py` / `interakt_api.py` match parent + Cloud Run).
+
+**Approval flow:** Employee → **JMD I** or **JMD II** (per user `jmd_route` from `load_users.py`) → **MD**. No manager step.
+
+**Firestore users:** Run `python load_users.py` from repo root after changing `EMPLOYEES` so `jmd_route` is set on each user.
 
 This image has **no** `.env` file. All config comes from Cloud Run env vars.

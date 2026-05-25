@@ -66,7 +66,7 @@ def _cloud_run_metadata_credentials_env():
 
 FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "whatsapp-approval-system").strip()
 
-# Global approval chain for all employees (10-digit mobiles → whatsapp:+91…)
+# Approver numbers (10-digit mobiles → whatsapp:+91…)
 def _wa_from_mobile(mobile: str) -> str:
     digits = "".join(c for c in (mobile or "") if c.isdigit())
     if len(digits) == 10:
@@ -76,17 +76,19 @@ def _wa_from_mobile(mobile: str) -> str:
     return ""
 
 
-MANAGER_WHATSAPP_NUMBER = (
-    os.getenv("MANAGER_WHATSAPP_NUMBER") or _wa_from_mobile("9994246682")
+JMD_I_WHATSAPP_NUMBER = (
+    os.getenv("JMD_I_WHATSAPP_NUMBER")
+    or os.getenv("JMD_WHATSAPP_NUMBER")
+    or _wa_from_mobile("7339221730")
 ).strip()
-JMD_WHATSAPP_NUMBER = (
-    os.getenv("JMD_WHATSAPP_NUMBER") or _wa_from_mobile("7339221730")
+JMD_II_WHATSAPP_NUMBER = (
+    os.getenv("JMD_II_WHATSAPP_NUMBER") or _wa_from_mobile("9659756070")
 ).strip()
 MD_WHATSAPP_NUMBER = (
     os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
 ).strip()
 
-# WhatsApp session window for outbound session messages (manager/JMD/MD approval).
+# WhatsApp session window for outbound session messages (JMD/MD approval).
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
 
 REQUEST_CANNOT_BE_RAISED_MSG = "This request cannot be raised now. Thanks!"
@@ -433,30 +435,57 @@ def _resolve_approval(incoming: str, approver: str):
     return None, None
 
 
-def _build_approval_chain(_user_data: dict | None = None) -> dict | None:
-    """Employee → Manager → JMD → MD (final). Same approvers for every employee."""
-    manager = MANAGER_WHATSAPP_NUMBER
-    jmd = JMD_WHATSAPP_NUMBER
-    md = MD_WHATSAPP_NUMBER
-    if not manager or not jmd or not md:
+def _jmd_route_from_names(mgr_l1_name: str, mgr_l2_name: str) -> str:
+    """JMD1 or JMD2 from spreadsheet name columns (L2 checked first, then L1)."""
+    for name in (mgr_l2_name, mgr_l1_name):
+        key = (name or "").strip().upper().replace(" ", "")
+        if key == "JMD2":
+            return "JMD2"
+        if key == "JMD1":
+            return "JMD1"
+    return "JMD1"
+
+
+def _jmd_whatsapp_for_route(jmd_route: str) -> str:
+    if (jmd_route or "").strip().upper() == "JMD2":
+        return JMD_II_WHATSAPP_NUMBER
+    return JMD_I_WHATSAPP_NUMBER
+
+
+def _request_jmd_whatsapp(rd: dict) -> str:
+    """Resolve JMD WhatsApp from jmd_route (env), not a stale stored jmd number."""
+    route = (rd.get("jmd_route") or "").strip().upper()
+    if route in ("JMD1", "JMD2"):
+        return _jmd_whatsapp_for_route(route)
+    stored = (rd.get("jmd") or "").strip()
+    if stored:
+        return stored
+    return JMD_I_WHATSAPP_NUMBER
+
+
+def _build_approval_chain(user_data: dict | None = None) -> dict | None:
+    """Employee → JMD1 or JMD2 (per employee) → MD (final)."""
+    if not user_data:
         return None
-    return {"manager": manager, "jmd": jmd, "md": md}
+    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
+    jmd = _jmd_whatsapp_for_route(jmd_route)
+    md = MD_WHATSAPP_NUMBER
+    if not jmd or not md:
+        return None
+    return {
+        "jmd": jmd,
+        "jmd_route": jmd_route,
+        "md": md,
+    }
 
 
 def _approval_role(sender: str, rd: dict) -> str | None:
-    """Manager → JMD → MD (final). Uses global .env numbers, not stale request fields."""
-    mgr_st = (rd.get("manager_status") or "").strip().upper()
+    """JMD (I or II on request) → MD (final)."""
     jmd_st = (rd.get("jmd_status") or "").strip().upper()
     md_st = (rd.get("md_status") or "").strip().upper()
+    jmd_wa = _request_jmd_whatsapp(rd)
 
-    if _same_whatsapp(sender, MANAGER_WHATSAPP_NUMBER) and mgr_st == "PENDING":
-        return "manager"
-
-    if (
-        _same_whatsapp(sender, JMD_WHATSAPP_NUMBER)
-        and mgr_st == "APPROVED"
-        and jmd_st == "PENDING"
-    ):
+    if _same_whatsapp(sender, jmd_wa) and jmd_st in ("PENDING", "AWAITING_MANAGER"):
         return "jmd"
 
     if (
@@ -499,54 +528,29 @@ def _handle_approval_gate(sender: str, incoming: str) -> bool:
     role = _approval_role(sender, rd)
     if not role:
         logger.warning(
-            "approval ignored sender=%s request_id=%s mgr=%s jmd=%s md=%s",
+            "approval ignored sender=%s request_id=%s jmd=%s md=%s",
             sender,
             request_id,
-            rd.get("manager_status"),
             rd.get("jmd_status"),
             rd.get("md_status"),
         )
         return True
 
-    if role == "manager":
+    if role == "jmd":
         if is_approve:
             ref.update({
-                "manager": MANAGER_WHATSAPP_NUMBER,
-                "jmd": JMD_WHATSAPP_NUMBER,
+                "jmd": _request_jmd_whatsapp(rd),
+                "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
                 "md": MD_WHATSAPP_NUMBER,
-                "manager_status": "APPROVED",
-                "jmd_status": "PENDING",
-                "md_status": "AWAITING_JMD",
-            })
-            _notify_approver(JMD_WHATSAPP_NUMBER, rd, request_id)
-            logger.info("manager approved request_id=%s", request_id)
-        else:
-            ref.update({
-                "manager_status": "DENIED",
-                "jmd_status": "N/A",
-                "md_status": "N/A",
-            })
-            _send_to(employee, "Your OD request was not approved.")
-            logger.info("manager denied request_id=%s", request_id)
-
-    elif role == "jmd":
-        if is_approve:
-            ref.update({
-                "manager": MANAGER_WHATSAPP_NUMBER,
-                "jmd": JMD_WHATSAPP_NUMBER,
-                "md": MD_WHATSAPP_NUMBER,
+                "manager_status": "N/A",
                 "jmd_status": "APPROVED",
                 "md_status": "PENDING",
             })
             _notify_approver(MD_WHATSAPP_NUMBER, rd, request_id)
-            logger.info(
-                "jmd approved request_id=%s, notifying md=%s",
-                request_id,
-                MD_WHATSAPP_NUMBER,
-            )
+            logger.info("jmd approved request_id=%s → md", request_id)
         else:
             ref.update({
-                "manager_status": "DENIED",
+                "manager_status": "N/A",
                 "jmd_status": "DENIED",
                 "md_status": "N/A",
             })
@@ -559,16 +563,17 @@ def _handle_approval_gate(sender: str, incoming: str) -> bool:
                 "md_status": "APPROVED",
                 "approved_datetime": _utcnow(),
             }
-            if (rd.get("manager_status") or "").strip().upper() == "PENDING":
-                patch["manager_status"] = "APPROVED"
-            if (rd.get("jmd_status") or "").strip().upper() == "PENDING":
+            if (rd.get("jmd_status") or "").strip().upper() in (
+                "PENDING",
+                "AWAITING_MANAGER",
+            ):
                 patch["jmd_status"] = "APPROVED"
             ref.update(patch)
             _send_to(employee, "Your OD has been Approved.")
             logger.info("md approved (final) request_id=%s", request_id)
         else:
             ref.update({
-                "manager_status": "DENIED",
+                "manager_status": "N/A",
                 "jmd_status": "DENIED",
                 "md_status": "DENIED",
             })
@@ -580,7 +585,7 @@ def _handle_approval_gate(sender: str, incoming: str) -> bool:
 
 
 def _od_request_is_closed(d: dict) -> bool:
-    """Open until manager/JMD/MD denies or security records IN (visit closed)."""
+    """Open until JMD/MD denies or security records IN (visit closed)."""
     for key in ("manager_status", "jmd_status", "md_status"):
         if (d.get(key) or "").strip().upper() == "DENIED":
             return True
@@ -800,33 +805,34 @@ def _submit_od(
         "company_vehicle_id": company_vehicle_id or "",
         "company_vehicle": company_vehicle or "",
         "company_vehicle_description": company_vehicle_description or "",
-        "manager": chain["manager"],
         "jmd": chain["jmd"],
+        "jmd_route": chain["jmd_route"],
         "md": chain["md"],
-        "manager_status": "PENDING",
-        "jmd_status": "AWAITING_MANAGER",
-        "md_status": "AWAITING_MANAGER",
+        "manager_status": "N/A",
+        "jmd_status": "PENDING",
+        "md_status": "AWAITING_JMD",
     })
-    logger.info("OD created %s", request_id)
+    logger.info("OD created %s jmd_route=%s", request_id, chain["jmd_route"])
 
-    manager_wa = chain["manager"]
-    manager_ok = _send_approval_buttons(
-        manager_wa,
+    jmd_wa = chain["jmd"]
+    jmd_ok = _send_approval_buttons(
+        jmd_wa,
         employee_name=ud.get("name"),
         department=ud.get("department"),
         reason=reason,
         request_id=request_id,
     )
-    if manager_ok:
-        _set_pending_approval(manager_wa, request_id)
+    if jmd_ok:
+        _set_pending_approval(jmd_wa, request_id)
 
     db.collection("sessions").document(sender).delete()
     msg = "OD is Submitted."
     if uses_company_vehicle and company_vehicle_description:
         msg += f"\nVehicle: {company_vehicle_description}."
-    if not manager_ok:
+    if not jmd_ok:
+        route = chain["jmd_route"]
         msg += (
-            "\n\nYour manager could not be notified on WhatsApp. "
+            f"\n\nJMD ({route}) could not be notified on WhatsApp. "
             "Ask them to send Hi to this Alubee number once, then try again or contact admin."
         )
     _send_to(sender, msg)
@@ -1195,8 +1201,9 @@ def health():
         "runtime": "cloud_run" if _running_on_cloud_run() else "local",
         "api_key_set": bool(key),
         "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
-        "manager": MANAGER_WHATSAPP_NUMBER,
-        "jmd": JMD_WHATSAPP_NUMBER,
+        "approval_flow": "employee → JMD1|JMD2 → MD",
+        "jmd_i": JMD_I_WHATSAPP_NUMBER,
+        "jmd_ii": JMD_II_WHATSAPP_NUMBER,
         "md": MD_WHATSAPP_NUMBER,
     }
 

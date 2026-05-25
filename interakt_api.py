@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 _APP_DIR = Path(__file__).resolve().parent
-if not os.getenv("INTERAKT_API_KEY") and not os.getenv("K_SERVICE"):
+if not os.getenv("INTERAKT_API_KEY"):
     for name in (".env", ".env.example"):
         path = _APP_DIR / name
         if path.is_file():
