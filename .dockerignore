@@ -13,3 +13,4 @@ venv
 .gitignore
 .dockerignore
 .gcloudignore
+DEPLOY.md

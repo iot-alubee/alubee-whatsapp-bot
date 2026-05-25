@@ -1,27 +1,33 @@
-from contextlib import contextmanager
+"""
+Alubee WhatsApp OD bot — Interakt InteractiveList (menu) + buttons + text vehicle list.
 
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
+Flow: Hi → list menu → OD reason buttons → company vehicle → numbered text vehicles → approval.
+"""
 
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
-
-import firebase_admin
-from firebase_admin import credentials, firestore
+from __future__ import annotations
 
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import firebase_admin
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from firebase_admin import credentials, firestore
+
+from interakt_api import (
+    ensure_customer,
+    phone_to_wa_id,
+    send_list_menu,
+    send_reply_buttons,
+    send_text,
+    wa_id_to_phone,
+)
+
 _APP_DIR = Path(__file__).resolve().parent
-
-logger = logging.getLogger(__name__)
-
-# =========================================================
-# FIREBASE SETUP (local JSON / env JSON / ADC on Cloud Run)
-# =========================================================
 
 _CLOUD_RUN_STRIP_CRED_ENV = (
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -29,15 +35,24 @@ _CLOUD_RUN_STRIP_CRED_ENV = (
     "FIREBASE_CREDENTIALS_JSON",
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 def _running_on_cloud_run() -> bool:
     return bool(os.environ.get("K_SERVICE"))
 
 
-if not os.environ.get("K_SERVICE"):
+if not _running_on_cloud_run():
     from dotenv import load_dotenv
 
-    load_dotenv(_APP_DIR / ".env")
+    env_file = _APP_DIR / ".env"
+    if env_file.is_file():
+        load_dotenv(env_file, override=True)
+    else:
+        example = _APP_DIR / ".env.example"
+        if example.is_file():
+            load_dotenv(example, override=True)
 
 
 @contextmanager
@@ -49,15 +64,85 @@ def _cloud_run_metadata_credentials_env():
         os.environ.update(saved)
 
 
+FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "whatsapp-approval-system").strip()
+
+# Global approval chain for all employees (10-digit mobiles → whatsapp:+91…)
+def _wa_from_mobile(mobile: str) -> str:
+    digits = "".join(c for c in (mobile or "") if c.isdigit())
+    if len(digits) == 10:
+        return f"whatsapp:+91{digits}"
+    if len(digits) == 12 and digits.startswith("91"):
+        return f"whatsapp:+{digits}"
+    return ""
+
+
+MANAGER_WHATSAPP_NUMBER = (
+    os.getenv("MANAGER_WHATSAPP_NUMBER") or _wa_from_mobile("9994246682")
+).strip()
+JMD_WHATSAPP_NUMBER = (
+    os.getenv("JMD_WHATSAPP_NUMBER") or _wa_from_mobile("7339221730")
+).strip()
+MD_WHATSAPP_NUMBER = (
+    os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
+).strip()
+
+# WhatsApp session window for outbound session messages (manager/JMD/MD approval).
+WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
+
+REQUEST_CANNOT_BE_RAISED_MSG = "This request cannot be raised now. Thanks!"
+
+OD_ALREADY_PENDING_MSG = "Your OD request is already pending."
+
+_UNSUPPORTED_REQUEST_IDS = frozenset({
+    "VEHICLE_REQUEST",
+    "LEAVE_REQUEST",
+    "PERMISSION_REQUEST",
+    "VISITOR_REQUEST",
+})
+
+_OD_SESSION_STATES = frozenset({
+    "WAITING_OD_REASON_PICK",
+    "WAITING_OD_REASON_TYPING",
+    "WAITING_COMPANY_VEHICLE_YESNO",
+    "WAITING_VEHICLE_PICK",
+    "WAITING_OD_CONFIRM",
+})
+
+_SESSION_MENU_IDLE = "MENU_IDLE"
+_SESSION_AWAITING_HI = "AWAITING_HI"
+
+# List row id (lowercase) → internal choice
+_ROW_IDS = {
+    "od_request": "OD_REQUEST",
+    "vehicle_request": "VEHICLE_REQUEST",
+    "leave_request": "LEAVE_REQUEST",
+    "permission_request": "PERMISSION_REQUEST",
+    "visitor_request": "VISITOR_REQUEST",
+    "unit_i": "UNIT_I",
+    "unit_ii": "UNIT_II",
+    "unit_1": "UNIT_I",
+    "unit_2": "UNIT_II",
+    "other": "OTHER",
+    "yes": "YES",
+    "no": "NO",
+    "back": "BACK",
+    "submit": "SUBMIT",
+    "cancel": "CANCEL",
+    "approve": "APPROVE",
+    "deny": "DENY",
+}
+
+_OD_REASON_CHOICES = frozenset({"UNIT_I", "UNIT_II", "OTHER"})
+_COMPANY_VEHICLE_CHOICES = frozenset({"YES", "NO"})
+_CONFIRM_CHOICES = frozenset({"SUBMIT", "CANCEL", "BACK"})
+
+
 def _init_firebase() -> None:
-    project_id = (
-        os.getenv("FIREBASE_PROJECT_ID", "whatsapp-approval-system") or ""
-    ).strip()
-    init_options = {"projectId": project_id} if project_id else None
+    opts = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
 
     def _try_adc():
         cred = credentials.ApplicationDefault()
-        firebase_admin.initialize_app(cred, init_options)
+        firebase_admin.initialize_app(cred, opts)
 
     try:
         firebase_admin.get_app()
@@ -68,8 +153,8 @@ def _init_firebase() -> None:
     if _running_on_cloud_run():
         if any(os.environ.get(k) for k in _CLOUD_RUN_STRIP_CRED_ENV):
             logger.warning(
-                "Cloud Run: ignoring FIREBASE_CREDENTIALS_JSON / "
-                "GOOGLE_APPLICATION_CREDENTIALS; use service account IAM instead."
+                "Cloud Run: use service account IAM for Firestore; "
+                "ignoring GOOGLE_APPLICATION_CREDENTIALS / FIREBASE_CREDENTIALS_JSON."
             )
         with _cloud_run_metadata_credentials_env():
             _try_adc()
@@ -77,16 +162,18 @@ def _init_firebase() -> None:
 
     json_raw = (os.getenv("FIREBASE_CREDENTIALS_JSON") or "").strip()
     if json_raw:
-        cred = credentials.Certificate(json.loads(json_raw))
-        firebase_admin.initialize_app(cred, init_options)
+        firebase_admin.initialize_app(credentials.Certificate(json.loads(json_raw)), opts)
         return
 
     cred_path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if not cred_path:
-        cred_path = "firebase-adminsdk.json"
-    if cred_path and os.path.isfile(cred_path):
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred, init_options)
+        cred_path = str(_APP_DIR / "firebase-adminsdk.json")
+    elif not os.path.isabs(cred_path):
+        cred_path = str(_APP_DIR / cred_path)
+    if not cred_path or not os.path.isfile(cred_path):
+        cred_path = str(_APP_DIR.parent / "firebase-adminsdk.json")
+    if os.path.isfile(cred_path):
+        firebase_admin.initialize_app(credentials.Certificate(cred_path), opts)
         return
 
     _try_adc()
@@ -95,86 +182,54 @@ def _init_firebase() -> None:
 _init_firebase()
 db = firestore.client()
 
-# =========================================================
-# TWILIO CONFIG (local: .env | Cloud Run: service env vars)
-# =========================================================
+if _running_on_cloud_run() and not (os.getenv("INTERAKT_API_KEY") or "").strip():
+    raise RuntimeError("Cloud Run requires INTERAKT_API_KEY environment variable.")
 
-TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip()
-TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
-TWILIO_WHATSAPP_NUMBER = (
-    os.getenv("TWILIO_WHATSAPP_NUMBER") or "whatsapp:+14155238886"
-).strip()
-# Messaging Service (MG…) + WhatsApp sender in pool — required for templates outside 24h (manager/MD)
-TWILIO_MESSAGING_SERVICE_SID = (
-    os.getenv("TWILIO_MESSAGING_SERVICE_SID") or ""
-).strip()
-
-if _running_on_cloud_run() and (
-    not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_NUMBER
-):
-    raise RuntimeError(
-        "Cloud Run requires TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and "
-        "TWILIO_WHATSAPP_NUMBER environment variables."
-    )
-
-# List picker: request_form_selector (body uses {{1}} = employee name)
-CONTENT_SID_LIST_PICKER_MENU = "HXa158841c1a5f69c9d710c5bee9a3edfc"
-
-# OD reason: quick reply (UNIT_I, UNIT_II, OTHER — if OTHER, user types reason next)
-CONTENT_SID_OD_REASON = "HXb7fc34d81aedf34cf883b87e40136ee8"
-
-# Company vehicle yes/no (list items YES, NO)
-CONTENT_SID_COMPANY_VEHICLE = "HX3959a4bf26503ecfad21f0866cac50bd"
-
-# OD approval quick reply (manager + MD): {{1}} employee, {{2}} dept, {{3}} reason; buttons APPROVE / DENY
-CONTENT_SID_OD_APPROVAL = "HX78da53a160efba6b6c7c6e23daac0ba5"
-
-# MD WhatsApp id (must match load_users MD_MOBILE; override with env MD_WHATSAPP_NUMBER)
-MD_WHATSAPP_NUMBER = os.getenv(
-    "MD_WHATSAPP_NUMBER",
-    "whatsapp:+916374941546",
-).strip()
-
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-if _running_on_cloud_run() and not TWILIO_MESSAGING_SERVICE_SID:
-    logger.warning(
-        "TWILIO_MESSAGING_SERVICE_SID is not set. Approval templates to manager/MD "
-        "may fail with error 63016 until they message this number (24h window)."
-    )
-
-
-REQUEST_CANNOT_BE_RAISED_MSG = (
-    "This request cannot be raised now. Thanks!"
-)
-
-# Button / list item IDs for request types that are not implemented yet
-_UNSUPPORTED_REQUEST_IDS = frozenset({
-    "VEHICLE_REQUEST",
-    "LEAVE_REQUEST",
-    "PERMISSION_REQUEST",
-    "VISITOR_REQUEST",
-})
-
-# OD flow session states (must be handled before menu shortcuts "1"–"5")
-_OD_SESSION_STATES = frozenset({
-    "WAITING_OD_REASON_PICK",
-    "WAITING_OD_REASON_TYPING",
-    "WAITING_COMPANY_VEHICLE_YESNO",
-    "WAITING_VEHICLE_PICK",
-})
+app = FastAPI(title="Alubee Interakt OD bot")
 
 
 def _utcnow():
     return datetime.now(timezone.utc)
 
 
+def _session_ref(sender: str):
+    return db.collection("sessions").document(sender)
+
+
+def _whatsapp_activity_ref(wa_id: str):
+    return db.collection("whatsapp_activity").document(wa_id)
+
+
+def _touch_whatsapp_inbound(wa_id: str) -> None:
+    """Record last inbound message (opens 24h session for outbound session messages)."""
+    _whatsapp_activity_ref(wa_id).set({"last_inbound_at": _utcnow()}, merge=True)
+
+
+def _has_active_whatsapp_session(wa_id: str) -> bool:
+    """True if this user messaged Alubee within WHATSAPP_SESSION_HOURS."""
+    snap = _whatsapp_activity_ref(wa_id).get()
+    if not snap.exists:
+        return False
+    last = snap.to_dict().get("last_inbound_at")
+    if not last:
+        return False
+    if hasattr(last, "timestamp"):
+        last_dt = datetime.fromtimestamp(last.timestamp(), tz=timezone.utc)
+    elif isinstance(last, datetime):
+        last_dt = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+    else:
+        return False
+    age_hours = (_utcnow() - last_dt).total_seconds() / 3600
+    return age_hours < WHATSAPP_SESSION_HOURS
+
+
+def _session_merge(sender: str, **fields) -> None:
+    _session_ref(sender).set(fields, merge=True)
+
+
 def _chat_name(name) -> str:
-    """Employee name for WhatsApp messages (e.g. AJAY SENTHILKUMAR -> Ajay Senthilkumar)."""
     raw = str(name or "").strip()
-    if not raw:
-        return "Employee"
-    return raw.title()
+    return raw.title() if raw else "Employee"
 
 
 def _numbered_request_menu(employee_name: str) -> str:
@@ -190,149 +245,176 @@ def _numbered_request_menu(employee_name: str) -> str:
     )
 
 
-def _content_var(value) -> str:
-    """Twilio Content variables: single-line strings only (error 21656 if newlines)."""
-    s = str(value or "").strip()
-    s = " ".join(s.split())
-    return s[:256] if s else "Employee"
-
-
-def _content_variables_json(**kwargs) -> str:
-    return json.dumps({str(k): _content_var(v) for k, v in kwargs.items()})
-
-
-def _list_picker_menu_variables(employee_name) -> str:
-    return _content_variables_json(
-        **{"1": _chat_name(employee_name) or "Employee"}
-    )
-
-
-def _parse_incoming_choice(form_data) -> str:
-    """Prefer list/button IDs from Twilio templates; fall back to Body or numbers."""
-    list_id = (form_data.get("ListId") or "").strip()
-    if list_id:
-        return list_id
-    button_payload = (form_data.get("ButtonPayload") or "").strip()
-    if button_payload:
-        return button_payload
-    body = (form_data.get("Body") or "").strip()
-    if not body:
+def _normalize_choice(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
         return ""
-    key = body.lower()
-    menu_titles = {
+    key = s.lower().replace(" ", "_").replace("-", "_")
+    if key in _ROW_IDS:
+        return _ROW_IDS[key]
+    if key.upper() in _ROW_IDS.values():
+        return key.upper()
+    titles = {
         "od request": "OD_REQUEST",
         "vehicle request": "VEHICLE_REQUEST",
         "leave request": "LEAVE_REQUEST",
         "permission request": "PERMISSION_REQUEST",
         "visitor request": "VISITOR_REQUEST",
     }
-    return menu_titles.get(key, body)
+    return titles.get(s.lower(), s)
 
 
 def _same_whatsapp(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
-    return a.strip().lower() == b.strip().lower()
+    return bool(a and b and a.strip().lower() == b.strip().lower())
 
 
-def _department_for_template(request_data: dict | None = None) -> str:
-    """Approval template {{2}} — employee department from Firestore users / request doc only."""
-    dept = ((request_data or {}).get("department") or "").strip()
-    return dept or "—"
+def _send_to(wa_id: str, text: str) -> None:
+    try:
+        send_text(wa_id_to_phone(wa_id), text)
+    except Exception:
+        logger.exception("send_text failed to=%s", wa_id)
 
 
-def _reason_for_template(request_data: dict | None = None, reason: str = "") -> str:
-    """Approval template {{3}} — OD reason selection (Unit I / Unit II / typed), not department or vehicle."""
-    return (reason or (request_data or {}).get("reason") or "").strip()
+def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
+    """InteractiveList rows: (id, title) only — no descriptions."""
+    return [{"id": row_id, "title": title[:24]} for row_id, title in items]
 
 
-def _od_content_variables(
-    *,
-    employee_name,
-    reason,
-    request_id,
-    department,
-) -> str:
-    """Twilio od_approval_template: {{1}} employee, {{2}} department, {{3}} reason."""
-    return _content_variables_json(
-        **{
-            "1": _chat_name(employee_name),
-            "2": department or "—",
-            "3": reason or "",
-        }
-    )
-
-
-def _twilio_outbound_kwargs(to: str) -> dict:
-    """WhatsApp Content API: MG service + from_ sender; never pass body with content_sid."""
-    to = (to or "").strip()
-    if TWILIO_MESSAGING_SERVICE_SID:
-        return {
-            "messaging_service_sid": TWILIO_MESSAGING_SERVICE_SID,
-            "from_": TWILIO_WHATSAPP_NUMBER,
-            "to": to,
-        }
-    return {"from_": TWILIO_WHATSAPP_NUMBER, "to": to}
-
-
-def _send_od_approval_template(
-    to: str,
-    *,
-    employee_name,
-    reason,
-    department,
-    request_id: str = "",
-) -> bool:
-    """
-    Manager/MD approval — must use ContentSid (error 63016 if plain body outside 24h).
-    """
-    vars_json = _od_content_variables(
-        employee_name=employee_name,
-        reason=reason,
-        request_id=request_id,
-        department=department,
+def _send_main_menu(wa_id: str, employee_name: str) -> None:
+    name = _chat_name(employee_name)
+    rows = _list_rows(
+        ("od_request", "OD Request"),
+        ("vehicle_request", "Vehicle Request"),
+        ("leave_request", "Leave Request"),
+        ("permission_request", "Permission Request"),
+        ("visitor_request", "Visitor Request"),
     )
     try:
-        tw_msg = client.messages.create(
-            **_twilio_outbound_kwargs(to),
-            content_sid=CONTENT_SID_OD_APPROVAL,
-            content_variables=vars_json,
+        send_list_menu(
+            wa_id_to_phone(wa_id),
+            f"Welcome {name} 👋\n\nPlease choose an option:",
+            rows,
+            callback_data="main-menu",
         )
-        err = getattr(tw_msg, "error_code", None)
-        print(
-            "OD approval template:",
-            "to=", to,
-            "request_id=", request_id,
-            "sid=", tw_msg.sid,
-            "status=", tw_msg.status,
-            "error_code=", err,
-            "content_sid=", CONTENT_SID_OD_APPROVAL,
-            "content_variables=", vars_json,
+    except Exception:
+        logger.exception("main menu InteractiveList failed to=%s", wa_id)
+        _send_to(wa_id, _numbered_request_menu(employee_name))
+
+
+def _send_od_reason_buttons(wa_id: str) -> None:
+    """InteractiveList: Unit I / Unit II / Other / Back."""
+    rows = _list_rows(
+        ("unit_i", "Unit I"),
+        ("unit_ii", "Unit II"),
+        ("other", "Other"),
+        ("back", "Back"),
+    )
+    try:
+        send_list_menu(
+            wa_id_to_phone(wa_id),
+            "OD reason:",
+            rows,
+            button_label="Select reason",
+            section_title="Reason",
+            callback_data="od-reason",
         )
-        return not err
-    except Exception as e:
-        print(
-            "OD approval template send failed:",
-            "to=", to,
-            "request_id=", request_id,
-            repr(e),
-            "content_sid=", CONTENT_SID_OD_APPROVAL,
-            "content_variables=", vars_json,
+    except Exception:
+        logger.exception("OD reason list failed")
+        _send_to(
+            wa_id,
+            "OD reason:\n1. Unit I\n2. Unit II\n3. Other\n\nReply 1, 2, 3, or BACK for menu.",
+        )
+
+
+def _send_company_vehicle_buttons(wa_id: str, reason: str) -> None:
+    """YES / NO / Back."""
+    body = f"{reason}\n\nCompany vehicle?"
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            body,
+            [("YES", "YES"), ("NO", "NO"), ("BACK", "Back")],
+            callback_data="company-vehicle",
+        )
+    except Exception:
+        logger.exception("company vehicle buttons failed")
+        _send_to(wa_id, f"{body}\n\nReply YES, NO, or BACK.")
+
+
+def _send_dynamic_vehicle_list(wa_id: str, vehicles: list) -> None:
+    """Dynamic numbered text list from Firestore (all vehicles; reply 1–N or vehicle ID)."""
+    n = len(vehicles)
+    if n == 0:
+        return
+    lines = [f"Select company vehicle ({n} available; reply with number or ID):\n"]
+    for i, v in enumerate(vehicles, start=1):
+        label = v.get("description") or v.get("vehicle_id")
+        lines.append(f"{i}. {label} ({v['vehicle_id']})")
+    lines.append("\nReply BACK to go back.")
+    _send_to(wa_id, "\n".join(lines))
+
+
+def _send_approval_buttons(
+    wa_id: str,
+    *,
+    employee_name: str,
+    department: str,
+    reason: str,
+    request_id: str,
+) -> bool:
+    """Send Approve/Deny only if approver has an active WhatsApp session (messaged Alubee recently)."""
+    if not _has_active_whatsapp_session(wa_id):
+        logger.info(
+            "skip approval notify to=%s request_id=%s (no active WhatsApp session in %sh)",
+            wa_id,
+            request_id,
+            WHATSAPP_SESSION_HOURS,
         )
         return False
 
+    body = (
+        "OD approval request\n\n"
+        f"Employee: {_chat_name(employee_name)}\n"
+        f"Department: {department or '—'}\n"
+        f"Reason: {reason or '—'}\n\n"
+        "Please approve or deny."
+    )
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            body,
+            [("APPROVE", "Approve"), ("DENY", "Deny")],
+            callback_data=request_id,
+            ensure_contact=True,
+            contact_name=_chat_name(employee_name),
+        )
+        return True
+    except Exception as e:
+        logger.exception("approval buttons failed to=%s: %s", wa_id, e)
+        try:
+            ensure_customer(wa_id_to_phone(wa_id), name="Approver")
+            send_reply_buttons(
+                wa_id_to_phone(wa_id),
+                body,
+                [("APPROVE", "Approve"), ("DENY", "Deny")],
+                callback_data=request_id,
+            )
+            return True
+        except Exception:
+            logger.exception("approval retry failed to=%s", wa_id)
+        return False
 
-def _set_pending_approval_session(recipient: str, request_id: str) -> None:
-    """Link Approve/DENY taps (fixed button IDs) to this request for manager/MD."""
-    db.collection("sessions").document(recipient).set({
-        "state": "WAITING_APPROVAL_ACTION",
-        "approval_request_id": request_id,
-    })
+
+def _set_pending_approval(recipient: str, request_id: str) -> None:
+    _session_merge(
+        recipient,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=request_id,
+    )
 
 
-def _resolve_approval_request_id(incoming_msg: str, approver: str):
-    """Return (is_approve, request_id) or (None, None) if not an approval message."""
-    raw = (incoming_msg or "").strip()
+def _resolve_approval(incoming: str, approver: str):
+    raw = (incoming or "").strip()
     um = raw.upper()
     if um.startswith("APPROVE_"):
         rid = raw.split("_", 1)[1].strip()
@@ -340,125 +422,207 @@ def _resolve_approval_request_id(incoming_msg: str, approver: str):
     if um.startswith("DENY_"):
         rid = raw.split("_", 1)[1].strip()
         return (False, rid) if rid else (None, None)
-    if raw in ("Approve", "APPROVE") or um == "APPROVE":
+    if um in ("APPROVE", "DENY"):
         snap = db.collection("sessions").document(approver).get()
         if snap.exists:
             data = snap.to_dict() or {}
             if data.get("state") == "WAITING_APPROVAL_ACTION":
                 rid = (data.get("approval_request_id") or "").strip()
                 if rid:
-                    return True, rid
-    if raw in ("Deny", "DENY") or um == "DENY":
-        snap = db.collection("sessions").document(approver).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            if data.get("state") == "WAITING_APPROVAL_ACTION":
-                rid = (data.get("approval_request_id") or "").strip()
-                if rid:
-                    return False, rid
+                    return um == "APPROVE", rid
     return None, None
 
 
-def _handle_approval_gate(sender: str, incoming_msg: str, response) -> bool:
-    """Manager/MD Approve or Deny. Returns True if this message was handled."""
-    approval = _resolve_approval_request_id(incoming_msg, sender)
-    if approval[0] is None:
+def _build_approval_chain(_user_data: dict | None = None) -> dict | None:
+    """Employee → Manager → JMD → MD (final). Same approvers for every employee."""
+    manager = MANAGER_WHATSAPP_NUMBER
+    jmd = JMD_WHATSAPP_NUMBER
+    md = MD_WHATSAPP_NUMBER
+    if not manager or not jmd or not md:
+        return None
+    return {"manager": manager, "jmd": jmd, "md": md}
+
+
+def _approval_role(sender: str, rd: dict) -> str | None:
+    """Manager → JMD → MD (final). Uses global .env numbers, not stale request fields."""
+    mgr_st = (rd.get("manager_status") or "").strip().upper()
+    jmd_st = (rd.get("jmd_status") or "").strip().upper()
+    md_st = (rd.get("md_status") or "").strip().upper()
+
+    if _same_whatsapp(sender, MANAGER_WHATSAPP_NUMBER) and mgr_st == "PENDING":
+        return "manager"
+
+    if (
+        _same_whatsapp(sender, JMD_WHATSAPP_NUMBER)
+        and mgr_st == "APPROVED"
+        and jmd_st == "PENDING"
+    ):
+        return "jmd"
+
+    if (
+        _same_whatsapp(sender, MD_WHATSAPP_NUMBER)
+        and jmd_st == "APPROVED"
+        and md_st == "PENDING"
+    ):
+        return "md"
+
+    return None
+
+
+def _notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
+    if not wa_id:
+        return
+    if _send_approval_buttons(
+        wa_id,
+        employee_name=rd.get("employee_name"),
+        department=rd.get("department"),
+        reason=rd.get("reason"),
+        request_id=request_id,
+    ):
+        _set_pending_approval(wa_id, request_id)
+
+
+def _handle_approval_gate(sender: str, incoming: str) -> bool:
+    resolved = _resolve_approval(incoming, sender)
+    if resolved[0] is None:
         return False
 
-    is_approve, request_id = approval
-    request_ref = db.collection("requests").document(request_id)
-    snap = request_ref.get()
-
+    is_approve, request_id = resolved
+    ref = db.collection("requests").document(request_id)
+    snap = ref.get()
     if not snap.exists:
-        print("Approve/deny: request not found", request_id)
+        logger.warning("request not found %s", request_id)
         return True
 
     rd = snap.to_dict()
-    mgr_pending = rd.get("manager_status") == "PENDING"
-    md_waiting = (
-        rd.get("manager_status") == "APPROVED"
-        and rd.get("md_status") == "PENDING"
-    )
-    handled = False
+    employee = rd.get("employee")
+    role = _approval_role(sender, rd)
+    if not role:
+        logger.warning(
+            "approval ignored sender=%s request_id=%s mgr=%s jmd=%s md=%s",
+            sender,
+            request_id,
+            rd.get("manager_status"),
+            rd.get("jmd_status"),
+            rd.get("md_status"),
+        )
+        return True
 
-    if (
-        md_waiting
-        and MD_WHATSAPP_NUMBER
-        and _same_whatsapp(sender, MD_WHATSAPP_NUMBER)
-    ):
+    if role == "manager":
         if is_approve:
-            request_ref.update({
-                "md_status": "APPROVED",
-                "approved_datetime": _utcnow(),
+            ref.update({
+                "manager": MANAGER_WHATSAPP_NUMBER,
+                "jmd": JMD_WHATSAPP_NUMBER,
+                "md": MD_WHATSAPP_NUMBER,
+                "manager_status": "APPROVED",
+                "jmd_status": "PENDING",
+                "md_status": "AWAITING_JMD",
             })
-            client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                to=rd["employee"],
-                body="Your OD has been Approved.",
-            )
+            _notify_approver(JMD_WHATSAPP_NUMBER, rd, request_id)
+            logger.info("manager approved request_id=%s", request_id)
         else:
-            request_ref.update({"md_status": "DENIED"})
-            client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                to=rd["employee"],
-                body="Your OD request was not approved.",
-            )
-        handled = True
-
-    elif mgr_pending and _same_whatsapp(sender, rd.get("manager")):
-        if is_approve:
-            if not MD_WHATSAPP_NUMBER:
-                print(
-                    "Manager approve: MD_WHATSAPP_NUMBER not set; "
-                    "cannot complete flow",
-                    request_id,
-                )
-            else:
-                request_ref.update({
-                    "manager_status": "APPROVED",
-                    "md_status": "PENDING",
-                })
-                _notify_md_for_request(request_id, rd)
-        else:
-            request_ref.update({
+            ref.update({
                 "manager_status": "DENIED",
+                "jmd_status": "N/A",
                 "md_status": "N/A",
             })
-            client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                to=rd["employee"],
-                body="Your OD request was not approved.",
-            )
-        handled = True
+            _send_to(employee, "Your OD request was not approved.")
+            logger.info("manager denied request_id=%s", request_id)
 
-    if handled:
-        db.collection("sessions").document(sender).delete()
-    else:
-        print(
-            "Approve/deny: unauthorized or wrong state",
-            request_id,
-        )
+    elif role == "jmd":
+        if is_approve:
+            ref.update({
+                "manager": MANAGER_WHATSAPP_NUMBER,
+                "jmd": JMD_WHATSAPP_NUMBER,
+                "md": MD_WHATSAPP_NUMBER,
+                "jmd_status": "APPROVED",
+                "md_status": "PENDING",
+            })
+            _notify_approver(MD_WHATSAPP_NUMBER, rd, request_id)
+            logger.info(
+                "jmd approved request_id=%s, notifying md=%s",
+                request_id,
+                MD_WHATSAPP_NUMBER,
+            )
+        else:
+            ref.update({
+                "manager_status": "DENIED",
+                "jmd_status": "DENIED",
+                "md_status": "N/A",
+            })
+            _send_to(employee, "Your OD request was not approved.")
+            logger.info("jmd denied request_id=%s", request_id)
+
+    elif role == "md":
+        if is_approve:
+            patch = {
+                "md_status": "APPROVED",
+                "approved_datetime": _utcnow(),
+            }
+            if (rd.get("manager_status") or "").strip().upper() == "PENDING":
+                patch["manager_status"] = "APPROVED"
+            if (rd.get("jmd_status") or "").strip().upper() == "PENDING":
+                patch["jmd_status"] = "APPROVED"
+            ref.update(patch)
+            _send_to(employee, "Your OD has been Approved.")
+            logger.info("md approved (final) request_id=%s", request_id)
+        else:
+            ref.update({
+                "manager_status": "DENIED",
+                "jmd_status": "DENIED",
+                "md_status": "DENIED",
+            })
+            _send_to(employee, "Your OD request was not approved.")
+            logger.info("md denied (final) request_id=%s", request_id)
+
+    _session_ref(sender).delete()
     return True
 
 
-def _vehicles_currently_out_ids():
-    """Vehicle IDs that are out (Security OUT recorded, IN not yet)."""
-    out_ids = set()
+def _od_request_is_closed(d: dict) -> bool:
+    """Open until manager/JMD/MD denies or security records IN (visit closed)."""
+    for key in ("manager_status", "jmd_status", "md_status"):
+        if (d.get(key) or "").strip().upper() == "DENIED":
+            return True
+    if d.get("security_in_at"):
+        return True
+    return False
+
+
+def _find_open_od_for_employee(employee: str) -> dict | None:
     for snap in db.collection("requests").stream():
         d = snap.to_dict() or {}
         if (d.get("type") or "").strip().upper() != "OD":
             continue
-        vid = (d.get("company_vehicle_id") or "").strip().upper()
-        if not vid:
+        if not _same_whatsapp(d.get("employee"), employee):
             continue
-        if d.get("security_out_at") and not d.get("security_in_at"):
-            out_ids.add(vid)
-    return out_ids
+        if _od_request_is_closed(d):
+            continue
+        return d
+    return None
 
 
-def _fetch_available_vehicles():
-    """Active vehicles from Firestore, excluding those currently out."""
-    out_ids = _vehicles_currently_out_ids()
+def _try_start_od(sender: str) -> None:
+    if _find_open_od_for_employee(sender):
+        _send_to(sender, OD_ALREADY_PENDING_MSG)
+        return
+    _start_od(sender)
+
+
+def _vehicles_out_ids():
+    out = set()
+    for snap in db.collection("requests").stream():
+        d = snap.to_dict() or {}
+        if (d.get("type") or "").upper() != "OD":
+            continue
+        vid = (d.get("company_vehicle_id") or "").strip().upper()
+        if vid and d.get("security_out_at") and not d.get("security_in_at"):
+            out.add(vid)
+    return out
+
+
+def _fetch_vehicles():
+    out_ids = _vehicles_out_ids()
     available = []
     for snap in db.collection("vehicles").stream():
         d = snap.to_dict() or {}
@@ -470,65 +634,13 @@ def _fetch_available_vehicles():
         available.append({
             "vehicle_id": vid,
             "vehicle": (d.get("vehicle") or "").strip(),
-            "make": (d.get("make") or "").strip(),
             "description": (d.get("description") or "").strip(),
         })
-    available.sort(key=lambda v: (v.get("description") or v.get("vehicle_id") or ""))
+    available.sort(key=lambda v: v.get("description") or v.get("vehicle_id") or "")
     return available
 
 
-def _send_company_vehicle_yes_no(sender: str) -> bool:
-    """Send Company Vehicle? template. Returns True if sent OK."""
-    try:
-        tw_msg = client.messages.create(
-            **_twilio_outbound_kwargs(sender),
-            content_sid=CONTENT_SID_COMPANY_VEHICLE,
-        )
-        print(
-            "Company vehicle template:",
-            "sid=", tw_msg.sid,
-            "status=", tw_msg.status,
-            "error_code=", getattr(tw_msg, "error_code", None),
-            "template=", CONTENT_SID_COMPANY_VEHICLE,
-        )
-        return not getattr(tw_msg, "error_code", None)
-    except Exception as e:
-        print(
-            "Company vehicle template send failed:",
-            repr(e),
-            "template=", CONTENT_SID_COMPANY_VEHICLE,
-        )
-        return False
-
-
-def _prompt_company_vehicle(sender: str, reason: str, response: MessagingResponse) -> None:
-    """After OD reason: ask company vehicle yes/no."""
-    db.collection("sessions").document(sender).set({
-        "state": "WAITING_COMPANY_VEHICLE_YESNO",
-        "od_reason": reason,
-    })
-    if _send_company_vehicle_yes_no(sender):
-        return
-    response.message().body(
-        "Company vehicle?\nReply YES or NO."
-    )
-
-
-def _send_vehicle_pick_list(sender: str, vehicles: list) -> None:
-    """Send available vehicles; user replies with list number or vehicle_id."""
-    lines = ["Select company vehicle (reply with the number or vehicle ID):\n"]
-    for i, v in enumerate(vehicles, start=1):
-        desc = v.get("description") or v.get("vehicle_id")
-        lines.append(f"{i}. {desc}")
-    client.messages.create(
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=sender,
-        body="\n".join(lines),
-    )
-
-
 def _resolve_vehicle_pick(incoming: str, vehicle_ids: list):
-    """Map user reply to vehicle dict fields or None if invalid."""
     raw = (incoming or "").strip().upper()
     if not raw or not vehicle_ids:
         return None
@@ -540,7 +652,11 @@ def _resolve_vehicle_pick(incoming: str, vehicle_ids: list):
             return None
         idx = n - 1
     else:
-        return None
+        low = incoming.strip().lower()
+        match = [i for i, v in enumerate(vehicle_ids) if v.lower() == low]
+        if not match:
+            return None
+        idx = match[0]
     vid = vehicle_ids[idx]
     snap = db.collection("vehicles").document(vid).get()
     if not snap.exists:
@@ -553,342 +669,550 @@ def _resolve_vehicle_pick(incoming: str, vehicle_ids: list):
     }
 
 
-def _notify_md_for_request(request_id: str, request_data: dict):
-    """After manager approval, notify MD using the same Content template as the manager."""
-    if not MD_WHATSAPP_NUMBER:
-        print("MD notify skipped: MD_WHATSAPP_NUMBER not set", request_id)
+def _employee_name_for(sender: str, session: dict | None) -> str:
+    if session and session.get("employee_name"):
+        return _chat_name(session["employee_name"])
+    user = db.collection("users").document(sender).get()
+    if user.exists:
+        return _chat_name(user.to_dict().get("name"))
+    return "Employee"
+
+
+def _go_back_to_main_menu(sender: str, session: dict | None = None) -> None:
+    name = _employee_name_for(sender, session)
+    _session_merge(sender, state=_SESSION_MENU_IDLE, employee_name=name)
+    _send_main_menu(sender, name)
+
+
+def _cancel_od_flow(sender: str, session: dict | None = None) -> None:
+    _session_merge(sender, state=_SESSION_AWAITING_HI)
+    _send_to(sender, "OD cancelled.\nSend Hi when you need the menu.")
+
+
+def _build_od_summary(session: dict) -> str:
+    reason = (session.get("od_reason") or "—").strip()
+    uses_cv = session.get("uses_company_vehicle")
+    lines = [
+        "Please review your OD request:\n",
+        "Request type: OD Request",
+        f"Reason: {reason}",
+    ]
+    if uses_cv is True:
+        desc = (session.get("company_vehicle_description") or "").strip()
+        vid = (session.get("company_vehicle_id") or "").strip()
+        vehicle_line = desc or vid or "—"
+        lines.append(f"Company vehicle: Yes — {vehicle_line}")
+    elif uses_cv is False:
+        lines.append("Company vehicle: No")
+    else:
+        lines.append("Company vehicle: —")
+    lines.append("\nSubmit | Cancel | Back")
+    return "\n".join(lines)
+
+
+def _send_od_confirm(sender: str, session: dict) -> None:
+    body = _build_od_summary(session)
+    _session_merge(sender, state="WAITING_OD_CONFIRM")
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            body,
+            [("SUBMIT", "Submit"), ("CANCEL", "Cancel"), ("BACK", "Back")],
+            callback_data="od-confirm",
+        )
+    except Exception:
+        logger.exception("OD confirm buttons failed")
+        _send_to(sender, f"{body}\n\nReply SUBMIT, CANCEL, or BACK.")
+
+
+def _show_od_confirm(sender: str, session: dict) -> None:
+    snap = _session_ref(sender).get()
+    data = {**(snap.to_dict() if snap.exists else {}), **session}
+    _session_merge(
+        sender,
+        state="WAITING_OD_CONFIRM",
+        od_reason=data.get("od_reason"),
+        uses_company_vehicle=data.get("uses_company_vehicle"),
+        company_vehicle_id=data.get("company_vehicle_id") or "",
+        company_vehicle=data.get("company_vehicle") or "",
+        company_vehicle_description=data.get("company_vehicle_description") or "",
+        employee_name=data.get("employee_name"),
+        vehicle_ids=data.get("vehicle_ids"),
+    )
+    fresh = _session_ref(sender).get()
+    _send_od_confirm(sender, fresh.to_dict() if fresh.exists else data)
+
+
+def _submit_od_from_session(sender: str, session: dict) -> None:
+    reason = (session.get("od_reason") or "").strip()
+    if not reason:
+        _send_to(sender, "Missing OD reason. Send Hi to start again.")
         return
-    if _send_od_approval_template(
-        MD_WHATSAPP_NUMBER,
-        employee_name=request_data.get("employee_name"),
-        reason=_reason_for_template(request_data),
-        department=_department_for_template(request_data),
-        request_id=request_id,
-    ):
-        _set_pending_approval_session(MD_WHATSAPP_NUMBER, request_id)
+    _submit_od(
+        sender,
+        reason,
+        uses_company_vehicle=bool(session.get("uses_company_vehicle")),
+        company_vehicle_id=session.get("company_vehicle_id") or "",
+        company_vehicle=session.get("company_vehicle") or "",
+        company_vehicle_description=session.get("company_vehicle_description") or "",
+    )
 
 
-def _submit_od_request(
+def _submit_od(
     sender: str,
     reason: str,
-    response: MessagingResponse,
     *,
     uses_company_vehicle: bool = False,
     company_vehicle_id: str = "",
     company_vehicle: str = "",
     company_vehicle_description: str = "",
 ) -> None:
-    """Create OD request, notify manager, clear session; or set TwiML error on failure."""
-    user_doc = db.collection("users").document(sender).get()
+    if _find_open_od_for_employee(sender):
+        db.collection("sessions").document(sender).delete()
+        _send_to(sender, OD_ALREADY_PENDING_MSG)
+        return
 
+    user_doc = db.collection("users").document(sender).get()
     if not user_doc.exists:
         db.collection("sessions").document(sender).delete()
-        response.message().body(
-            "User not registered.\nPlease contact admin."
-        )
+        _send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
-    user_data = user_doc.to_dict()
-    employee_name = user_data.get("name")
-    manager_number = (user_data.get("manager") or "").strip()
-    employee_id = user_data.get("employee_id", "")
-    department = user_data.get("department", "")
-
-    if not manager_number:
+    ud = user_doc.to_dict()
+    chain = _build_approval_chain(ud)
+    if not chain:
         db.collection("sessions").document(sender).delete()
-        response.message().body(
-            "No manager is set on your profile.\nPlease contact admin."
-        )
+        _send_to(sender, "Approval chain not configured.\nPlease contact admin.")
         return
 
-    doc_ref = db.collection("requests").document()
-    request_id = doc_ref.id
-
-    doc_ref.set({
+    ref = db.collection("requests").document()
+    request_id = ref.id
+    ref.set({
         "request_id": request_id,
         "requested_datetime": _utcnow(),
         "employee": sender,
-        "employee_id": employee_id or "",
-        "employee_name": employee_name or "Employee",
-        "department": department or "",
+        "employee_id": ud.get("employee_id") or "",
+        "employee_name": ud.get("name") or "Employee",
+        "department": ud.get("department") or "",
         "type": "OD",
         "reason": reason,
         "uses_company_vehicle": uses_company_vehicle,
         "company_vehicle_id": company_vehicle_id or "",
         "company_vehicle": company_vehicle or "",
         "company_vehicle_description": company_vehicle_description or "",
-        "manager": manager_number,
+        "manager": chain["manager"],
+        "jmd": chain["jmd"],
+        "md": chain["md"],
         "manager_status": "PENDING",
+        "jmd_status": "AWAITING_MANAGER",
         "md_status": "AWAITING_MANAGER",
     })
+    logger.info("OD created %s", request_id)
 
-    print("Request ID:", request_id)
-
-    if _send_od_approval_template(
-        manager_number,
-        employee_name=employee_name,
-        reason=_reason_for_template(reason=reason),
-        department=_department_for_template({"department": department}),
+    manager_wa = chain["manager"]
+    manager_ok = _send_approval_buttons(
+        manager_wa,
+        employee_name=ud.get("name"),
+        department=ud.get("department"),
+        reason=reason,
         request_id=request_id,
-    ):
-        _set_pending_approval_session(manager_number, request_id)
-    else:
-        print(
-            "Manager approval template not delivered; request_id=",
-            request_id,
-            "manager=", manager_number,
-        )
+    )
+    if manager_ok:
+        _set_pending_approval(manager_wa, request_id)
 
     db.collection("sessions").document(sender).delete()
     msg = "OD is Submitted."
     if uses_company_vehicle and company_vehicle_description:
         msg += f"\nVehicle: {company_vehicle_description}."
-    response.message().body(msg)
+    if not manager_ok:
+        msg += (
+            "\n\nYour manager could not be notified on WhatsApp. "
+            "Ask them to send Hi to this Alubee number once, then try again or contact admin."
+        )
+    _send_to(sender, msg)
 
 
-def _handle_od_session(sender, incoming_msg, session_data, response):
-    """Continue in-progress OD flow. Caller must only invoke for ``_OD_SESSION_STATES``."""
-    state = session_data.get("state")
+def _normalize_od_reason_choice(incoming: str) -> str:
+    choice = incoming.strip().upper().replace(" ", "_")
+    if choice == "1":
+        return "UNIT_I"
+    if choice == "2":
+        return "UNIT_II"
+    if choice == "3":
+        return "OTHER"
+    if choice == "UNITII":
+        return "UNIT_II"
+    return choice
+
+
+def _go_back_to_od_reason_pick(sender: str, session: dict | None = None) -> None:
+    name = _employee_name_for(sender, session)
+    _session_merge(sender, state="WAITING_OD_REASON_PICK", employee_name=name)
+    _send_od_reason_buttons(sender)
+
+
+def _go_back_to_company_vehicle(sender: str, reason: str, session: dict | None = None) -> None:
+    name = _employee_name_for(sender, session)
+    _session_merge(
+        sender,
+        state="WAITING_COMPANY_VEHICLE_YESNO",
+        od_reason=reason,
+        employee_name=name,
+        uses_company_vehicle=None,
+        company_vehicle_id="",
+        company_vehicle="",
+        company_vehicle_description="",
+    )
+    _send_company_vehicle_buttons(sender, reason)
+
+
+def _go_back_from_confirm(sender: str, session: dict) -> None:
+    reason = (session.get("od_reason") or "").strip()
+    if session.get("uses_company_vehicle") and (
+        session.get("company_vehicle_id") or session.get("vehicle_ids")
+    ):
+        ids = session.get("vehicle_ids") or []
+        if session.get("company_vehicle_id") and session["company_vehicle_id"] not in ids:
+            ids = list(ids) + [session["company_vehicle_id"]]
+        vehicles = _fetch_vehicles()
+        if not vehicles:
+            _go_back_to_company_vehicle(sender, reason, session)
+            return
+        _session_merge(
+            sender,
+            state="WAITING_VEHICLE_PICK",
+            od_reason=reason,
+            vehicle_ids=[v["vehicle_id"] for v in vehicles],
+            employee_name=session.get("employee_name"),
+            uses_company_vehicle=True,
+        )
+        _send_dynamic_vehicle_list(sender, vehicles)
+        return
+    _go_back_to_company_vehicle(sender, reason, session)
+
+
+def _prompt_od_reason_typing(sender: str, session: dict | None = None) -> None:
+    name = _employee_name_for(sender, session)
+    _session_merge(sender, state="WAITING_OD_REASON_TYPING", employee_name=name)
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            "Please write OD reason:",
+            [("BACK", "Back")],
+            callback_data="od-reason-type",
+        )
+    except Exception:
+        logger.exception("OD reason typing prompt failed")
+        _send_to(sender, "Please write OD reason:")
+
+
+def _prompt_company_vehicle(sender: str, reason: str, session: dict | None = None) -> None:
+    name = _employee_name_for(sender, session)
+    _session_merge(
+        sender,
+        state="WAITING_COMPANY_VEHICLE_YESNO",
+        od_reason=reason,
+        employee_name=name,
+    )
+    _send_company_vehicle_buttons(sender, reason)
+
+
+def _locked_step_hint(session: dict) -> str:
+    state = session.get("state")
+    reason = (session.get("od_reason") or "").strip()
+    if state == "WAITING_OD_REASON_PICK":
+        return "Choose Unit I, Unit II, Other, or Back."
+    if state == "WAITING_COMPANY_VEHICLE_YESNO":
+        return f"Reason: {reason}. Tap YES, NO, or Back."
+    if state == "WAITING_VEHICLE_PICK":
+        return "Pick a vehicle from the list, or reply BACK."
+    if state == "WAITING_OD_REASON_TYPING":
+        return "Write your OD reason, or tap Back."
+    if state == "WAITING_OD_CONFIRM":
+        return "Tap Submit, Cancel, or Back to review or change your choices."
+    return "Use the options for this step, or send Hi to start over."
+
+
+def _handle_od_back(sender: str, session: dict) -> None:
+    state = session.get("state")
+    reason = (session.get("od_reason") or "").strip()
 
     if state == "WAITING_OD_REASON_PICK":
+        _go_back_to_main_menu(sender, session)
+        return
+    if state == "WAITING_OD_REASON_TYPING":
+        _go_back_to_od_reason_pick(sender, session)
+        return
+    if state == "WAITING_COMPANY_VEHICLE_YESNO":
+        _go_back_to_od_reason_pick(sender, session)
+        return
+    if state == "WAITING_VEHICLE_PICK":
+        _go_back_to_company_vehicle(sender, reason, session)
+        return
+    if state == "WAITING_OD_CONFIRM":
+        _go_back_from_confirm(sender, session)
+        return
+    _go_back_to_main_menu(sender, session)
 
-        choice = incoming_msg.strip().upper().replace(" ", "_")
 
-        if choice == "UNIT_I":
-            _prompt_company_vehicle(sender, "Unit I", response)
-        elif choice in ("UNIT_II", "UNITII"):
-            _prompt_company_vehicle(sender, "Unit II", response)
-        elif choice == "OTHER":
-            db.collection("sessions").document(sender).set({
-                "state": "WAITING_OD_REASON_TYPING",
-            })
-            response.message().body(
-                "Please type your OD reason."
-            )
+def _handle_od_session(sender: str, incoming: str, session: dict) -> None:
+    state = session.get("state")
+    choice = incoming.strip().upper().replace(" ", "_")
+    reason = (session.get("od_reason") or "").strip()
+
+    if choice == "BACK":
+        _handle_od_back(sender, session)
+        return
+
+    if choice == "CANCEL":
+        if state == "WAITING_OD_CONFIRM":
+            _cancel_od_flow(sender, session)
         else:
-            response.message().body(
-                "Please tap Unit I, Unit II, or Other on the message above, "
-                "or send Hi to start over."
-            )
+            _send_to(sender, "You can cancel on the final review screen, or reply BACK step by step.")
+        return
+
+    if state == "WAITING_OD_CONFIRM":
+        if choice == "SUBMIT":
+            _submit_od_from_session(sender, session)
+            return
+        if choice not in _CONFIRM_CHOICES:
+            _send_to(sender, _locked_step_hint(session))
+        return
+
+    if state == "WAITING_OD_REASON_PICK":
+        choice = _normalize_od_reason_choice(incoming)
+        if choice not in _OD_REASON_CHOICES:
+            _send_to(sender, "Choose Unit I, Unit II, or Other — or send Hi to start over.")
+            return
+        if choice == "UNIT_I":
+            _prompt_company_vehicle(sender, "Unit I")
+        elif choice == "UNIT_II":
+            _prompt_company_vehicle(sender, "Unit II")
+        else:
+            _prompt_od_reason_typing(sender, session)
 
     elif state == "WAITING_OD_REASON_TYPING":
-
-        reason = incoming_msg.strip()
-        if not reason:
-            response.message().body("Please type your OD reason.")
+        if choice in _OD_REASON_CHOICES or choice in _CONFIRM_CHOICES:
+            _send_to(sender, _locked_step_hint(session))
+            return
+        reason_text = incoming.strip()
+        if reason_text:
+            _prompt_company_vehicle(sender, reason_text, session)
         else:
-            _prompt_company_vehicle(sender, reason, response)
+            _send_to(sender, "Please write OD reason, or tap Back.")
 
     elif state == "WAITING_COMPANY_VEHICLE_YESNO":
-
-        choice = incoming_msg.strip().upper()
-        reason = (session_data.get("od_reason") or "").strip()
-
+        if choice in _OD_REASON_CHOICES or choice in _CONFIRM_CHOICES:
+            _send_to(sender, _locked_step_hint(session))
+            return
+        if choice not in _COMPANY_VEHICLE_CHOICES:
+            _send_to(sender, _locked_step_hint(session))
+            return
         if choice == "YES":
-            vehicles = _fetch_available_vehicles()
+            vehicles = _fetch_vehicles()
             if not vehicles:
                 db.collection("sessions").document(sender).delete()
-                response.message().body(
-                    "No company vehicles are available right now. "
-                    "Your OD was not submitted. Send Hi to try again."
+                _send_to(
+                    sender,
+                    "No company vehicles available. Send Hi to try again.",
                 )
             else:
-                vehicle_ids = [v["vehicle_id"] for v in vehicles]
-                db.collection("sessions").document(sender).set({
-                    "state": "WAITING_VEHICLE_PICK",
-                    "od_reason": reason,
-                    "vehicle_ids": vehicle_ids,
-                })
-                _send_vehicle_pick_list(sender, vehicles)
-        elif choice == "NO":
-            _submit_od_request(
-                sender,
-                reason,
-                response,
-                uses_company_vehicle=False,
-            )
+                ids = [v["vehicle_id"] for v in vehicles]
+                _session_merge(
+                    sender,
+                    state="WAITING_VEHICLE_PICK",
+                    od_reason=reason,
+                    vehicle_ids=ids,
+                    uses_company_vehicle=True,
+                    employee_name=session.get("employee_name"),
+                )
+                _send_dynamic_vehicle_list(sender, vehicles)
         else:
-            response.message().body(
-                "Please tap YES or NO on the Company Vehicle message, "
-                "or send Hi to start over."
+            _show_od_confirm(
+                sender,
+                {
+                    **session,
+                    "od_reason": reason,
+                    "uses_company_vehicle": False,
+                    "company_vehicle_id": "",
+                    "company_vehicle": "",
+                    "company_vehicle_description": "",
+                },
             )
 
     elif state == "WAITING_VEHICLE_PICK":
-
-        reason = (session_data.get("od_reason") or "").strip()
-        vehicle_ids = session_data.get("vehicle_ids") or []
-        picked = _resolve_vehicle_pick(incoming_msg, vehicle_ids)
-        if not picked:
-            response.message().body(
-                "Invalid selection. Reply with the number or vehicle ID from the list."
+        if choice in _OD_REASON_CHOICES or choice in _COMPANY_VEHICLE_CHOICES:
+            _send_to(sender, _locked_step_hint(session))
+            return
+        ids = session.get("vehicle_ids") or []
+        picked = _resolve_vehicle_pick(incoming, ids)
+        if picked:
+            _show_od_confirm(
+                sender,
+                {
+                    **session,
+                    "od_reason": reason,
+                    "uses_company_vehicle": True,
+                    "company_vehicle_id": picked["company_vehicle_id"],
+                    "company_vehicle": picked["company_vehicle"],
+                    "company_vehicle_description": picked["company_vehicle_description"],
+                },
             )
         else:
-            _submit_od_request(
+            _send_to(
                 sender,
-                reason,
-                response,
-                uses_company_vehicle=True,
-                company_vehicle_id=picked["company_vehicle_id"],
-                company_vehicle=picked["company_vehicle"],
-                company_vehicle_description=picked["company_vehicle_description"],
+                "Invalid selection. Pick from the list (number or ID), or reply BACK.",
             )
 
 
-# =========================================================
-# FASTAPI
-# =========================================================
+def _start_od(sender: str) -> None:
+    user = db.collection("users").document(sender).get()
+    name = "Employee"
+    if user.exists:
+        name = user.to_dict().get("name") or name
+    _session_merge(
+        sender,
+        state="WAITING_OD_REASON_PICK",
+        employee_name=name,
+        form_type="OD_REQUEST",
+    )
+    _send_od_reason_buttons(sender)
 
-app = FastAPI()
+
+def _extract_message(message_field) -> str:
+    """Plain text, or list/button reply id from InteractiveListReply webhooks."""
+    if isinstance(message_field, dict):
+        if message_field.get("type") == "list_reply":
+            lr = message_field.get("list_reply") or {}
+            if lr.get("id"):
+                return str(lr["id"])
+        if message_field.get("type") == "button_reply":
+            br = message_field.get("button_reply") or {}
+            if br.get("id"):
+                return str(br["id"])
+        br = message_field.get("button_reply")
+        if isinstance(br, dict) and br.get("id"):
+            return str(br["id"])
+        lr = message_field.get("list_reply")
+        if isinstance(lr, dict) and lr.get("id"):
+            return str(lr["id"])
+        return str(
+            message_field.get("id")
+            or message_field.get("title")
+            or message_field.get("message")
+            or message_field.get("text")
+            or ""
+        )
+    raw = str(message_field or "").strip()
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return _extract_message(parsed)
+        except json.JSONDecodeError:
+            pass
+    return raw
 
 
-@app.get("/")
-def root():
-    return {"service": "alubee-whatsapp-bot", "status": "ok"}
+def _parse_webhook(body: dict) -> tuple[str, str] | None:
+    wtype = (body.get("type") or "").strip()
+    if wtype != "message_received":
+        return None
+
+    data = body.get("data") or {}
+    customer = data.get("customer") or {}
+    msg_obj = data.get("message") or {}
+
+    phone = str(customer.get("phone_number") or "")
+    if not phone:
+        phone = str(customer.get("channel_phone_number") or "")
+
+    wa_id = phone_to_wa_id(phone)
+    raw_msg = msg_obj.get("message")
+    incoming = _normalize_choice(_extract_message(raw_msg))
+    logger.info(
+        "parsed incoming=%s content_type=%s",
+        incoming,
+        msg_obj.get("message_content_type"),
+    )
+    return wa_id, incoming
+
+
+def _process(sender: str, incoming: str) -> None:
+    logger.info("process sender=%s incoming=%s", sender, incoming)
+    _touch_whatsapp_inbound(sender)
+
+    if incoming.lower() in ("hi", "hello"):
+        user = db.collection("users").document(sender).get()
+        if user.exists:
+            name = user.to_dict().get("name", "Employee")
+            _session_merge(sender, state=_SESSION_MENU_IDLE, employee_name=name)
+            _send_main_menu(sender, name)
+        else:
+            _session_ref(sender).delete()
+            _send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+
+    if _handle_approval_gate(sender, incoming):
+        return
+
+    session_doc = _session_ref(sender).get()
+    session = session_doc.to_dict() if session_doc.exists else None
+    state = (session or {}).get("state")
+
+    if state == _SESSION_AWAITING_HI:
+        _send_to(sender, "Send Hi to start.")
+        return
+
+    if state in _OD_SESSION_STATES:
+        _handle_od_session(sender, incoming, session)
+        return
+
+    if incoming == "1" or incoming == "OD_REQUEST":
+        if state == _SESSION_MENU_IDLE:
+            _try_start_od(sender)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("2", "3", "4", "5") or incoming in _UNSUPPORTED_REQUEST_IDS:
+        _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
+        return
+
+    if session_doc.exists:
+        _send_to(sender, "Invalid session state")
+        return
+
+    _send_to(sender, "Send Hi to start.")
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    key = (os.getenv("INTERAKT_API_KEY") or "").strip()
+    return {
+        "status": "ok",
+        "provider": "interakt",
+        "runtime": "cloud_run" if _running_on_cloud_run() else "local",
+        "api_key_set": bool(key),
+        "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
+        "manager": MANAGER_WHATSAPP_NUMBER,
+        "jmd": JMD_WHATSAPP_NUMBER,
+        "md": MD_WHATSAPP_NUMBER,
+    }
 
 
-# =========================================================
-# WEBHOOK (Twilio must POST here; "/" also accepted if URL omits /webhook)
-# =========================================================
+@app.post("/webhook")
+@app.post("/")
+async def webhook(request: Request):
+    body = await request.json()
+    logger.info("webhook: %s", json.dumps(body, default=str)[:2500])
 
-@app.api_route("/webhook", methods=["POST"])
-@app.api_route("/", methods=["POST"])
-async def whatsapp_webhook(request: Request):
+    parsed = _parse_webhook(body)
+    if parsed:
+        sender, incoming = parsed
+        try:
+            _process(sender, incoming)
+        except Exception:
+            logger.exception("process failed")
 
-    form_data = await request.form()
-    print("Body:", form_data.get("Body"))
-    print("ButtonPayload:", form_data.get("ButtonPayload"))
-    print("ListId:", form_data.get("ListId"))
-
-    incoming_msg = _parse_incoming_choice(form_data)
-    sender = form_data.get("From", "")
-
-    print("===================================")
-    print("Message :", incoming_msg)
-    print("Sender  :", sender)
-    print("===================================")
-
-    response = MessagingResponse()
-
-    # =====================================================
-    # START / HI
-    # =====================================================
-
-    if incoming_msg.lower() == "hi":
-
-        # Abandon any in-progress OD / vehicle flow and return to main menu
-        db.collection("sessions").document(sender).delete()
-
-        # fetch user details
-        user_doc = db.collection("users").document(sender).get()
-
-        if user_doc.exists:
-
-            user_data = user_doc.to_dict()
-
-            employee_name = user_data.get("name", "Employee")
-
-            menu_vars = _list_picker_menu_variables(employee_name)
-            try:
-                tw_msg = client.messages.create(
-                    **_twilio_outbound_kwargs(sender),
-                    content_sid=CONTENT_SID_LIST_PICKER_MENU,
-                    content_variables=menu_vars,
-                )
-                print(
-                    "List picker menu:",
-                    "sid=", tw_msg.sid,
-                    "status=", tw_msg.status,
-                    "error_code=", getattr(tw_msg, "error_code", None),
-                    "content_variables=", menu_vars,
-                )
-                if getattr(tw_msg, "error_code", None):
-                    response.message().body(_numbered_request_menu(employee_name))
-            except Exception as e:
-                print(
-                    "List picker menu send failed:",
-                    repr(e),
-                    "template=", CONTENT_SID_LIST_PICKER_MENU,
-                    "content_variables=", menu_vars,
-                )
-                response.message().body(_numbered_request_menu(employee_name))
-
-        else:
-
-            response.message().body(
-                "User not registered.\n"
-                "Please contact admin."
-            )
-
-    else:
-
-        session_doc = db.collection("sessions").document(sender).get()
-        session_data = session_doc.to_dict() if session_doc.exists else None
-        state = (session_data or {}).get("state")
-
-        # Before "session exists" check — approver has WAITING_APPROVAL_ACTION session
-        if _handle_approval_gate(sender, incoming_msg, response):
-            pass
-
-        elif state in _OD_SESSION_STATES:
-            # Before menu shortcuts: vehicle pick uses "1"–"13", not main menu
-            _handle_od_session(sender, incoming_msg, session_data, response)
-
-        elif incoming_msg == "1" or incoming_msg.upper() == "OD_REQUEST":
-
-            db.collection("sessions").document(sender).set({
-                "state": "WAITING_OD_REASON_PICK",
-            })
-
-            try:
-                tw_msg = client.messages.create(
-                    **_twilio_outbound_kwargs(sender),
-                    content_sid=CONTENT_SID_OD_REASON,
-                )
-                print(
-                    "OD reason template:",
-                    "sid=", tw_msg.sid,
-                    "status=", tw_msg.status,
-                    "error_code=", getattr(tw_msg, "error_code", None),
-                    "template=", CONTENT_SID_OD_REASON,
-                )
-                if getattr(tw_msg, "error_code", None):
-                    raise RuntimeError("Twilio returned error_code on OD reason template")
-            except Exception as e:
-                print(
-                    "OD reason template send failed:",
-                    repr(e),
-                    "template=", CONTENT_SID_OD_REASON,
-                )
-                db.collection("sessions").document(sender).set({
-                    "state": "WAITING_OD_REASON_TYPING",
-                })
-                response.message().body(
-                    "Please type your OD reason (reason template could not be sent)."
-                )
-
-        elif (
-            incoming_msg in ("2", "3", "4", "5")
-            or incoming_msg.upper() in _UNSUPPORTED_REQUEST_IDS
-        ):
-
-            response.message().body(REQUEST_CANNOT_BE_RAISED_MSG)
-
-        elif session_doc.exists:
-
-            response.message().body("Invalid session state")
-
-        else:
-
-            response.message().body(
-                "Send 'Hi' to start."
-            )
-
-    return Response(
-        content=str(response),
-        media_type="application/xml"
-    )
+    return {"status": "success"}

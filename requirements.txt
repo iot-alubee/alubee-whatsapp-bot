@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-python-multipart
 python-dotenv
-twilio>=9.0.0
+requests
 firebase-admin

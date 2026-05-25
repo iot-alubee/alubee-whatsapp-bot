@@ -1,33 +1,53 @@
-# Deploy WhatsApp bot (Production folder → Cloud Run)
+# Deploy Interakt OD bot (this folder → Cloud Run)
 
-This directory is the **only** build context for the Twilio webhook service.  
-The Flask security portal stays in `../alubee_flask_app/` (separate Cloud Run service).
+This directory is the **only** build context for the Interakt webhook service.  
+Local development uses `../` (parent `Interakt/` folder with `.env`).
 
 ## Prerequisites
 
 - [Google Cloud SDK](https://cloud.google.com/sdk) (`gcloud`) installed and logged in
-- GCP project with **Cloud Run** and **Artifact Registry** (or Cloud Build) enabled
-- Firestore: project `whatsapp-approval-system`
-- Twilio WhatsApp sender + Content templates (SIDs in `main.py`)
+- GCP project with **Cloud Run** enabled
+- Firestore project: `whatsapp-approval-system`
+- Interakt API key + WhatsApp number connected in [Interakt](https://app.interakt.ai)
 
 ## 1. Firestore IAM
 
-On project **`whatsapp-approval-system`**, grant the **Cloud Run runtime service account** (e.g. `PROJECT_NUMBER-compute@developer.gserviceaccount.com`):
+On **`whatsapp-approval-system`**, grant the Cloud Run runtime service account:
 
-- **Cloud Datastore User** (Firestore access)
+- **Cloud Datastore User**
 
-Use Application Default Credentials on Cloud Run. Do **not** ship `firebase-adminsdk.json` in the container.
+Use Application Default Credentials on Cloud Run. Do **not** ship `firebase-adminsdk.json` in the image.
+
+**Do not set** on Cloud Run (can break ADC):
+
+- `GOOGLE_APPLICATION_CREDENTIALS`
+- `FIREBASE_CREDENTIALS_JSON`
 
 ## 2. Deploy
 
-From this folder:
+From **this folder** (`Interakt/Production`):
+
+```powershell
+cd "path\to\alubee-whatsapp-bot-system\Interakt\Production"
+
+$env:PROJECT_ID = "alubee-prod"
+$env:REGION = "asia-south1"
+$env:SERVICE_NAME = "alubee-interakt-od-bot"
+
+gcloud run deploy $env:SERVICE_NAME `
+  --source . `
+  --platform managed `
+  --region $env:REGION `
+  --project $env:PROJECT_ID `
+  --allow-unauthenticated
+```
+
+Bash:
 
 ```bash
-cd "path/to/alubee-whatsapp-bot-system/Production"
-
 export PROJECT_ID=alubee-prod
 export REGION=asia-south1
-export SERVICE_NAME=alubee-whatsapp-api-latest
+export SERVICE_NAME=alubee-interakt-od-bot
 
 gcloud run deploy "$SERVICE_NAME" \
   --source . \
@@ -37,51 +57,30 @@ gcloud run deploy "$SERVICE_NAME" \
   --allow-unauthenticated
 ```
 
-`--source .` must run inside **`Production/`** (where this `Dockerfile` and `main.py` are).
+## 3. Cloud Run environment variables
 
-## 3. Environment variables
+Service → **Edit revision** → **Variables and secrets**:
 
-Cloud Run → service → **Edit revision** → **Variables and secrets**:
+| Variable | Required | Example |
+|----------|----------|---------|
+| `INTERAKT_API_KEY` | **Yes** | From [Developer settings](https://app.interakt.ai/settings/developer-setting) |
+| `FIREBASE_PROJECT_ID` | Yes | `whatsapp-approval-system` |
+| `MANAGER_WHATSAPP_NUMBER` | Yes | `whatsapp:+919994246682` |
+| `JMD_WHATSAPP_NUMBER` | Yes | `whatsapp:+917339221730` |
+| `MD_WHATSAPP_NUMBER` | Yes | `whatsapp:+917538866308` |
+| `WHATSAPP_SESSION_HOURS` | No | `24` (default) |
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TWILIO_ACCOUNT_SID` | Yes | Twilio Account SID |
-| `TWILIO_AUTH_TOKEN` | Yes | Twilio Auth Token (prefer Secret Manager) |
-| `TWILIO_WHATSAPP_NUMBER` | Yes | e.g. `whatsapp:+91XXXXXXXXXX` |
-| `FIREBASE_PROJECT_ID` | Yes | `whatsapp-approval-system` (also set in Dockerfile) |
-| `MD_WHATSAPP_NUMBER` | Recommended | MD WhatsApp id for final approval |
-| `TWILIO_MESSAGING_SERVICE_SID` | **Yes (production)** | `MG…` — add **+917397743357** to this service’s sender pool |
+Store `INTERAKT_API_KEY` in **Secret Manager** when possible.
 
-Without `TWILIO_MESSAGING_SERVICE_SID`, manager/MD approval templates often fail with **63016** until they send **Hi** (24h session workaround).
+## 4. Interakt webhook
 
-**Create Messaging Service:** Twilio → Messaging → Services → Create → Senders → add your WhatsApp number → copy `MGxxxxxxxx`.
+After deploy, copy the service URL from Cloud Run, then in Interakt:
 
-**Do not set** on Cloud Run (disabled keys cause JWT errors):
+- Webhook URL: `https://YOUR-SERVICE-XXXX.run.app/webhook`
+- Event: **message_received**
+- Method: **POST**
 
-- `FIREBASE_CREDENTIALS_JSON`
-- `GOOGLE_APPLICATION_CREDENTIALS`
-
-Example with Secret Manager:
-
-```bash
-gcloud secrets create twilio-auth-token --project="$PROJECT_ID" --data-file=-
-# paste token, Ctrl-D / Ctrl-Z
-
-gcloud run services update "$SERVICE_NAME" \
-  --region="$REGION" \
-  --project="$PROJECT_ID" \
-  --set-secrets=TWILIO_AUTH_TOKEN=twilio-auth-token:latest
-```
-
-## 4. Twilio webhook
-
-After deploy, set the WhatsApp sandbox or production sender webhook to:
-
-```
-https://YOUR-SERVICE-XXXX.run.app/webhook
-```
-
-Method: **POST**. (`POST /` is also accepted.)
+Turn off Interakt **Greeting / welcome** automations so they do not clash with the bot.
 
 ## 5. Health check
 
@@ -89,18 +88,17 @@ Method: **POST**. (`POST /` is also accepted.)
 curl "https://YOUR-SERVICE-XXXX.run.app/health"
 ```
 
-Expected: `{"status":"ok"}`
+Expected JSON includes `"status":"ok"` and `"api_key_set":true`.
 
-Send **Hi** on WhatsApp to confirm the menu.
+## 6. Sync code before redeploy
 
-This folder has **no** `.env` file. All secrets and config come from **Cloud Run environment variables** (or Secret Manager). `.dockerignore` blocks `.env` if one is added by mistake.
+After editing `../main.py` or `../interakt_api.py` locally:
 
-For local testing, use the repo root (`../`) with its `.env` — not this folder.
-
-## Syncing code from repo root
-
-After changing the bot in `../main.py`, copy the latest into this folder before redeploying:
-
-```bash
-cp ../main.py ./main.py
+```powershell
+Copy-Item ..\main.py .\main.py
+Copy-Item ..\interakt_api.py .\interakt_api.py
 ```
+
+Then re-apply Cloud Run–specific changes in this folder’s `main.py` if you maintain them only here, or keep Cloud Run logic in the parent and copy wholesale.
+
+This image has **no** `.env` file. All config comes from Cloud Run env vars.
