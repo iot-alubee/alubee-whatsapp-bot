@@ -374,6 +374,9 @@ def _send_approval_buttons(
         )
         return False
 
+    rid = (request_id or "").strip()
+    approve_id = f"APPROVE_{rid}"[:256]
+    deny_id = f"DENY_{rid}"[:256]
     body = (
         "OD approval request\n\n"
         f"Employee: {_chat_name(employee_name)}\n"
@@ -385,7 +388,7 @@ def _send_approval_buttons(
         send_reply_buttons(
             wa_id_to_phone(wa_id),
             body,
-            [("APPROVE", "Approve"), ("DENY", "Deny")],
+            [(approve_id, "Approve"), (deny_id, "Deny")],
             callback_data=request_id,
             ensure_contact=True,
             contact_name=_chat_name(employee_name),
@@ -398,7 +401,7 @@ def _send_approval_buttons(
             send_reply_buttons(
                 wa_id_to_phone(wa_id),
                 body,
-                [("APPROVE", "Approve"), ("DENY", "Deny")],
+                [(approve_id, "Approve"), (deny_id, "Deny")],
                 callback_data=request_id,
             )
             return True
@@ -419,10 +422,10 @@ def _resolve_approval(incoming: str, approver: str):
     raw = (incoming or "").strip()
     um = raw.upper()
     if um.startswith("APPROVE_"):
-        rid = raw.split("_", 1)[1].strip()
+        rid = um[len("APPROVE_") :].strip()
         return (True, rid) if rid else (None, None)
     if um.startswith("DENY_"):
-        rid = raw.split("_", 1)[1].strip()
+        rid = um[len("DENY_") :].strip()
         return (False, rid) if rid else (None, None)
     if um in ("APPROVE", "DENY"):
         snap = db.collection("sessions").document(approver).get()
@@ -574,13 +577,21 @@ def _handle_approval_gate(sender: str, incoming: str) -> bool:
         else:
             ref.update({
                 "manager_status": "N/A",
-                "jmd_status": "DENIED",
                 "md_status": "DENIED",
             })
             _send_to(employee, "Your OD request was not approved.")
             logger.info("md denied (final) request_id=%s", request_id)
 
-    _session_ref(sender).delete()
+    # Clear approval pointer only (keep session if approver is also an employee).
+    snap = _session_ref(sender).get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        if data.get("state") == "WAITING_APPROVAL_ACTION":
+            if db.collection("users").document(sender).get().exists:
+                _session_merge(sender, state=_SESSION_MENU_IDLE)
+            else:
+                _session_ref(sender).delete()
+
     return True
 
 
@@ -1202,6 +1213,7 @@ def health():
         "api_key_set": bool(key),
         "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
         "approval_flow": "employee → JMD1|JMD2 → MD",
+        "multi_request_approval": "per-request APPROVE_/DENY_ button ids",
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,
         "md": MD_WHATSAPP_NUMBER,

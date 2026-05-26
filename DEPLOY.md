@@ -88,7 +88,7 @@ Turn off Interakt **Greeting / welcome** automations so they do not clash with t
 curl "https://YOUR-SERVICE-XXXX.run.app/health"
 ```
 
-Expected JSON includes `"status":"ok"` and `"api_key_set":true`.
+Expected JSON includes `"status":"ok"`, `"api_key_set":true`, and `"runtime":"cloud_run"`.
 
 ## 6. Sync code before redeploy
 
@@ -104,6 +104,8 @@ Copy-Item ..\interakt_api.py .\interakt_api.py -Force
 Or deploy from this folder after it has been synced (current `main.py` / `interakt_api.py` match parent + Cloud Run).
 
 **Approval flow:** Employee → **JMD I** or **JMD II** (per user `jmd_route` from `load_users.py`) → **MD**. No manager step.
+
+**Multiple pending approvals:** Each notification uses unique `APPROVE_<request_id>` / `DENY_<request_id>` buttons so approvers can act on several ODs without “Send Hi to start”.
 
 **Firestore users:** Run `python load_users.py` from repo root after changing `EMPLOYEES` so `jmd_route` is set on each user.
 
