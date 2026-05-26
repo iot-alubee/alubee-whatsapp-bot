@@ -20,8 +20,8 @@ foreach ($name in $modules) {
 }
 
 Write-Host ""
-Write-Host "Synced: visitor list count picker, guest WhatsApp prompt, visitor_pass_code OTP template."
-Write-Host "Production/main.py unchanged (Cloud Run). Compare ../main.py if routing changed."
+Write-Host "Synced: visitor flow (1-5, names, coming from text, coming for list, guest OTP)."
+Write-Host "Production/main.py is NOT overwritten (Cloud Run bootstrap)."
 Write-Host ""
 Write-Host "Deploy:"
 Write-Host "  cd Interakt/Production"

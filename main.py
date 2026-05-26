@@ -1,10 +1,7 @@
 """
-Alubee WhatsApp bot (Interakt) — main entry: webhook, menu, routing.
+Alubee WhatsApp bot (Interakt) — Cloud Run entry: webhook, menu, routing.
 
-Request flows live in separate modules:
-  - od_request.py
-  - visitor_request.py
-  - approval.py (shared JMD → MD)
+Request flows: od_request.py, visitor_request.py, approval.py
 """
 
 from __future__ import annotations
@@ -12,11 +9,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import firebase_admin
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from firebase_admin import credentials, firestore
 
@@ -28,27 +25,39 @@ from interakt_api import phone_to_wa_id, send_list_menu, send_text, wa_id_to_pho
 
 _APP_DIR = Path(__file__).resolve().parent
 
+_CLOUD_RUN_STRIP_CRED_ENV = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "FIREBASE_CREDENTIALS_PATH",
+    "FIREBASE_CREDENTIALS_JSON",
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _load_env() -> None:
+def _running_on_cloud_run() -> bool:
+    return bool(os.environ.get("K_SERVICE"))
+
+
+if not _running_on_cloud_run():
+    from dotenv import load_dotenv
+
     env_file = _APP_DIR / ".env"
     if env_file.is_file():
         load_dotenv(env_file, override=True)
-        return
-    example = _APP_DIR / ".env.example"
-    if example.is_file():
-        load_dotenv(example, override=True)
-        logger.warning(
-            "Interakt/.env not found — loaded .env.example. "
-            "Copy .env.example to .env for your real API key."
-        )
-        return
-    logger.warning("No Interakt/.env — set INTERAKT_API_KEY before sending messages.")
+    else:
+        example = _APP_DIR / ".env.example"
+        if example.is_file():
+            load_dotenv(example, override=True)
 
 
-_load_env()
+@contextmanager
+def _cloud_run_metadata_credentials_env():
+    saved = {k: os.environ.pop(k) for k in _CLOUD_RUN_STRIP_CRED_ENV if k in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
 
 FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "whatsapp-approval-system").strip()
 
@@ -154,34 +163,61 @@ _ROW_IDS = {
     "cancel": "CANCEL",
     "approve": "APPROVE",
     "deny": "DENY",
-    "visitor_reason_customer": "CUSTOMER_VISIT",
-    "visitor_reason_other": "OTHER",
+    "visitor_coming_for_customer": "CUSTOMER_VISIT",
+    "visitor_coming_for_technical": "TECHNICAL_WORK",
+    "visitor_coming_for_other": "OTHER",
     "customer_visit": "CUSTOMER_VISIT",
+    "technical_work": "TECHNICAL_WORK",
 }
 
 
 def _init_firebase() -> None:
     opts = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+
+    def _try_adc():
+        cred = credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred, opts)
+
     try:
         firebase_admin.get_app()
         return
     except ValueError:
         pass
+
+    if _running_on_cloud_run():
+        if any(os.environ.get(k) for k in _CLOUD_RUN_STRIP_CRED_ENV):
+            logger.warning(
+                "Cloud Run: use service account IAM for Firestore; "
+                "ignoring GOOGLE_APPLICATION_CREDENTIALS / FIREBASE_CREDENTIALS_JSON."
+            )
+        with _cloud_run_metadata_credentials_env():
+            _try_adc()
+        return
+
+    json_raw = (os.getenv("FIREBASE_CREDENTIALS_JSON") or "").strip()
+    if json_raw:
+        firebase_admin.initialize_app(credentials.Certificate(json.loads(json_raw)), opts)
+        return
+
     cred_path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if not cred_path:
         cred_path = str(_APP_DIR / "firebase-adminsdk.json")
     elif not os.path.isabs(cred_path):
         cred_path = str(_APP_DIR / cred_path)
-    if not os.path.isfile(cred_path):
+    if not cred_path or not os.path.isfile(cred_path):
         cred_path = str(_APP_DIR.parent / "firebase-adminsdk.json")
     if os.path.isfile(cred_path):
         firebase_admin.initialize_app(credentials.Certificate(cred_path), opts)
         return
-    firebase_admin.initialize_app(options=opts)
+
+    _try_adc()
 
 
 _init_firebase()
 db = firestore.client()
+
+if _running_on_cloud_run() and not (os.getenv("INTERAKT_API_KEY") or "").strip():
+    raise RuntimeError("Cloud Run requires INTERAKT_API_KEY environment variable.")
 
 app = FastAPI(title="Alubee Interakt bot")
 
@@ -511,7 +547,7 @@ def health():
         "status": "ok",
         "provider": "interakt",
         "api_key_set": bool(key),
-        "env_file": "Interakt/.env" if (_APP_DIR / ".env").is_file() else "missing",
+        "runtime": "cloud_run" if _running_on_cloud_run() else "local",
         "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,

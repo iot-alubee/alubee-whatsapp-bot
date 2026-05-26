@@ -166,8 +166,13 @@ def _approval_message_body(
     if req_type == "VISITOR":
         rd = request_rd or {}
         names = ", ".join(rd.get("visitor_names") or []) or "—"
-        coming = (
-            (rd.get("visit_reason_label") or rd.get("organization") or "").strip()
+        coming_from = (
+            (rd.get("coming_from") or rd.get("coming_from_label") or rd.get("organization") or "")
+            .strip()
+            or "—"
+        )
+        coming_for = (
+            (rd.get("coming_for_label") or rd.get("visit_for_label") or "").strip()
             or "—"
         )
         test_tag = "[TEST] " if rd.get("approval_test") else ""
@@ -176,9 +181,10 @@ def _approval_message_body(
             f"Employee: {emp}\n"
             f"Department: {dept}\n"
             f"People: {rd.get('people_count') or '—'}\n"
-            f"Coming from: {coming}\n"
             f"Names: {names}\n"
-            f"Visitor WhatsApp: {rd.get('guest_phone') or '—'}\n\n"
+            f"Coming from: {coming_from}\n"
+            f"Coming for: {coming_for}\n"
+            f"Guest WhatsApp: {rd.get('guest_phone') or '—'}\n\n"
             "Please approve or deny."
         )
     return (
