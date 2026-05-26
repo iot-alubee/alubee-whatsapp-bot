@@ -420,21 +420,22 @@ def _set_pending_approval(recipient: str, request_id: str) -> None:
 
 def _resolve_approval(incoming: str, approver: str):
     raw = (incoming or "").strip()
-    um = raw.upper()
-    if um.startswith("APPROVE_"):
-        rid = um[len("APPROVE_") :].strip()
+    upper = raw.upper()
+    # Firestore document ids are case-sensitive — keep suffix casing from the button id.
+    if upper.startswith("APPROVE_"):
+        rid = raw[8:].strip()
         return (True, rid) if rid else (None, None)
-    if um.startswith("DENY_"):
-        rid = um[len("DENY_") :].strip()
+    if upper.startswith("DENY_"):
+        rid = raw[4:].strip()
         return (False, rid) if rid else (None, None)
-    if um in ("APPROVE", "DENY"):
+    if upper in ("APPROVE", "DENY"):
         snap = db.collection("sessions").document(approver).get()
         if snap.exists:
             data = snap.to_dict() or {}
             if data.get("state") == "WAITING_APPROVAL_ACTION":
                 rid = (data.get("approval_request_id") or "").strip()
                 if rid:
-                    return um == "APPROVE", rid
+                    return upper == "APPROVE", rid
     return None, None
 
 
@@ -523,7 +524,8 @@ def _handle_approval_gate(sender: str, incoming: str) -> bool:
     ref = db.collection("requests").document(request_id)
     snap = ref.get()
     if not snap.exists:
-        logger.warning("request not found %s", request_id)
+        logger.warning("request not found %s (from incoming=%s)", request_id, incoming)
+        _send_to(sender, "This approval link is invalid or already handled. Check for another OD message.")
         return True
 
     rd = snap.to_dict()
