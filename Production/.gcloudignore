@@ -1,0 +1,11 @@
+.git
+.gitignore
+
+firebase-adminsdk.json
+*credentials*.json
+.env
+.env.*
+
+__pycache__
+.venv
+venv

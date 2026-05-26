@@ -1,0 +1,16 @@
+# Credentials — use ADC + IAM on Cloud Run
+firebase-adminsdk.json
+*credentials*.json
+*service*acc*.json
+.env
+.env.*
+
+__pycache__
+*.py[cod]
+.venv
+venv
+.git
+.gitignore
+.dockerignore
+.gcloudignore
+DEPLOY.md
