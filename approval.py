@@ -30,10 +30,12 @@ class ApprovalDeps:
     whatsapp_session_hours: int
     menu_idle_state: str
     on_visitor_md_approved: Callable[[object, dict], None]
-    # Production visitor approvers (all VISITOR requests; OD uses jmd_i / jmd_ii / md).
+    # All visitor requests use these (not OD jmd_i / jmd_ii / md).
     visitor_jmd_i: str = ""
     visitor_jmd_ii: str = ""
     visitor_md: str = ""
+    # If true, Unit II employees (jmd_route JMD2) use visitor_jmd_ii; else everyone uses visitor_jmd_i.
+    visitor_route_by_unit: bool = False
     # Optional: listed employees use test numbers instead (for pilot testing).
     visitor_test_jmd_i: str = ""
     visitor_test_jmd_ii: str = ""
@@ -63,12 +65,15 @@ def _use_visitor_test_approvers(employee_wa: str) -> bool:
 
 
 def _visitor_jmd_for_route(d: ApprovalDeps, jmd_route: str, *, use_test: bool) -> str:
+    """Dedicated visitor JMD — never OD approvers. Default: same JMD for every employee."""
+    route = (jmd_route or "").strip().upper()
+    by_unit = d.visitor_route_by_unit and route == "JMD2"
     if use_test and d.visitor_test_jmd_i:
-        if (jmd_route or "").strip().upper() == "JMD2" and d.visitor_test_jmd_ii:
+        if by_unit and d.visitor_test_jmd_ii:
             return d.visitor_test_jmd_ii
         return d.visitor_test_jmd_i
     if d.visitor_jmd_i:
-        if (jmd_route or "").strip().upper() == "JMD2" and d.visitor_jmd_ii:
+        if by_unit and d.visitor_jmd_ii:
             return d.visitor_jmd_ii
         return d.visitor_jmd_i
     return ""
@@ -136,8 +141,8 @@ def build_approval_chain(
             md = ""
         if not jmd or not md:
             logger.error(
-                "visitor approvers not configured (set VISITOR_JMD_* and VISITOR_MD, "
-                "or VISITOR_TEST_* for pilot employees)"
+                "visitor approvers not configured — set VISITOR_JMD_I_WHATSAPP_NUMBER "
+                "and VISITOR_MD_WHATSAPP_NUMBER on Cloud Run (separate from OD JMD/MD)"
             )
             return None
         chain = {"jmd": jmd, "jmd_route": jmd_route, "md": md, "visitor_approval": True}

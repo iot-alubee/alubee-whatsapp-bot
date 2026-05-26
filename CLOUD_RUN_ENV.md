@@ -4,18 +4,34 @@ Set these in **Google Cloud Console → Cloud Run → your service → Edit & de
 
 Do **not** bake secrets into the Docker image. The container does not read a `.env` file in production.
 
+## Visitor vs OD (important)
+
+| Request type | Who approves |
+|--------------|--------------|
+| **OD** (menu option 1) | `JMD_I_*`, `JMD_II_*`, `MD_WHATSAPP_NUMBER` |
+| **Visitor** (menu option 5) | `VISITOR_JMD_*`, `VISITOR_MD_*` only |
+
+**Every employee** who submits a visitor request goes to the **visitor** JMD and MD you set below — not the OD approvers. You do **not** need `VISITOR_TEST_*` for normal use (leave those unset).
+
+Minimum for visitor (all users, one JMD + one MD):
+
+- `VISITOR_JMD_I_WHATSAPP_NUMBER` — your new visitor JMD  
+  (alias: `VISITOR_JMD_WHATSAPP_NUMBER`)
+- `VISITOR_MD_WHATSAPP_NUMBER` — your new visitor MD  
+
+Optional: `VISITOR_JMD_II_WHATSAPP_NUMBER` only if `VISITOR_ROUTE_BY_UNIT=true` and Unit II should use a different visitor JMD.
+
 ## Required
 
 | Name | Example / value |
 |------|-----------------|
 | `INTERAKT_API_KEY` | From [Interakt Developer settings](https://app.interakt.ai/settings/developer-setting) |
 | `FIREBASE_PROJECT_ID` | `whatsapp-approval-system` |
-| `JMD_I_WHATSAPP_NUMBER` | `whatsapp:+917339221730` (OD Unit I JMD) |
-| `JMD_II_WHATSAPP_NUMBER` | `whatsapp:+919659756070` (OD Unit II JMD) |
-| `MD_WHATSAPP_NUMBER` | `whatsapp:+917538866308` (OD final MD) |
-| `VISITOR_JMD_I_WHATSAPP_NUMBER` | Your visitor Unit I JMD |
-| `VISITOR_JMD_II_WHATSAPP_NUMBER` | Your visitor Unit II JMD |
-| `VISITOR_MD_WHATSAPP_NUMBER` | Your visitor final MD |
+| `JMD_I_WHATSAPP_NUMBER` | OD Unit I JMD |
+| `JMD_II_WHATSAPP_NUMBER` | OD Unit II JMD |
+| `MD_WHATSAPP_NUMBER` | OD final MD |
+| `VISITOR_JMD_I_WHATSAPP_NUMBER` | **All** visitor requests → this JMD (unless route-by-unit) |
+| `VISITOR_MD_WHATSAPP_NUMBER` | **All** visitor requests → this MD |
 | `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
@@ -26,11 +42,9 @@ Do **not** bake secrets into the Docker image. The container does not read a `.e
 | Name | Default | Purpose |
 |------|---------|---------|
 | `WHATSAPP_SESSION_HOURS` | `24` | Approver must message Alubee within this window for Approve/Deny buttons |
-| `VISITOR_TEST_JMD_WHATSAPP_NUMBER` | — | Pilot: test JMD (both units if I/II not set) |
-| `VISITOR_TEST_JMD_I_WHATSAPP_NUMBER` | — | Pilot: test JMD Unit I |
-| `VISITOR_TEST_JMD_II_WHATSAPP_NUMBER` | — | Pilot: test JMD Unit II |
-| `VISITOR_TEST_MD_WHATSAPP_NUMBER` | — | Pilot: test MD |
-| `VISITOR_TEST_EMPLOYEE_WHATSAPP_NUMBERS` | — | Comma-separated; only these employees use TEST visitor approvers |
+| `VISITOR_JMD_II_WHATSAPP_NUMBER` | same as `VISITOR_JMD_I` | Only used when `VISITOR_ROUTE_BY_UNIT=true` and employee is Unit II |
+| `VISITOR_ROUTE_BY_UNIT` | `false` | `true` = Unit II employees use `VISITOR_JMD_II`; else **everyone** uses `VISITOR_JMD_I` |
+| `VISITOR_TEST_*` | — | **Pilot only** — leave unset in production |
 
 ## Do not set on Cloud Run
 
@@ -65,4 +79,4 @@ gcloud run services update alubee-interakt-od-bot `
   --set-env-vars "FIREBASE_PROJECT_ID=whatsapp-approval-system,WHATSAPP_SESSION_HOURS=24,VISITOR_OTP_TEMPLATE_NAME=visitor_pass_code,VISITOR_OTP_TEMPLATE_LANGUAGE_CODE=en,VISITOR_OTP_TEMPLATE_BODY_FIELDS=otp,VISITOR_OTP_TEMPLATE_AUTH_BUTTON=true"
 ```
 
-Set secrets and phone numbers separately (Console UI is easier for many vars). Use **Secret Manager** for `INTERAKT_API_KEY` when possible.
+Set `VISITOR_JMD_I_WHATSAPP_NUMBER`, `VISITOR_MD_WHATSAPP_NUMBER`, and secrets in the Console UI (easier for phone numbers). Use **Secret Manager** for `INTERAKT_API_KEY` when possible.

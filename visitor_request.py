@@ -471,7 +471,10 @@ def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
     chain = deps.build_approval_chain(ud, sender)
     if not chain:
         deps.clear_session(sender)
-        deps.send_to(sender, "Approval chain not configured.\nPlease contact admin.")
+        deps.send_to(
+            sender,
+            "Visitor approvers are not configured on the server.\nPlease contact admin.",
+        )
         return
 
     names = list(session.get("visitor_names") or [])
