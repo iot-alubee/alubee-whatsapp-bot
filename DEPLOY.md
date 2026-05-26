@@ -1,35 +1,41 @@
-# Deploy Interakt OD bot (this folder → Cloud Run)
+# Deploy Alubee Interakt bot (Production folder → Cloud Run)
 
-This directory is the **only** build context for the Interakt webhook service.  
-Local development uses `../` (parent `Interakt/` folder with `.env`).
+Deploy **only** from `Interakt/Production/`. Local dev uses parent `Interakt/` with `.env`.
+
+## Layout
+
+| File | Role |
+|------|------|
+| `main.py` | Webhook, menu, Cloud Run Firebase init |
+| `od_request.py` | OD flow |
+| `visitor_request.py` | Visitor flow + guest OTP |
+| `approval.py` | JMD → MD (OD + visitor approvers) |
+| `interakt_api.py` | Interakt API (text, buttons, templates) |
+| `bot_shared.py` | Shared Firestore helpers |
 
 ## Prerequisites
 
-- [Google Cloud SDK](https://cloud.google.com/sdk) (`gcloud`) installed and logged in
-- GCP project with **Cloud Run** enabled
-- Firestore project: `whatsapp-approval-system`
-- Interakt API key + WhatsApp number connected in [Interakt](https://app.interakt.ai)
+- Google Cloud SDK (`gcloud`), logged in
+- Firestore project `whatsapp-approval-system`
+- Interakt API key + webhook on your WhatsApp number
+- Template **`visitor_pass_code`** approved (guest OTP)
 
-## 1. Firestore IAM
-
-On **`whatsapp-approval-system`**, grant the Cloud Run runtime service account:
-
-- **Cloud Datastore User**
-
-Use Application Default Credentials on Cloud Run. Do **not** ship `firebase-adminsdk.json` in the image.
-
-**Do not set** on Cloud Run (can break ADC):
-
-- `GOOGLE_APPLICATION_CREDENTIALS`
-- `FIREBASE_CREDENTIALS_JSON`
-
-## 2. Deploy
-
-From **this folder** (`Interakt/Production`):
+## 1. Sync code before deploy
 
 ```powershell
 cd "path\to\alubee-whatsapp-bot-system\Interakt\Production"
+.\sync-from-parent.ps1
+```
 
+## 2. Firestore IAM
+
+Grant the Cloud Run service account **Cloud Datastore User** on `whatsapp-approval-system`.
+
+Do **not** set on Cloud Run: `GOOGLE_APPLICATION_CREDENTIALS`, `FIREBASE_CREDENTIALS_JSON`.
+
+## 3. Deploy
+
+```powershell
 $env:PROJECT_ID = "alubee-prod"
 $env:REGION = "asia-south1"
 $env:SERVICE_NAME = "alubee-interakt-od-bot"
@@ -42,71 +48,52 @@ gcloud run deploy $env:SERVICE_NAME `
   --allow-unauthenticated
 ```
 
-Bash:
+## 4. Cloud Run environment variables
+
+**Set all values in Cloud Run** (Console → Variables and secrets). The image does not load `.env`.
+
+Full checklist: **`CLOUD_RUN_ENV.md`** · quick list: **`.env.example`**
+
+Minimum:
+
+| Variable | Purpose |
+|----------|---------|
+| `INTERAKT_API_KEY` | **Required** |
+| `FIREBASE_PROJECT_ID` | `whatsapp-approval-system` |
+| `JMD_I_WHATSAPP_NUMBER` | OD — Unit I JMD |
+| `JMD_II_WHATSAPP_NUMBER` | OD — Unit II JMD |
+| `MD_WHATSAPP_NUMBER` | OD — final approver |
+| `VISITOR_JMD_I_WHATSAPP_NUMBER` | Visitor — Unit I JMD |
+| `VISITOR_JMD_II_WHATSAPP_NUMBER` | Visitor — Unit II JMD |
+| `VISITOR_MD_WHATSAPP_NUMBER` | Visitor — final approver |
+| `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
+| `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
+| `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
+| `VISITOR_OTP_TEMPLATE_AUTH_BUTTON` | `true` |
+
+Optional pilot testing (test JMD/MD for listed employees only):
+
+- `VISITOR_TEST_JMD_WHATSAPP_NUMBER`, `VISITOR_TEST_MD_WHATSAPP_NUMBER`
+- `VISITOR_TEST_EMPLOYEE_WHATSAPP_NUMBERS`
+
+## 5. Interakt webhook
+
+- URL: `https://YOUR-SERVICE.run.app/webhook`
+- Event: `message_received`
+- Disable conflicting Interakt greeting automations
+
+## 6. Health check
 
 ```bash
-export PROJECT_ID=alubee-prod
-export REGION=asia-south1
-export SERVICE_NAME=alubee-interakt-od-bot
-
-gcloud run deploy "$SERVICE_NAME" \
-  --source . \
-  --platform managed \
-  --region "$REGION" \
-  --project "$PROJECT_ID" \
-  --allow-unauthenticated
+curl "https://YOUR-SERVICE.run.app/health"
 ```
 
-## 3. Cloud Run environment variables
+Expect: `"status":"ok"`, `"api_key_set":true`, `"runtime":"cloud_run"`, `"visitor_approvers_configured":true`, `"visitor_otp_template":"visitor_pass_code"`.
 
-Service → **Edit revision** → **Variables and secrets**:
+## 7. Flows
 
-| Variable | Required | Example |
-|----------|----------|---------|
-| `INTERAKT_API_KEY` | **Yes** | From [Developer settings](https://app.interakt.ai/settings/developer-setting) |
-| `FIREBASE_PROJECT_ID` | Yes | `whatsapp-approval-system` |
-| `JMD_I_WHATSAPP_NUMBER` | Yes | JMD1 employees — `whatsapp:+917339221730` |
-| `JMD_II_WHATSAPP_NUMBER` | Yes | JMD2 employees — `whatsapp:+919659756070` |
-| `MD_WHATSAPP_NUMBER` | Yes | `whatsapp:+917538866308` |
-| `WHATSAPP_SESSION_HOURS` | No | `24` (default) |
+- **OD:** Employee → OD JMD (by unit) → OD MD  
+- **Visitor:** Employee → Visitor JMD → Visitor MD → OTP to employee + guest (`visitor_pass_code` template)  
+- Approvers need **Hi** to Alubee within 24h for Approve/Deny buttons. Guests do not.
 
-Store `INTERAKT_API_KEY` in **Secret Manager** when possible.
-
-## 4. Interakt webhook
-
-After deploy, copy the service URL from Cloud Run, then in Interakt:
-
-- Webhook URL: `https://YOUR-SERVICE-XXXX.run.app/webhook`
-- Event: **message_received**
-- Method: **POST**
-
-Turn off Interakt **Greeting / welcome** automations so they do not clash with the bot.
-
-## 5. Health check
-
-```bash
-curl "https://YOUR-SERVICE-XXXX.run.app/health"
-```
-
-Expected JSON includes `"status":"ok"`, `"api_key_set":true`, and `"runtime":"cloud_run"`.
-
-## 6. Sync code before redeploy
-
-After editing `../main.py` or `../interakt_api.py` locally, copy into this folder and keep the Cloud Run bootstrap in `main.py` (ADC on Cloud Run, optional `.env` when testing this folder locally):
-
-```powershell
-cd "path\to\alubee-whatsapp-bot-system\Interakt\Production"
-Copy-Item ..\main.py .\main.py -Force
-Copy-Item ..\interakt_api.py .\interakt_api.py -Force
-# Restore Production-only blocks in main.py: _running_on_cloud_run, _init_firebase, health runtime
-```
-
-Or deploy from this folder after it has been synced (current `main.py` / `interakt_api.py` match parent + Cloud Run).
-
-**Approval flow:** Employee → **JMD I** or **JMD II** (per user `jmd_route` from `load_users.py`) → **MD**. No manager step.
-
-**Multiple pending approvals:** Each notification uses unique `APPROVE_<request_id>` / `DENY_<request_id>` buttons so approvers can act on several ODs without “Send Hi to start”.
-
-**Firestore users:** Run `python load_users.py` from repo root after changing `EMPLOYEES` so `jmd_route` is set on each user.
-
-This image has **no** `.env` file. All config comes from Cloud Run env vars.
+Run `python load_users.py` from repo root after changing employees.

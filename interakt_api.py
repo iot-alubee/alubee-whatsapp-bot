@@ -105,6 +105,48 @@ def ensure_customer(phone: str, *, name: str = "", user_id: str = "") -> None:
         logger.exception("Interakt track user failed phone=%s", phone_to_10(phone))
 
 
+def send_template(
+    phone: str,
+    template_name: str,
+    *,
+    language_code: str = "en",
+    body_values: list[str] | None = None,
+    button_values: dict[str, list[str]] | None = None,
+    callback_data: str = "",
+    campaign_id: str = "",
+    ensure_contact: bool = False,
+    contact_name: str = "",
+) -> dict[str, Any]:
+    """
+    Approved WhatsApp template — works without an active 24h session (business-initiated).
+    Authentication templates also need buttonValues (same OTP in body + copy button).
+    """
+    if ensure_contact:
+        ensure_customer(phone, name=contact_name or "Guest")
+    template: dict[str, Any] = {
+        "name": template_name.strip(),
+        "languageCode": (language_code or "en").strip(),
+    }
+    if body_values:
+        template["bodyValues"] = [str(v)[:1024] for v in body_values]
+    if button_values:
+        template["buttonValues"] = {
+            k: [str(v)[:15] for v in vals]
+            for k, vals in button_values.items()
+        }
+    payload: dict[str, Any] = {
+        "countryCode": "+91",
+        "phoneNumber": phone_to_10(phone),
+        "type": "Template",
+        "template": template,
+    }
+    if callback_data:
+        payload["callbackData"] = callback_data[:512]
+    if campaign_id:
+        payload["campaignId"] = campaign_id[:256]
+    return _post(payload)
+
+
 def send_text(phone: str, text: str, *, callback_data: str = "") -> dict[str, Any]:
     """Text requires data.message as a plain string (per Interakt API)."""
     payload: dict[str, Any] = {
@@ -269,3 +311,66 @@ def send_reply_buttons(
         ensure_contact=ensure_contact,
         contact_name=contact_name,
     )
+
+
+def _template_body_values_from_spec(spec: str, values: dict[str, str]) -> list[str]:
+    """Build bodyValues order from env e.g. name,otp,organization."""
+    keys = [k.strip().lower() for k in (spec or "name,otp,organization").split(",") if k.strip()]
+    out: list[str] = []
+    for key in keys:
+        out.append(str(values.get(key, ""))[:1024])
+    return out
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = (os.getenv(name) or ("true" if default else "false")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def send_guest_visit_otp(
+    phone: str,
+    *,
+    guest_name: str,
+    otp: str,
+    organization: str,
+) -> bool:
+    """
+    Send visit OTP to a guest who may never have messaged Alubee (no session).
+    Default template: visitor_pass_code (Authentication — body + copy button).
+    """
+    template_name = (os.getenv("VISITOR_OTP_TEMPLATE_NAME") or "visitor_pass_code").strip()
+    if not template_name:
+        logger.error("VISITOR_OTP_TEMPLATE_NAME is empty — cannot WhatsApp guest")
+        return False
+
+    lang = (os.getenv("VISITOR_OTP_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    body_spec = (os.getenv("VISITOR_OTP_TEMPLATE_BODY_FIELDS") or "otp").strip()
+    otp_code = str(otp or "").strip()[:15]
+    body_values = _template_body_values_from_spec(
+        body_spec,
+        {
+            "name": (guest_name or "Guest")[:50],
+            "otp": otp_code,
+            "organization": (organization or "Alubee")[:200],
+        },
+    )
+    button_values = None
+    if _env_flag("VISITOR_OTP_TEMPLATE_AUTH_BUTTON", default=True):
+        button_values = {"0": [otp_code]}
+
+    try:
+        send_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            button_values=button_values,
+            callback_data="visitor-otp",
+            ensure_contact=True,
+            contact_name=(guest_name or "Guest")[:50],
+        )
+        logger.info("guest visit OTP template sent phone=%s", phone_to_10(phone))
+        return True
+    except Exception:
+        logger.exception("guest visit OTP template failed phone=%s", phone_to_10(phone))
+        return False

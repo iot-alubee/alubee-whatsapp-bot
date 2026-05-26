@@ -1,7 +1,7 @@
 """
-Alubee WhatsApp OD bot — Interakt InteractiveList (menu) + buttons + text vehicle list.
+Alubee WhatsApp bot (Interakt) — Cloud Run entry: webhook, menu, routing.
 
-Flow: Hi → list menu → OD reason buttons → company vehicle → numbered text vehicles → approval.
+Request flows: od_request.py, visitor_request.py, approval.py
 """
 
 from __future__ import annotations
@@ -15,17 +15,13 @@ from pathlib import Path
 
 import firebase_admin
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from firebase_admin import credentials, firestore
 
-from interakt_api import (
-    ensure_customer,
-    phone_to_wa_id,
-    send_list_menu,
-    send_reply_buttons,
-    send_text,
-    wa_id_to_phone,
-)
+import approval
+import bot_shared
+import od_request
+import visitor_request
+from interakt_api import phone_to_wa_id, send_list_menu, send_text, wa_id_to_phone
 
 _APP_DIR = Path(__file__).resolve().parent
 
@@ -66,7 +62,7 @@ def _cloud_run_metadata_credentials_env():
 
 FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "whatsapp-approval-system").strip()
 
-# Approver numbers (10-digit mobiles → whatsapp:+91…)
+
 def _wa_from_mobile(mobile: str) -> str:
     digits = "".join(c for c in (mobile or "") if c.isdigit())
     if len(digits) == 10:
@@ -88,32 +84,65 @@ MD_WHATSAPP_NUMBER = (
     os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
 ).strip()
 
-# WhatsApp session window for outbound session messages (JMD/MD approval).
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
 
-REQUEST_CANNOT_BE_RAISED_MSG = "This request cannot be raised now. Thanks!"
 
-OD_ALREADY_PENDING_MSG = "Your OD request is already pending."
+def _parse_whatsapp_id_set(env_value: str) -> frozenset[str]:
+    out: set[str] = set()
+    for part in (env_value or "").split(","):
+        raw = part.strip()
+        if not raw:
+            continue
+        if raw.lower().startswith("whatsapp:"):
+            out.add(raw.lower())
+            continue
+        digits = "".join(c for c in raw if c.isdigit())
+        if len(digits) == 10:
+            out.add(f"whatsapp:+91{digits}")
+        elif len(digits) == 12 and digits.startswith("91"):
+            out.add(f"whatsapp:+{digits}")
+    return frozenset(out)
+
+
+VISITOR_JMD_I_WHATSAPP_NUMBER = (
+    os.getenv("VISITOR_JMD_I_WHATSAPP_NUMBER")
+    or os.getenv("VISITOR_JMD_WHATSAPP_NUMBER")
+    or ""
+).strip()
+VISITOR_JMD_II_WHATSAPP_NUMBER = (
+    os.getenv("VISITOR_JMD_II_WHATSAPP_NUMBER")
+    or os.getenv("VISITOR_JMD_WHATSAPP_NUMBER")
+    or VISITOR_JMD_I_WHATSAPP_NUMBER
+).strip()
+VISITOR_MD_WHATSAPP_NUMBER = (os.getenv("VISITOR_MD_WHATSAPP_NUMBER") or "").strip()
+
+VISITOR_TEST_JMD_I_WHATSAPP_NUMBER = (
+    os.getenv("VISITOR_TEST_JMD_I_WHATSAPP_NUMBER")
+    or os.getenv("VISITOR_TEST_JMD_WHATSAPP_NUMBER")
+    or ""
+).strip()
+VISITOR_TEST_JMD_II_WHATSAPP_NUMBER = (
+    os.getenv("VISITOR_TEST_JMD_II_WHATSAPP_NUMBER")
+    or os.getenv("VISITOR_TEST_JMD_WHATSAPP_NUMBER")
+    or VISITOR_TEST_JMD_I_WHATSAPP_NUMBER
+).strip()
+VISITOR_TEST_MD_WHATSAPP_NUMBER = (os.getenv("VISITOR_TEST_MD_WHATSAPP_NUMBER") or "").strip()
+VISITOR_TEST_EMPLOYEE_WA_IDS = _parse_whatsapp_id_set(
+    os.getenv("VISITOR_TEST_EMPLOYEE_WHATSAPP_NUMBERS", "")
+)
+
+REQUEST_CANNOT_BE_RAISED_MSG = "This request cannot be raised now. Thanks!"
+VISITOR_ALREADY_PENDING_MSG = "You already have a visitor request pending approval."
 
 _UNSUPPORTED_REQUEST_IDS = frozenset({
     "VEHICLE_REQUEST",
     "LEAVE_REQUEST",
     "PERMISSION_REQUEST",
-    "VISITOR_REQUEST",
 })
 
-_OD_SESSION_STATES = frozenset({
-    "WAITING_OD_REASON_PICK",
-    "WAITING_OD_REASON_TYPING",
-    "WAITING_COMPANY_VEHICLE_YESNO",
-    "WAITING_VEHICLE_PICK",
-    "WAITING_OD_CONFIRM",
-})
+SESSION_MENU_IDLE = "MENU_IDLE"
+SESSION_AWAITING_HI = "AWAITING_HI"
 
-_SESSION_MENU_IDLE = "MENU_IDLE"
-_SESSION_AWAITING_HI = "AWAITING_HI"
-
-# List row id (lowercase) → internal choice
 _ROW_IDS = {
     "od_request": "OD_REQUEST",
     "vehicle_request": "VEHICLE_REQUEST",
@@ -132,11 +161,10 @@ _ROW_IDS = {
     "cancel": "CANCEL",
     "approve": "APPROVE",
     "deny": "DENY",
+    "visitor_plus": "VISITOR_PLUS",
+    "visitor_minus": "VISITOR_MINUS",
+    "visitor_next": "VISITOR_NEXT",
 }
-
-_OD_REASON_CHOICES = frozenset({"UNIT_I", "UNIT_II", "OTHER"})
-_COMPANY_VEHICLE_CHOICES = frozenset({"YES", "NO"})
-_CONFIRM_CHOICES = frozenset({"SUBMIT", "CANCEL", "BACK"})
 
 
 def _init_firebase() -> None:
@@ -187,7 +215,7 @@ db = firestore.client()
 if _running_on_cloud_run() and not (os.getenv("INTERAKT_API_KEY") or "").strip():
     raise RuntimeError("Cloud Run requires INTERAKT_API_KEY environment variable.")
 
-app = FastAPI(title="Alubee Interakt OD bot")
+app = FastAPI(title="Alubee Interakt bot")
 
 
 def _utcnow():
@@ -203,12 +231,10 @@ def _whatsapp_activity_ref(wa_id: str):
 
 
 def _touch_whatsapp_inbound(wa_id: str) -> None:
-    """Record last inbound message (opens 24h session for outbound session messages)."""
     _whatsapp_activity_ref(wa_id).set({"last_inbound_at": _utcnow()}, merge=True)
 
 
 def _has_active_whatsapp_session(wa_id: str) -> bool:
-    """True if this user messaged Alubee within WHATSAPP_SESSION_HOURS."""
     snap = _whatsapp_activity_ref(wa_id).get()
     if not snap.exists:
         return False
@@ -234,6 +260,108 @@ def _chat_name(name) -> str:
     return raw.title() if raw else "Employee"
 
 
+def _same_whatsapp(a: str, b: str) -> bool:
+    return bool(a and b and a.strip().lower() == b.strip().lower())
+
+
+def _send_to(wa_id: str, text: str) -> None:
+    try:
+        send_text(wa_id_to_phone(wa_id), text)
+    except Exception:
+        logger.exception("send_text failed to=%s", wa_id)
+
+
+bot_shared.configure(
+    db=db,
+    send_to=_send_to,
+    session_ref=_session_ref,
+    session_merge=_session_merge,
+    utcnow=_utcnow,
+    has_active_whatsapp_session=_has_active_whatsapp_session,
+    chat_name=_chat_name,
+    same_whatsapp=_same_whatsapp,
+)
+
+
+def _on_visitor_md_approved(ref, rd: dict) -> None:
+    visitor_request.send_otps_after_md_approve(ref, rd, _send_to)
+
+
+approval.configure(
+    approval.ApprovalDeps(
+        db=db,
+        send_to=_send_to,
+        session_merge=_session_merge,
+        session_ref=_session_ref,
+        utcnow=_utcnow,
+        chat_name=_chat_name,
+        same_whatsapp=_same_whatsapp,
+        has_active_whatsapp_session=_has_active_whatsapp_session,
+        jmd_i=JMD_I_WHATSAPP_NUMBER,
+        jmd_ii=JMD_II_WHATSAPP_NUMBER,
+        md=MD_WHATSAPP_NUMBER,
+        whatsapp_session_hours=WHATSAPP_SESSION_HOURS,
+        menu_idle_state=SESSION_MENU_IDLE,
+        on_visitor_md_approved=_on_visitor_md_approved,
+        visitor_jmd_i=VISITOR_JMD_I_WHATSAPP_NUMBER,
+        visitor_jmd_ii=VISITOR_JMD_II_WHATSAPP_NUMBER,
+        visitor_md=VISITOR_MD_WHATSAPP_NUMBER,
+        visitor_test_jmd_i=VISITOR_TEST_JMD_I_WHATSAPP_NUMBER,
+        visitor_test_jmd_ii=VISITOR_TEST_JMD_II_WHATSAPP_NUMBER,
+        visitor_test_md=VISITOR_TEST_MD_WHATSAPP_NUMBER,
+        visitor_test_employee_wa_ids=VISITOR_TEST_EMPLOYEE_WA_IDS,
+    )
+)
+
+
+def _build_visitor_approval_chain(user_data: dict, employee_wa: str) -> dict | None:
+    return approval.build_approval_chain(
+        user_data,
+        request_type="VISITOR",
+        employee_wa=employee_wa,
+    )
+
+
+def _go_main_menu_for_employee(sender: str) -> None:
+    user = db.collection("users").document(sender).get()
+    if user.exists:
+        name = user.to_dict().get("name", "Employee")
+        _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
+        _send_main_menu(sender, name)
+    else:
+        _session_ref(sender).delete()
+        _send_to(sender, "User not registered.\nPlease contact admin.")
+
+
+OD_DEPS = od_request.OdDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    chat_name=_chat_name,
+    same_whatsapp=_same_whatsapp,
+    build_approval_chain=approval.build_approval_chain,
+    notify_jmd=approval.notify_jmd,
+    go_main_menu=_go_main_menu_for_employee,
+    awaiting_hi_state=SESSION_AWAITING_HI,
+    already_pending_msg=od_request.OD_ALREADY_PENDING_MSG,
+)
+
+VISITOR_DEPS = visitor_request.VisitorDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    build_approval_chain=_build_visitor_approval_chain,
+    notify_jmd=approval.notify_jmd,
+    clear_session=lambda sender: _session_ref(sender).delete(),
+    go_main_menu=_go_main_menu_for_employee,
+    already_pending_msg=VISITOR_ALREADY_PENDING_MSG,
+)
+
+
 def _numbered_request_menu(employee_name: str) -> str:
     name = _chat_name(employee_name)
     return (
@@ -247,38 +375,7 @@ def _numbered_request_menu(employee_name: str) -> str:
     )
 
 
-def _normalize_choice(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    key = s.lower().replace(" ", "_").replace("-", "_")
-    if key in _ROW_IDS:
-        return _ROW_IDS[key]
-    if key.upper() in _ROW_IDS.values():
-        return key.upper()
-    titles = {
-        "od request": "OD_REQUEST",
-        "vehicle request": "VEHICLE_REQUEST",
-        "leave request": "LEAVE_REQUEST",
-        "permission request": "PERMISSION_REQUEST",
-        "visitor request": "VISITOR_REQUEST",
-    }
-    return titles.get(s.lower(), s)
-
-
-def _same_whatsapp(a: str, b: str) -> bool:
-    return bool(a and b and a.strip().lower() == b.strip().lower())
-
-
-def _send_to(wa_id: str, text: str) -> None:
-    try:
-        send_text(wa_id_to_phone(wa_id), text)
-    except Exception:
-        logger.exception("send_text failed to=%s", wa_id)
-
-
 def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
-    """InteractiveList rows: (id, title) only — no descriptions."""
     return [{"id": row_id, "title": title[:24]} for row_id, title in items]
 
 
@@ -303,803 +400,26 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         _send_to(wa_id, _numbered_request_menu(employee_name))
 
 
-def _send_od_reason_buttons(wa_id: str) -> None:
-    """InteractiveList: Unit I / Unit II / Other / Back."""
-    rows = _list_rows(
-        ("unit_i", "Unit I"),
-        ("unit_ii", "Unit II"),
-        ("other", "Other"),
-        ("back", "Back"),
-    )
-    try:
-        send_list_menu(
-            wa_id_to_phone(wa_id),
-            "OD reason:",
-            rows,
-            button_label="Select reason",
-            section_title="Reason",
-            callback_data="od-reason",
-        )
-    except Exception:
-        logger.exception("OD reason list failed")
-        _send_to(
-            wa_id,
-            "OD reason:\n1. Unit I\n2. Unit II\n3. Other\n\nReply 1, 2, 3, or BACK for menu.",
-        )
-
-
-def _send_company_vehicle_buttons(wa_id: str, reason: str) -> None:
-    """YES / NO / Back."""
-    body = f"{reason}\n\nCompany vehicle?"
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(wa_id),
-            body,
-            [("YES", "YES"), ("NO", "NO"), ("BACK", "Back")],
-            callback_data="company-vehicle",
-        )
-    except Exception:
-        logger.exception("company vehicle buttons failed")
-        _send_to(wa_id, f"{body}\n\nReply YES, NO, or BACK.")
-
-
-def _send_dynamic_vehicle_list(wa_id: str, vehicles: list) -> None:
-    """Dynamic numbered text list from Firestore (all vehicles; reply 1–N or vehicle ID)."""
-    n = len(vehicles)
-    if n == 0:
-        return
-    lines = [f"Select company vehicle ({n} available; reply with number or ID):\n"]
-    for i, v in enumerate(vehicles, start=1):
-        label = v.get("description") or v.get("vehicle_id")
-        lines.append(f"{i}. {label} ({v['vehicle_id']})")
-    lines.append("\nReply BACK to go back.")
-    _send_to(wa_id, "\n".join(lines))
-
-
-def _send_approval_buttons(
-    wa_id: str,
-    *,
-    employee_name: str,
-    department: str,
-    reason: str,
-    request_id: str,
-) -> bool:
-    """Send Approve/Deny only if approver has an active WhatsApp session (messaged Alubee recently)."""
-    if not _has_active_whatsapp_session(wa_id):
-        logger.info(
-            "skip approval notify to=%s request_id=%s (no active WhatsApp session in %sh)",
-            wa_id,
-            request_id,
-            WHATSAPP_SESSION_HOURS,
-        )
-        return False
-
-    rid = (request_id or "").strip()
-    approve_id = f"APPROVE_{rid}"[:256]
-    deny_id = f"DENY_{rid}"[:256]
-    body = (
-        "OD approval request\n\n"
-        f"Employee: {_chat_name(employee_name)}\n"
-        f"Department: {department or '—'}\n"
-        f"Reason: {reason or '—'}\n\n"
-        "Please approve or deny."
-    )
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(wa_id),
-            body,
-            [(approve_id, "Approve"), (deny_id, "Deny")],
-            callback_data=request_id,
-            ensure_contact=True,
-            contact_name=_chat_name(employee_name),
-        )
-        return True
-    except Exception as e:
-        logger.exception("approval buttons failed to=%s: %s", wa_id, e)
-        try:
-            ensure_customer(wa_id_to_phone(wa_id), name="Approver")
-            send_reply_buttons(
-                wa_id_to_phone(wa_id),
-                body,
-                [(approve_id, "Approve"), (deny_id, "Deny")],
-                callback_data=request_id,
-            )
-            return True
-        except Exception:
-            logger.exception("approval retry failed to=%s", wa_id)
-        return False
-
-
-def _set_pending_approval(recipient: str, request_id: str) -> None:
-    _session_merge(
-        recipient,
-        state="WAITING_APPROVAL_ACTION",
-        approval_request_id=request_id,
-    )
-
-
-def _resolve_approval(incoming: str, approver: str):
-    raw = (incoming or "").strip()
-    upper = raw.upper()
-    # Firestore document ids are case-sensitive — keep suffix casing from the button id.
-    if upper.startswith("APPROVE_"):
-        rid = raw[8:].strip()
-        return (True, rid) if rid else (None, None)
-    if upper.startswith("DENY_"):
-        rid = raw[4:].strip()
-        return (False, rid) if rid else (None, None)
-    if upper in ("APPROVE", "DENY"):
-        snap = db.collection("sessions").document(approver).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            if data.get("state") == "WAITING_APPROVAL_ACTION":
-                rid = (data.get("approval_request_id") or "").strip()
-                if rid:
-                    return upper == "APPROVE", rid
-    return None, None
-
-
-def _jmd_route_from_names(mgr_l1_name: str, mgr_l2_name: str) -> str:
-    """JMD1 or JMD2 from spreadsheet name columns (L2 checked first, then L1)."""
-    for name in (mgr_l2_name, mgr_l1_name):
-        key = (name or "").strip().upper().replace(" ", "")
-        if key == "JMD2":
-            return "JMD2"
-        if key == "JMD1":
-            return "JMD1"
-    return "JMD1"
-
-
-def _jmd_whatsapp_for_route(jmd_route: str) -> str:
-    if (jmd_route or "").strip().upper() == "JMD2":
-        return JMD_II_WHATSAPP_NUMBER
-    return JMD_I_WHATSAPP_NUMBER
-
-
-def _request_jmd_whatsapp(rd: dict) -> str:
-    """Resolve JMD WhatsApp from jmd_route (env), not a stale stored jmd number."""
-    route = (rd.get("jmd_route") or "").strip().upper()
-    if route in ("JMD1", "JMD2"):
-        return _jmd_whatsapp_for_route(route)
-    stored = (rd.get("jmd") or "").strip()
-    if stored:
-        return stored
-    return JMD_I_WHATSAPP_NUMBER
-
-
-def _build_approval_chain(user_data: dict | None = None) -> dict | None:
-    """Employee → JMD1 or JMD2 (per employee) → MD (final)."""
-    if not user_data:
-        return None
-    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
-    jmd = _jmd_whatsapp_for_route(jmd_route)
-    md = MD_WHATSAPP_NUMBER
-    if not jmd or not md:
-        return None
-    return {
-        "jmd": jmd,
-        "jmd_route": jmd_route,
-        "md": md,
+def _normalize_choice(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    key = s.lower().replace(" ", "_").replace("-", "_")
+    if key in _ROW_IDS:
+        return _ROW_IDS[key]
+    if key.upper() in _ROW_IDS.values():
+        return key.upper()
+    titles = {
+        "od request": "OD_REQUEST",
+        "vehicle request": "VEHICLE_REQUEST",
+        "leave request": "LEAVE_REQUEST",
+        "permission request": "PERMISSION_REQUEST",
+        "visitor request": "VISITOR_REQUEST",
     }
-
-
-def _approval_role(sender: str, rd: dict) -> str | None:
-    """JMD (I or II on request) → MD (final)."""
-    jmd_st = (rd.get("jmd_status") or "").strip().upper()
-    md_st = (rd.get("md_status") or "").strip().upper()
-    jmd_wa = _request_jmd_whatsapp(rd)
-
-    if _same_whatsapp(sender, jmd_wa) and jmd_st in ("PENDING", "AWAITING_MANAGER"):
-        return "jmd"
-
-    if (
-        _same_whatsapp(sender, MD_WHATSAPP_NUMBER)
-        and jmd_st == "APPROVED"
-        and md_st == "PENDING"
-    ):
-        return "md"
-
-    return None
-
-
-def _notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
-    if not wa_id:
-        return
-    if _send_approval_buttons(
-        wa_id,
-        employee_name=rd.get("employee_name"),
-        department=rd.get("department"),
-        reason=rd.get("reason"),
-        request_id=request_id,
-    ):
-        _set_pending_approval(wa_id, request_id)
-
-
-def _handle_approval_gate(sender: str, incoming: str) -> bool:
-    resolved = _resolve_approval(incoming, sender)
-    if resolved[0] is None:
-        return False
-
-    is_approve, request_id = resolved
-    ref = db.collection("requests").document(request_id)
-    snap = ref.get()
-    if not snap.exists:
-        logger.warning("request not found %s (from incoming=%s)", request_id, incoming)
-        _send_to(sender, "This approval link is invalid or already handled. Check for another OD message.")
-        return True
-
-    rd = snap.to_dict()
-    employee = rd.get("employee")
-    role = _approval_role(sender, rd)
-    if not role:
-        logger.warning(
-            "approval ignored sender=%s request_id=%s jmd=%s md=%s",
-            sender,
-            request_id,
-            rd.get("jmd_status"),
-            rd.get("md_status"),
-        )
-        return True
-
-    if role == "jmd":
-        if is_approve:
-            ref.update({
-                "jmd": _request_jmd_whatsapp(rd),
-                "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
-                "md": MD_WHATSAPP_NUMBER,
-                "manager_status": "N/A",
-                "jmd_status": "APPROVED",
-                "md_status": "PENDING",
-            })
-            _notify_approver(MD_WHATSAPP_NUMBER, rd, request_id)
-            logger.info("jmd approved request_id=%s → md", request_id)
-        else:
-            ref.update({
-                "manager_status": "N/A",
-                "jmd_status": "DENIED",
-                "md_status": "N/A",
-            })
-            _send_to(employee, "Your OD request was not approved.")
-            logger.info("jmd denied request_id=%s", request_id)
-
-    elif role == "md":
-        if is_approve:
-            patch = {
-                "md_status": "APPROVED",
-                "approved_datetime": _utcnow(),
-            }
-            if (rd.get("jmd_status") or "").strip().upper() in (
-                "PENDING",
-                "AWAITING_MANAGER",
-            ):
-                patch["jmd_status"] = "APPROVED"
-            ref.update(patch)
-            _send_to(employee, "Your OD has been Approved.")
-            logger.info("md approved (final) request_id=%s", request_id)
-        else:
-            ref.update({
-                "manager_status": "N/A",
-                "md_status": "DENIED",
-            })
-            _send_to(employee, "Your OD request was not approved.")
-            logger.info("md denied (final) request_id=%s", request_id)
-
-    # Clear approval pointer only (keep session if approver is also an employee).
-    snap = _session_ref(sender).get()
-    if snap.exists:
-        data = snap.to_dict() or {}
-        if data.get("state") == "WAITING_APPROVAL_ACTION":
-            if db.collection("users").document(sender).get().exists:
-                _session_merge(sender, state=_SESSION_MENU_IDLE)
-            else:
-                _session_ref(sender).delete()
-
-    return True
-
-
-def _od_request_is_closed(d: dict) -> bool:
-    """Open until JMD/MD denies or security records IN (visit closed)."""
-    for key in ("manager_status", "jmd_status", "md_status"):
-        if (d.get(key) or "").strip().upper() == "DENIED":
-            return True
-    if d.get("security_in_at"):
-        return True
-    return False
-
-
-def _find_open_od_for_employee(employee: str) -> dict | None:
-    for snap in db.collection("requests").stream():
-        d = snap.to_dict() or {}
-        if (d.get("type") or "").strip().upper() != "OD":
-            continue
-        if not _same_whatsapp(d.get("employee"), employee):
-            continue
-        if _od_request_is_closed(d):
-            continue
-        return d
-    return None
-
-
-def _try_start_od(sender: str) -> None:
-    if _find_open_od_for_employee(sender):
-        _send_to(sender, OD_ALREADY_PENDING_MSG)
-        return
-    _start_od(sender)
-
-
-def _vehicles_out_ids():
-    out = set()
-    for snap in db.collection("requests").stream():
-        d = snap.to_dict() or {}
-        if (d.get("type") or "").upper() != "OD":
-            continue
-        vid = (d.get("company_vehicle_id") or "").strip().upper()
-        if vid and d.get("security_out_at") and not d.get("security_in_at"):
-            out.add(vid)
-    return out
-
-
-def _fetch_vehicles():
-    out_ids = _vehicles_out_ids()
-    available = []
-    for snap in db.collection("vehicles").stream():
-        d = snap.to_dict() or {}
-        if d.get("active") is False:
-            continue
-        vid = (d.get("vehicle_id") or snap.id or "").strip().upper()
-        if not vid or vid in out_ids:
-            continue
-        available.append({
-            "vehicle_id": vid,
-            "vehicle": (d.get("vehicle") or "").strip(),
-            "description": (d.get("description") or "").strip(),
-        })
-    available.sort(key=lambda v: v.get("description") or v.get("vehicle_id") or "")
-    return available
-
-
-def _resolve_vehicle_pick(incoming: str, vehicle_ids: list):
-    raw = (incoming or "").strip().upper()
-    if not raw or not vehicle_ids:
-        return None
-    if raw in vehicle_ids:
-        idx = vehicle_ids.index(raw)
-    elif raw.isdigit():
-        n = int(raw)
-        if n < 1 or n > len(vehicle_ids):
-            return None
-        idx = n - 1
-    else:
-        low = incoming.strip().lower()
-        match = [i for i, v in enumerate(vehicle_ids) if v.lower() == low]
-        if not match:
-            return None
-        idx = match[0]
-    vid = vehicle_ids[idx]
-    snap = db.collection("vehicles").document(vid).get()
-    if not snap.exists:
-        return None
-    d = snap.to_dict() or {}
-    return {
-        "company_vehicle_id": vid,
-        "company_vehicle": (d.get("vehicle") or "").strip(),
-        "company_vehicle_description": (d.get("description") or "").strip(),
-    }
-
-
-def _employee_name_for(sender: str, session: dict | None) -> str:
-    if session and session.get("employee_name"):
-        return _chat_name(session["employee_name"])
-    user = db.collection("users").document(sender).get()
-    if user.exists:
-        return _chat_name(user.to_dict().get("name"))
-    return "Employee"
-
-
-def _go_back_to_main_menu(sender: str, session: dict | None = None) -> None:
-    name = _employee_name_for(sender, session)
-    _session_merge(sender, state=_SESSION_MENU_IDLE, employee_name=name)
-    _send_main_menu(sender, name)
-
-
-def _cancel_od_flow(sender: str, session: dict | None = None) -> None:
-    _session_merge(sender, state=_SESSION_AWAITING_HI)
-    _send_to(sender, "OD cancelled.\nSend Hi when you need the menu.")
-
-
-def _build_od_summary(session: dict) -> str:
-    reason = (session.get("od_reason") or "—").strip()
-    uses_cv = session.get("uses_company_vehicle")
-    lines = [
-        "Please review your OD request:\n",
-        "Request type: OD Request",
-        f"Reason: {reason}",
-    ]
-    if uses_cv is True:
-        desc = (session.get("company_vehicle_description") or "").strip()
-        vid = (session.get("company_vehicle_id") or "").strip()
-        vehicle_line = desc or vid or "—"
-        lines.append(f"Company vehicle: Yes — {vehicle_line}")
-    elif uses_cv is False:
-        lines.append("Company vehicle: No")
-    else:
-        lines.append("Company vehicle: —")
-    lines.append("\nSubmit | Cancel | Back")
-    return "\n".join(lines)
-
-
-def _send_od_confirm(sender: str, session: dict) -> None:
-    body = _build_od_summary(session)
-    _session_merge(sender, state="WAITING_OD_CONFIRM")
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(sender),
-            body,
-            [("SUBMIT", "Submit"), ("CANCEL", "Cancel"), ("BACK", "Back")],
-            callback_data="od-confirm",
-        )
-    except Exception:
-        logger.exception("OD confirm buttons failed")
-        _send_to(sender, f"{body}\n\nReply SUBMIT, CANCEL, or BACK.")
-
-
-def _show_od_confirm(sender: str, session: dict) -> None:
-    snap = _session_ref(sender).get()
-    data = {**(snap.to_dict() if snap.exists else {}), **session}
-    _session_merge(
-        sender,
-        state="WAITING_OD_CONFIRM",
-        od_reason=data.get("od_reason"),
-        uses_company_vehicle=data.get("uses_company_vehicle"),
-        company_vehicle_id=data.get("company_vehicle_id") or "",
-        company_vehicle=data.get("company_vehicle") or "",
-        company_vehicle_description=data.get("company_vehicle_description") or "",
-        employee_name=data.get("employee_name"),
-        vehicle_ids=data.get("vehicle_ids"),
-    )
-    fresh = _session_ref(sender).get()
-    _send_od_confirm(sender, fresh.to_dict() if fresh.exists else data)
-
-
-def _submit_od_from_session(sender: str, session: dict) -> None:
-    reason = (session.get("od_reason") or "").strip()
-    if not reason:
-        _send_to(sender, "Missing OD reason. Send Hi to start again.")
-        return
-    _submit_od(
-        sender,
-        reason,
-        uses_company_vehicle=bool(session.get("uses_company_vehicle")),
-        company_vehicle_id=session.get("company_vehicle_id") or "",
-        company_vehicle=session.get("company_vehicle") or "",
-        company_vehicle_description=session.get("company_vehicle_description") or "",
-    )
-
-
-def _submit_od(
-    sender: str,
-    reason: str,
-    *,
-    uses_company_vehicle: bool = False,
-    company_vehicle_id: str = "",
-    company_vehicle: str = "",
-    company_vehicle_description: str = "",
-) -> None:
-    if _find_open_od_for_employee(sender):
-        db.collection("sessions").document(sender).delete()
-        _send_to(sender, OD_ALREADY_PENDING_MSG)
-        return
-
-    user_doc = db.collection("users").document(sender).get()
-    if not user_doc.exists:
-        db.collection("sessions").document(sender).delete()
-        _send_to(sender, "User not registered.\nPlease contact admin.")
-        return
-
-    ud = user_doc.to_dict()
-    chain = _build_approval_chain(ud)
-    if not chain:
-        db.collection("sessions").document(sender).delete()
-        _send_to(sender, "Approval chain not configured.\nPlease contact admin.")
-        return
-
-    ref = db.collection("requests").document()
-    request_id = ref.id
-    ref.set({
-        "request_id": request_id,
-        "requested_datetime": _utcnow(),
-        "employee": sender,
-        "employee_id": ud.get("employee_id") or "",
-        "employee_name": ud.get("name") or "Employee",
-        "department": ud.get("department") or "",
-        "type": "OD",
-        "reason": reason,
-        "uses_company_vehicle": uses_company_vehicle,
-        "company_vehicle_id": company_vehicle_id or "",
-        "company_vehicle": company_vehicle or "",
-        "company_vehicle_description": company_vehicle_description or "",
-        "jmd": chain["jmd"],
-        "jmd_route": chain["jmd_route"],
-        "md": chain["md"],
-        "manager_status": "N/A",
-        "jmd_status": "PENDING",
-        "md_status": "AWAITING_JMD",
-    })
-    logger.info("OD created %s jmd_route=%s", request_id, chain["jmd_route"])
-
-    jmd_wa = chain["jmd"]
-    jmd_ok = _send_approval_buttons(
-        jmd_wa,
-        employee_name=ud.get("name"),
-        department=ud.get("department"),
-        reason=reason,
-        request_id=request_id,
-    )
-    if jmd_ok:
-        _set_pending_approval(jmd_wa, request_id)
-
-    db.collection("sessions").document(sender).delete()
-    msg = "OD is Submitted."
-    if uses_company_vehicle and company_vehicle_description:
-        msg += f"\nVehicle: {company_vehicle_description}."
-    if not jmd_ok:
-        route = chain["jmd_route"]
-        msg += (
-            f"\n\nJMD ({route}) could not be notified on WhatsApp. "
-            "Ask them to send Hi to this Alubee number once, then try again or contact admin."
-        )
-    _send_to(sender, msg)
-
-
-def _normalize_od_reason_choice(incoming: str) -> str:
-    choice = incoming.strip().upper().replace(" ", "_")
-    if choice == "1":
-        return "UNIT_I"
-    if choice == "2":
-        return "UNIT_II"
-    if choice == "3":
-        return "OTHER"
-    if choice == "UNITII":
-        return "UNIT_II"
-    return choice
-
-
-def _go_back_to_od_reason_pick(sender: str, session: dict | None = None) -> None:
-    name = _employee_name_for(sender, session)
-    _session_merge(sender, state="WAITING_OD_REASON_PICK", employee_name=name)
-    _send_od_reason_buttons(sender)
-
-
-def _go_back_to_company_vehicle(sender: str, reason: str, session: dict | None = None) -> None:
-    name = _employee_name_for(sender, session)
-    _session_merge(
-        sender,
-        state="WAITING_COMPANY_VEHICLE_YESNO",
-        od_reason=reason,
-        employee_name=name,
-        uses_company_vehicle=None,
-        company_vehicle_id="",
-        company_vehicle="",
-        company_vehicle_description="",
-    )
-    _send_company_vehicle_buttons(sender, reason)
-
-
-def _go_back_from_confirm(sender: str, session: dict) -> None:
-    reason = (session.get("od_reason") or "").strip()
-    if session.get("uses_company_vehicle") and (
-        session.get("company_vehicle_id") or session.get("vehicle_ids")
-    ):
-        ids = session.get("vehicle_ids") or []
-        if session.get("company_vehicle_id") and session["company_vehicle_id"] not in ids:
-            ids = list(ids) + [session["company_vehicle_id"]]
-        vehicles = _fetch_vehicles()
-        if not vehicles:
-            _go_back_to_company_vehicle(sender, reason, session)
-            return
-        _session_merge(
-            sender,
-            state="WAITING_VEHICLE_PICK",
-            od_reason=reason,
-            vehicle_ids=[v["vehicle_id"] for v in vehicles],
-            employee_name=session.get("employee_name"),
-            uses_company_vehicle=True,
-        )
-        _send_dynamic_vehicle_list(sender, vehicles)
-        return
-    _go_back_to_company_vehicle(sender, reason, session)
-
-
-def _prompt_od_reason_typing(sender: str, session: dict | None = None) -> None:
-    name = _employee_name_for(sender, session)
-    _session_merge(sender, state="WAITING_OD_REASON_TYPING", employee_name=name)
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(sender),
-            "Please write OD reason:",
-            [("BACK", "Back")],
-            callback_data="od-reason-type",
-        )
-    except Exception:
-        logger.exception("OD reason typing prompt failed")
-        _send_to(sender, "Please write OD reason:")
-
-
-def _prompt_company_vehicle(sender: str, reason: str, session: dict | None = None) -> None:
-    name = _employee_name_for(sender, session)
-    _session_merge(
-        sender,
-        state="WAITING_COMPANY_VEHICLE_YESNO",
-        od_reason=reason,
-        employee_name=name,
-    )
-    _send_company_vehicle_buttons(sender, reason)
-
-
-def _locked_step_hint(session: dict) -> str:
-    state = session.get("state")
-    reason = (session.get("od_reason") or "").strip()
-    if state == "WAITING_OD_REASON_PICK":
-        return "Choose Unit I, Unit II, Other, or Back."
-    if state == "WAITING_COMPANY_VEHICLE_YESNO":
-        return f"Reason: {reason}. Tap YES, NO, or Back."
-    if state == "WAITING_VEHICLE_PICK":
-        return "Pick a vehicle from the list, or reply BACK."
-    if state == "WAITING_OD_REASON_TYPING":
-        return "Write your OD reason, or tap Back."
-    if state == "WAITING_OD_CONFIRM":
-        return "Tap Submit, Cancel, or Back to review or change your choices."
-    return "Use the options for this step, or send Hi to start over."
-
-
-def _handle_od_back(sender: str, session: dict) -> None:
-    state = session.get("state")
-    reason = (session.get("od_reason") or "").strip()
-
-    if state == "WAITING_OD_REASON_PICK":
-        _go_back_to_main_menu(sender, session)
-        return
-    if state == "WAITING_OD_REASON_TYPING":
-        _go_back_to_od_reason_pick(sender, session)
-        return
-    if state == "WAITING_COMPANY_VEHICLE_YESNO":
-        _go_back_to_od_reason_pick(sender, session)
-        return
-    if state == "WAITING_VEHICLE_PICK":
-        _go_back_to_company_vehicle(sender, reason, session)
-        return
-    if state == "WAITING_OD_CONFIRM":
-        _go_back_from_confirm(sender, session)
-        return
-    _go_back_to_main_menu(sender, session)
-
-
-def _handle_od_session(sender: str, incoming: str, session: dict) -> None:
-    state = session.get("state")
-    choice = incoming.strip().upper().replace(" ", "_")
-    reason = (session.get("od_reason") or "").strip()
-
-    if choice == "BACK":
-        _handle_od_back(sender, session)
-        return
-
-    if choice == "CANCEL":
-        if state == "WAITING_OD_CONFIRM":
-            _cancel_od_flow(sender, session)
-        else:
-            _send_to(sender, "You can cancel on the final review screen, or reply BACK step by step.")
-        return
-
-    if state == "WAITING_OD_CONFIRM":
-        if choice == "SUBMIT":
-            _submit_od_from_session(sender, session)
-            return
-        if choice not in _CONFIRM_CHOICES:
-            _send_to(sender, _locked_step_hint(session))
-        return
-
-    if state == "WAITING_OD_REASON_PICK":
-        choice = _normalize_od_reason_choice(incoming)
-        if choice not in _OD_REASON_CHOICES:
-            _send_to(sender, "Choose Unit I, Unit II, or Other — or send Hi to start over.")
-            return
-        if choice == "UNIT_I":
-            _prompt_company_vehicle(sender, "Unit I")
-        elif choice == "UNIT_II":
-            _prompt_company_vehicle(sender, "Unit II")
-        else:
-            _prompt_od_reason_typing(sender, session)
-
-    elif state == "WAITING_OD_REASON_TYPING":
-        if choice in _OD_REASON_CHOICES or choice in _CONFIRM_CHOICES:
-            _send_to(sender, _locked_step_hint(session))
-            return
-        reason_text = incoming.strip()
-        if reason_text:
-            _prompt_company_vehicle(sender, reason_text, session)
-        else:
-            _send_to(sender, "Please write OD reason, or tap Back.")
-
-    elif state == "WAITING_COMPANY_VEHICLE_YESNO":
-        if choice in _OD_REASON_CHOICES or choice in _CONFIRM_CHOICES:
-            _send_to(sender, _locked_step_hint(session))
-            return
-        if choice not in _COMPANY_VEHICLE_CHOICES:
-            _send_to(sender, _locked_step_hint(session))
-            return
-        if choice == "YES":
-            vehicles = _fetch_vehicles()
-            if not vehicles:
-                db.collection("sessions").document(sender).delete()
-                _send_to(
-                    sender,
-                    "No company vehicles available. Send Hi to try again.",
-                )
-            else:
-                ids = [v["vehicle_id"] for v in vehicles]
-                _session_merge(
-                    sender,
-                    state="WAITING_VEHICLE_PICK",
-                    od_reason=reason,
-                    vehicle_ids=ids,
-                    uses_company_vehicle=True,
-                    employee_name=session.get("employee_name"),
-                )
-                _send_dynamic_vehicle_list(sender, vehicles)
-        else:
-            _show_od_confirm(
-                sender,
-                {
-                    **session,
-                    "od_reason": reason,
-                    "uses_company_vehicle": False,
-                    "company_vehicle_id": "",
-                    "company_vehicle": "",
-                    "company_vehicle_description": "",
-                },
-            )
-
-    elif state == "WAITING_VEHICLE_PICK":
-        if choice in _OD_REASON_CHOICES or choice in _COMPANY_VEHICLE_CHOICES:
-            _send_to(sender, _locked_step_hint(session))
-            return
-        ids = session.get("vehicle_ids") or []
-        picked = _resolve_vehicle_pick(incoming, ids)
-        if picked:
-            _show_od_confirm(
-                sender,
-                {
-                    **session,
-                    "od_reason": reason,
-                    "uses_company_vehicle": True,
-                    "company_vehicle_id": picked["company_vehicle_id"],
-                    "company_vehicle": picked["company_vehicle"],
-                    "company_vehicle_description": picked["company_vehicle_description"],
-                },
-            )
-        else:
-            _send_to(
-                sender,
-                "Invalid selection. Pick from the list (number or ID), or reply BACK.",
-            )
-
-
-def _start_od(sender: str) -> None:
-    user = db.collection("users").document(sender).get()
-    name = "Employee"
-    if user.exists:
-        name = user.to_dict().get("name") or name
-    _session_merge(
-        sender,
-        state="WAITING_OD_REASON_PICK",
-        employee_name=name,
-        form_type="OD_REQUEST",
-    )
-    _send_od_reason_buttons(sender)
+    return titles.get(s.lower(), s)
 
 
 def _extract_message(message_field) -> str:
-    """Plain text, or list/button reply id from InteractiveListReply webhooks."""
     if isinstance(message_field, dict):
         if message_field.get("type") == "list_reply":
             lr = message_field.get("list_reply") or {}
@@ -1165,36 +485,47 @@ def _process(sender: str, incoming: str) -> None:
         user = db.collection("users").document(sender).get()
         if user.exists:
             name = user.to_dict().get("name", "Employee")
-            _session_merge(sender, state=_SESSION_MENU_IDLE, employee_name=name)
+            _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
             _send_main_menu(sender, name)
         else:
             _session_ref(sender).delete()
             _send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
-    if _handle_approval_gate(sender, incoming):
+    if approval.handle_approval_gate(sender, incoming):
         return
 
     session_doc = _session_ref(sender).get()
     session = session_doc.to_dict() if session_doc.exists else None
     state = (session or {}).get("state")
 
-    if state == _SESSION_AWAITING_HI:
+    if state == SESSION_AWAITING_HI:
         _send_to(sender, "Send Hi to start.")
         return
 
-    if state in _OD_SESSION_STATES:
-        _handle_od_session(sender, incoming, session)
+    if od_request.is_od_state(state):
+        od_request.handle(sender, incoming, session or {}, OD_DEPS)
+        return
+
+    if visitor_request.is_visitor_state(state):
+        visitor_request.handle(sender, incoming, session or {}, VISITOR_DEPS)
         return
 
     if incoming == "1" or incoming == "OD_REQUEST":
-        if state == _SESSION_MENU_IDLE:
-            _try_start_od(sender)
+        if state == SESSION_MENU_IDLE:
+            od_request.try_start(sender, OD_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("2", "3", "4", "5") or incoming in _UNSUPPORTED_REQUEST_IDS:
+    if incoming == "5" or incoming == "VISITOR_REQUEST":
+        if state == SESSION_MENU_IDLE:
+            visitor_request.try_start(sender, VISITOR_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("2", "3", "4") or incoming in _UNSUPPORTED_REQUEST_IDS:
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
@@ -1211,14 +542,26 @@ def health():
     return {
         "status": "ok",
         "provider": "interakt",
-        "runtime": "cloud_run" if _running_on_cloud_run() else "local",
         "api_key_set": bool(key),
+        "runtime": "cloud_run" if _running_on_cloud_run() else "local",
         "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
-        "approval_flow": "employee → JMD1|JMD2 → MD",
-        "multi_request_approval": "per-request APPROVE_/DENY_ button ids",
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,
         "md": MD_WHATSAPP_NUMBER,
+        "visitor_jmd_i": VISITOR_JMD_I_WHATSAPP_NUMBER or None,
+        "visitor_md": VISITOR_MD_WHATSAPP_NUMBER or None,
+        "visitor_approvers_configured": bool(
+            VISITOR_JMD_I_WHATSAPP_NUMBER and VISITOR_MD_WHATSAPP_NUMBER
+        ),
+        "visitor_test_approvers_configured": bool(
+            VISITOR_TEST_JMD_I_WHATSAPP_NUMBER
+            and VISITOR_TEST_MD_WHATSAPP_NUMBER
+            and VISITOR_TEST_EMPLOYEE_WA_IDS
+        ),
+        "visitor_test_employee_count": len(VISITOR_TEST_EMPLOYEE_WA_IDS),
+        "visitor_otp_template": (
+            (os.getenv("VISITOR_OTP_TEMPLATE_NAME") or "visitor_pass_code").strip()
+        ),
     }
 
 
