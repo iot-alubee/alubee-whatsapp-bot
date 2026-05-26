@@ -230,7 +230,7 @@ def _parse_coming_for_choice(incoming: str) -> str | None:
 def _parse_comma_names(text: str, expected: int) -> tuple[list[str] | None, str]:
     parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
     if not parts:
-        return None, "Enter visitor names separated by commas."
+        return None, "Enter names separated by commas."
     valid = [p for p in parts if len(p) >= 2]
     if len(valid) < len(parts):
         return None, "Each name must be at least 2 characters."
@@ -252,7 +252,7 @@ def _send_count_picker(sender: str, deps: VisitorDeps) -> None:
     try:
         send_list_menu(
             wa_id_to_phone(sender),
-            "Visitor request\n\nHow many people?",
+            "How many people?",
             rows,
             button_label="Select count",
             section_title="Count",
@@ -260,7 +260,7 @@ def _send_count_picker(sender: str, deps: VisitorDeps) -> None:
         )
     except Exception:
         logger.exception("visitor count list failed")
-        deps.send_to(sender, "How many people? Reply 1 to 5, or BACK.")
+        deps.send_to(sender, "How many people? (1-5)")
 
 
 def _send_coming_for_picker(sender: str, deps: VisitorDeps) -> None:
@@ -281,21 +281,28 @@ def _send_coming_for_picker(sender: str, deps: VisitorDeps) -> None:
         )
     except Exception:
         logger.exception("visitor coming-for list failed")
-        deps.send_to(
-            sender,
-            "Coming for?\nReply CUSTOMER VISIT, TECHNICAL WORK, or OTHER, or BACK.",
-        )
+        deps.send_to(sender, "Coming for?")
+
+
+def _prompt_coming_from(sender: str, deps: VisitorDeps) -> None:
+    deps.send_to(sender, "Coming from?")
+
+
+def _prompt_whatsapp(sender: str, deps: VisitorDeps) -> None:
+    deps.send_to(
+        sender,
+        "Enter WhatsApp number.\n10-digit mobile. OTP sent here after approval.",
+    )
 
 
 def _prompt_comma_names(sender: str, count: int, deps: VisitorDeps) -> None:
-    example = ", ".join(f"Name{i}" for i in range(1, min(count + 1, 4)))
-    if count > 3:
-        example += ", ..."
-    deps.send_to(
-        sender,
-        f"Enter all {count} visitor name(s) in one message, separated by commas.\n"
-        f"Example ({count} people): {example}",
-    )
+    if count <= 1:
+        deps.send_to(sender, "Enter guest name.\ne.g. Raj")
+    else:
+        deps.send_to(
+            sender,
+            f"Enter guest names ({count}), comma separated.\ne.g. Raj, Priya",
+        )
 
 
 def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -307,7 +314,7 @@ def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) 
 
     count = _parse_count_choice(incoming)
     if count is None:
-        deps.send_to(sender, "Please select 1 to 5 from the list.")
+        deps.send_to(sender, "Select 1 to 5.")
         _send_count_picker(sender, deps)
         return
 
@@ -330,11 +337,7 @@ def _handle_names(sender: str, incoming: str, session: dict, deps: VisitorDeps) 
         return
 
     deps.session_merge(sender, state=VISITOR_COMING_FROM, visitor_names=names, coming_from="")
-    deps.send_to(
-        sender,
-        "Coming from?\n"
-        "Enter where the visitor(s) are coming from (company or place). Reply with text, or BACK.",
-    )
+    _prompt_coming_from(sender, deps)
 
 
 def _handle_coming_from(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -346,7 +349,7 @@ def _handle_coming_from(sender: str, incoming: str, session: dict, deps: Visitor
 
     detail = (incoming or "").strip()
     if len(detail) < 2:
-        deps.send_to(sender, "Please enter where they are coming from (at least 2 characters).")
+        deps.send_to(sender, "Coming from?")
         return
 
     deps.session_merge(
@@ -363,15 +366,12 @@ def _handle_coming_for(sender: str, incoming: str, session: dict, deps: VisitorD
     um = (incoming or "").strip().upper()
     if um == "BACK":
         deps.session_merge(sender, state=VISITOR_COMING_FROM)
-        deps.send_to(
-            sender,
-            "Coming from?\nEnter where the visitor(s) are coming from. Reply with text, or BACK.",
-        )
+        _prompt_coming_from(sender, deps)
         return
 
     choice = _parse_coming_for_choice(incoming)
     if not choice:
-        deps.send_to(sender, "Select Customer Visit, Technical Work, or Other from the list.")
+        deps.send_to(sender, "Select from the list.")
         _send_coming_for_picker(sender, deps)
         return
 
@@ -382,12 +382,7 @@ def _handle_coming_for(sender: str, incoming: str, session: dict, deps: VisitorD
         coming_for=choice,
         coming_for_label=label,
     )
-    deps.send_to(
-        sender,
-        "Guest WhatsApp number\n\n"
-        "Enter the visitor's WhatsApp number (10-digit Indian mobile, e.g. 9876543210).\n"
-        "After approval, the OTP will be sent to this number and to you.",
-    )
+    _prompt_whatsapp(sender, deps)
 
 
 def _handle_guest_phone(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -399,7 +394,7 @@ def _handle_guest_phone(sender: str, incoming: str, session: dict, deps: Visitor
 
     d = digits(incoming)
     if len(d) < 10:
-        deps.send_to(sender, "Please enter a valid 10-digit WhatsApp number.")
+        deps.send_to(sender, "Enter a valid 10-digit number.")
         return
 
     phone10 = d[-10:]
@@ -416,12 +411,12 @@ def _show_confirm(sender: str, session: dict, deps: VisitorDeps, **updates) -> N
     guest = data.get("guest_phone") or ""
 
     body = (
-        "Please confirm visitor request:\n\n"
+        "Confirm:\n\n"
         f"People: {count}\n"
         f"Names: {', '.join(names)}\n"
-        f"Coming from: {coming_from}\n"
-        f"Coming for: {coming_for}\n"
-        f"Guest WhatsApp: {guest}\n"
+        f"From: {coming_from}\n"
+        f"For: {coming_for}\n"
+        f"WhatsApp: {guest}\n"
     )
     try:
         send_reply_buttons(
@@ -452,10 +447,7 @@ def _handle_confirm(sender: str, incoming: str, session: dict, deps: VisitorDeps
     um = (incoming or "").strip().upper()
     if um == "BACK":
         deps.session_merge(sender, state=VISITOR_GUEST_PHONE)
-        deps.send_to(
-            sender,
-            "Enter the guest WhatsApp number (10 digits), or BACK.",
-        )
+        _prompt_whatsapp(sender, deps)
         return
     if um != "SUBMIT":
         deps.send_to(sender, "Reply SUBMIT to send the request, or CANCEL.")

@@ -163,9 +163,11 @@ _ROW_IDS = {
     "cancel": "CANCEL",
     "approve": "APPROVE",
     "deny": "DENY",
-    "visitor_reason_customer": "CUSTOMER_VISIT",
-    "visitor_reason_other": "OTHER",
+    "visitor_coming_for_customer": "CUSTOMER_VISIT",
+    "visitor_coming_for_technical": "TECHNICAL_WORK",
+    "visitor_coming_for_other": "OTHER",
     "customer_visit": "CUSTOMER_VISIT",
+    "technical_work": "TECHNICAL_WORK",
 }
 
 

@@ -20,7 +20,7 @@ foreach ($name in $modules) {
 }
 
 Write-Host ""
-Write-Host "Synced: visitor flow (1-5, Customer Visit/Other, comma names, guest WhatsApp OTP)."
+Write-Host "Synced: visitor flow (1-5, names, coming from text, coming for list, guest OTP)."
 Write-Host "Production/main.py is NOT overwritten (Cloud Run bootstrap)."
 Write-Host ""
 Write-Host "Deploy:"
