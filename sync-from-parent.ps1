@@ -1,6 +1,7 @@
 # Sync Interakt app modules from ../ into Production/ before Cloud Run deploy.
-# Does NOT overwrite Production/main.py (keeps Cloud Run Firebase bootstrap).
+# Production/main.py keeps Cloud Run Firebase bootstrap (not overwritten).
 
+$ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $parent = Split-Path -Parent $here
 
@@ -9,7 +10,8 @@ $modules = @(
     "bot_shared.py",
     "approval.py",
     "od_request.py",
-    "visitor_request.py"
+    "visitor_request.py",
+    "requirements.txt"
 )
 
 foreach ($name in $modules) {
@@ -17,11 +19,12 @@ foreach ($name in $modules) {
     Write-Host "Copied $name"
 }
 
-Write-Host "Update Production/.env.example manually if new env vars were added in parent."
-
 Write-Host ""
-Write-Host "Next: deploy from Interakt/Production/"
-Write-Host "  gcloud run deploy ... --source ."
+Write-Host "Synced: visitor list count picker, guest WhatsApp prompt, visitor_pass_code OTP template."
+Write-Host "Production/main.py unchanged (Cloud Run). Compare ../main.py if routing changed."
 Write-Host ""
-Write-Host "Set Cloud Run env vars from Production/.env.example"
-Write-Host "Production/main.py is unchanged — merge manually from ../main.py only if routing changed."
+Write-Host "Deploy:"
+Write-Host "  cd Interakt/Production"
+Write-Host "  gcloud run deploy alubee-interakt-od-bot --source . --region asia-south1 --project alubee-prod"
+Write-Host ""
+Write-Host "Env vars: see CLOUD_RUN_ENV.md and .env.example"

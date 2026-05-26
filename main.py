@@ -161,9 +161,6 @@ _ROW_IDS = {
     "cancel": "CANCEL",
     "approve": "APPROVE",
     "deny": "DENY",
-    "visitor_plus": "VISITOR_PLUS",
-    "visitor_minus": "VISITOR_MINUS",
-    "visitor_next": "VISITOR_NEXT",
 }
 
 

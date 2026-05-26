@@ -93,7 +93,7 @@ Expect: `"status":"ok"`, `"api_key_set":true`, `"runtime":"cloud_run"`, `"visito
 ## 7. Flows
 
 - **OD:** Employee → OD JMD (by unit) → OD MD  
-- **Visitor:** Employee → Visitor JMD → Visitor MD → OTP to employee + guest (`visitor_pass_code` template)  
+- **Visitor:** List pick 1–10 visitors → names → guest **WhatsApp** number → organization → Visitor JMD → Visitor MD → OTP to employee + guest (`visitor_pass_code` template)  
 - Approvers need **Hi** to Alubee within 24h for Approve/Deny buttons. Guests do not.
 
 Run `python load_users.py` from repo root after changing employees.

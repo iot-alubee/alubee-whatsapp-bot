@@ -9,7 +9,12 @@ import secrets
 from dataclasses import dataclass
 from typing import Callable
 
-from interakt_api import send_guest_visit_otp, send_reply_buttons, wa_id_to_phone
+from interakt_api import (
+    send_guest_visit_otp,
+    send_list_menu,
+    send_reply_buttons,
+    wa_id_to_phone,
+)
 
 from bot_shared import digits, find_open_request, wa_from_10
 
@@ -31,11 +36,6 @@ VISITOR_STATES = frozenset({
     VISITOR_ORGANIZATION,
     VISITOR_CONFIRM,
 })
-
-VISITOR_PLUS = "VISITOR_PLUS"
-VISITOR_MINUS = "VISITOR_MINUS"
-VISITOR_NEXT = "VISITOR_NEXT"
-
 
 @dataclass
 class VisitorDeps:
@@ -107,13 +107,13 @@ def try_start(sender: str, deps: VisitorDeps) -> None:
     deps.session_merge(
         sender,
         state=VISITOR_COUNT,
-        people_count=VISITOR_MIN_PEOPLE,
+        people_count=0,
         visitor_names=[],
         visitor_name_index=0,
         guest_phone="",
         organization="",
     )
-    _send_count_ui(sender, VISITOR_MIN_PEOPLE, deps)
+    _send_count_picker(sender, deps)
 
 
 def handle(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -141,7 +141,34 @@ def handle(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None
         _handle_confirm(sender, incoming, session, deps)
         return
 
-    deps.send_to(sender, "Use the buttons for this step, or send BACK to cancel.")
+    deps.send_to(sender, "Use the list or reply 1–10 for visitor count, or BACK to cancel.")
+
+
+def _parse_count_choice(incoming: str) -> int | None:
+    """List row visitor_count_N, digit N, or legacy +/- flow."""
+    raw = (incoming or "").strip()
+    if not raw:
+        return None
+    key = raw.lower().replace(" ", "_")
+    if key.startswith("visitor_count_"):
+        try:
+            n = int(key.split("_")[-1])
+        except ValueError:
+            return None
+    elif raw.isdigit():
+        n = int(raw)
+    else:
+        um = raw.upper()
+        if um.startswith("VISITOR_COUNT_"):
+            try:
+                n = int(um.split("_")[-1])
+            except ValueError:
+                return None
+        else:
+            return None
+    if VISITOR_MIN_PEOPLE <= n <= VISITOR_MAX_PEOPLE:
+        return n
+    return None
 
 
 def _people_count(session: dict) -> int:
@@ -152,56 +179,51 @@ def _people_count(session: dict) -> int:
     return max(VISITOR_MIN_PEOPLE, min(VISITOR_MAX_PEOPLE, n))
 
 
-def _send_count_ui(sender: str, count: int, deps: VisitorDeps) -> None:
-    body = (
-        "Visitor request\n\n"
-        f"Number of visitors: {count}\n\n"
-        "Use − to reduce, + to add, then tap Continue."
-    )
+def _send_count_picker(sender: str, deps: VisitorDeps) -> None:
+    """InteractiveList: pick 1–10 visitors in one tap (same pattern as main menu / OD reason)."""
+    rows = [
+        {"id": f"visitor_count_{n}", "title": f"{n} visitor{'s' if n > 1 else ''}"[:24]}
+        for n in range(VISITOR_MIN_PEOPLE, VISITOR_MAX_PEOPLE + 1)
+    ]
+    rows.append({"id": "back", "title": "Back"})
     try:
-        send_reply_buttons(
+        send_list_menu(
             wa_id_to_phone(sender),
-            body,
-            [
-                (VISITOR_MINUS, "−"),
-                (VISITOR_PLUS, "+"),
-                (VISITOR_NEXT, "Continue"),
-            ],
+            "Visitor request\n\nHow many visitors?",
+            rows,
+            button_label="Select count",
+            section_title="Visitors",
             callback_data="visitor-count",
         )
     except Exception:
-        logger.exception("visitor count buttons failed")
+        logger.exception("visitor count list failed")
         deps.send_to(
             sender,
-            f"{body}\n\nReply + or − to change count, then reply CONTINUE.",
+            "How many visitors?\nReply with a number from 1 to 10, or BACK.",
         )
 
 
 def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
     um = (incoming or "").strip().upper()
-    count = _people_count(session)
-
-    if um in (VISITOR_PLUS, "+"):
-        count = min(VISITOR_MAX_PEOPLE, count + 1)
-        deps.session_merge(sender, people_count=count)
-        _send_count_ui(sender, count, deps)
-        return
-    if um in (VISITOR_MINUS, "-", "−"):
-        count = max(VISITOR_MIN_PEOPLE, count - 1)
-        deps.session_merge(sender, people_count=count)
-        _send_count_ui(sender, count, deps)
-        return
-    if um in (VISITOR_NEXT, "CONTINUE", "NEXT", "OK", "DONE"):
-        deps.session_merge(
-            sender,
-            state=VISITOR_NAME,
-            visitor_names=[],
-            visitor_name_index=0,
-        )
-        _prompt_name(sender, 1, count, deps)
+    if um == "BACK":
+        deps.clear_session(sender)
+        deps.go_main_menu(sender)
         return
 
-    deps.send_to(sender, "Tap −, +, or Continue.")
+    count = _parse_count_choice(incoming)
+    if count is None:
+        deps.send_to(sender, "Please select 1–10 from the list, or type a number from 1 to 10.")
+        _send_count_picker(sender, deps)
+        return
+
+    deps.session_merge(
+        sender,
+        state=VISITOR_NAME,
+        people_count=count,
+        visitor_names=[],
+        visitor_name_index=0,
+    )
+    _prompt_name(sender, 1, count, deps)
 
 
 def _prompt_name(sender: str, index: int, total: int, deps: VisitorDeps) -> None:
@@ -230,14 +252,19 @@ def _handle_name(sender: str, incoming: str, session: dict, deps: VisitorDeps) -
     deps.session_merge(sender, state=VISITOR_GUEST_PHONE, visitor_names=names)
     deps.send_to(
         sender,
-        "Enter mobile number of any one visitor (10-digit Indian number):",
+        "Enter the WhatsApp phone number of any one guest "
+        "(10-digit Indian mobile, e.g. 9876543210).\n"
+        "The visit OTP will be sent to this number on WhatsApp.",
     )
 
 
 def _handle_guest_phone(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
     d = digits(incoming)
     if len(d) < 10:
-        deps.send_to(sender, "Enter a valid 10-digit mobile number.")
+        deps.send_to(
+            sender,
+            "Please enter a valid 10-digit WhatsApp number for the guest.",
+        )
         return
     phone10 = d[-10:]
     deps.session_merge(sender, state=VISITOR_ORGANIZATION, guest_phone=phone10)
@@ -262,7 +289,7 @@ def _handle_organization(sender: str, incoming: str, session: dict, deps: Visito
         "Please confirm visitor request:\n\n"
         f"Visitors: {count}\n"
         f"Names: {', '.join(names)}\n"
-        f"Guest phone: {guest}\n"
+        f"Guest WhatsApp: {guest}\n"
         f"Organization: {org}\n"
     )
     try:
@@ -279,7 +306,7 @@ def _handle_organization(sender: str, incoming: str, session: dict, deps: Visito
 def _build_summary(names: list, count: int, guest_phone: str, organization: str) -> str:
     name_str = ", ".join(names) if names else "—"
     return (
-        f"Visitors: {count} | {name_str} | Guest: {guest_phone} | From: {organization}"
+        f"Visitors: {count} | {name_str} | Guest WhatsApp: {guest_phone} | From: {organization}"
     )
 
 

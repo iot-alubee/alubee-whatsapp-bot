@@ -173,7 +173,7 @@ def _approval_message_body(
             f"Department: {dept}\n"
             f"Visitors: {rd.get('people_count') or '—'}\n"
             f"Names: {names}\n"
-            f"Guest phone: {rd.get('guest_phone') or '—'}\n"
+            f"Guest WhatsApp: {rd.get('guest_phone') or '—'}\n"
             f"From: {rd.get('organization') or '—'}\n\n"
             "Please approve or deny."
         )
