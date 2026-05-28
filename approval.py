@@ -170,14 +170,24 @@ def _approval_message_body(
     dept = department or "—"
     if req_type == "VISITOR":
         rd = request_rd or {}
-        names = ", ".join(rd.get("visitor_names") or []) or "—"
+        raw_names = rd.get("visitor_names") or []
+        if isinstance(raw_names, str):
+            names = raw_names.strip() or "—"
+        else:
+            names = ", ".join(raw_names) or "—"
+        coming_on = (rd.get("coming_on_date") or rd.get("visit_date") or "").strip() or "—"
         coming_from = (
             (rd.get("coming_from") or rd.get("coming_from_label") or rd.get("organization") or "")
             .strip()
             or "—"
         )
         coming_for = (
-            (rd.get("coming_for_label") or rd.get("visit_for_label") or "").strip()
+            (
+                rd.get("purpose_label")
+                or rd.get("coming_for_label")
+                or rd.get("visit_for_label")
+                or ""
+            ).strip()
             or "—"
         )
         test_tag = "[TEST] " if rd.get("approval_test") else ""
@@ -185,10 +195,11 @@ def _approval_message_body(
             f"{test_tag}Visitor approval request\n\n"
             f"Employee: {emp}\n"
             f"Department: {dept}\n"
+            f"Coming on: {coming_on}\n"
             f"People: {rd.get('people_count') or '—'}\n"
             f"Names: {names}\n"
             f"Coming from: {coming_from}\n"
-            f"Coming for: {coming_for}\n"
+            f"Purpose: {coming_for}\n"
             f"Guest WhatsApp: {rd.get('guest_phone') or '—'}\n\n"
             "Please approve or deny."
         )

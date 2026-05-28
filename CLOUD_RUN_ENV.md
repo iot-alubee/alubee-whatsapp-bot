@@ -36,6 +36,9 @@ Optional: `VISITOR_JMD_II_WHATSAPP_NUMBER` only if `VISITOR_ROUTE_BY_UNIT=true` 
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
 | `VISITOR_OTP_TEMPLATE_AUTH_BUTTON` | `true` |
+| `VISITOR_FLOW_TEMPLATE_NAME` | Approved template with WhatsApp Flow button (e.g. `visitor_request_form`) |
+| `VISITOR_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` |
+| `VISITOR_FLOW_TEMPLATE_BODY_FIELDS` | `name` (if template body has one variable) |
 
 ## Optional
 
@@ -67,6 +70,15 @@ Check:
 - `"api_key_set": true`
 - `"visitor_approvers_configured": true`
 - `"visitor_otp_template": "visitor_pass_code"`
+- `"visitor_flow_enabled": true`
+- `"visitor_flow_template": "visitor_request_form"` (your template name)
+
+## Interakt webhooks (visitor form)
+
+Enable in Developer settings:
+
+- `message_received`
+- **Completed Flow** / `message_api_flow_response` (form submit)
 
 ## Update env on existing service (gcloud)
 

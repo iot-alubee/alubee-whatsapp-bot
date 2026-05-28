@@ -463,6 +463,51 @@ def _extract_message(message_field) -> str:
     return raw
 
 
+def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
+    raw_msg = msg_obj.get("message")
+    if not isinstance(raw_msg, dict):
+        return None
+    if raw_msg.get("type") != "nfm_reply":
+        return None
+    nfm = raw_msg.get("nfm_reply") or {}
+    response = nfm.get("response_json")
+    if response is None:
+        return None
+    if isinstance(response, str):
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return response
+    return response
+
+
+def _parse_flow_webhook(body: dict) -> tuple[str, dict | str] | None:
+    wtype = (body.get("type") or "").strip()
+    data = body.get("data") or {}
+    customer = data.get("customer") or {}
+    phone = str(customer.get("phone_number") or customer.get("channel_phone_number") or "")
+    if not phone:
+        return None
+    wa_id = phone_to_wa_id(phone)
+
+    if wtype == "message_api_flow_response":
+        msg_obj = data.get("message") or {}
+        response = _flow_response_from_message(msg_obj)
+        if response is not None:
+            logger.info("flow webhook type=message_api_flow_response sender=%s", wa_id)
+            return wa_id, response
+
+    if wtype == "message_received":
+        msg_obj = data.get("message") or {}
+        ctype = (msg_obj.get("message_content_type") or "").strip()
+        if ctype == "InteractiveFlowReply":
+            response = _flow_response_from_message(msg_obj)
+            if response is not None:
+                logger.info("flow webhook InteractiveFlowReply sender=%s", wa_id)
+                return wa_id, response
+    return None
+
+
 def _parse_webhook(body: dict) -> tuple[str, str] | None:
     wtype = (body.get("type") or "").strip()
     if wtype != "message_received":
@@ -471,6 +516,10 @@ def _parse_webhook(body: dict) -> tuple[str, str] | None:
     data = body.get("data") or {}
     customer = data.get("customer") or {}
     msg_obj = data.get("message") or {}
+
+    ctype = (msg_obj.get("message_content_type") or "").strip()
+    if ctype == "InteractiveFlowReply":
+        return None
 
     phone = str(customer.get("phone_number") or "")
     if not phone:
@@ -572,6 +621,8 @@ def health():
         "visitor_otp_template": (
             (os.getenv("VISITOR_OTP_TEMPLATE_NAME") or "visitor_pass_code").strip()
         ),
+        "visitor_flow_template": (os.getenv("VISITOR_FLOW_TEMPLATE_NAME") or "").strip() or None,
+        "visitor_flow_enabled": visitor_request.visitor_flow_enabled(),
     }
 
 
@@ -580,6 +631,16 @@ def health():
 async def webhook(request: Request):
     body = await request.json()
     logger.info("webhook: %s", json.dumps(body, default=str)[:2500])
+
+    flow_parsed = _parse_flow_webhook(body)
+    if flow_parsed:
+        sender, response_json = flow_parsed
+        try:
+            _touch_whatsapp_inbound(sender)
+            visitor_request.handle_flow_submission(sender, response_json, VISITOR_DEPS)
+        except Exception:
+            logger.exception("visitor flow submit failed")
+        return {"status": "success"}
 
     parsed = _parse_webhook(body)
     if parsed:

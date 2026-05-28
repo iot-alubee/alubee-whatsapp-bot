@@ -327,6 +327,90 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def send_flow_template(
+    phone: str,
+    template_name: str,
+    *,
+    language_code: str = "en",
+    body_values: list[str] | None = None,
+    callback_data: str = "",
+    flow_token: str = "",
+    flow_action_data: dict | None = None,
+    ensure_contact: bool = False,
+    contact_name: str = "",
+) -> dict[str, Any]:
+    """
+    Send an approved WhatsApp Flow template (Interakt: is_flow_template=true).
+    Works outside 24h session when template is utility/marketing approved.
+    """
+    if ensure_contact:
+        ensure_customer(phone, name=contact_name or "Employee")
+
+    template: dict[str, Any] = {
+        "name": template_name.strip(),
+        "languageCode": (language_code or "en").strip(),
+        "is_flow_template": True,
+    }
+    if body_values:
+        template["bodyValues"] = [str(v)[:1024] for v in body_values]
+
+    token = (flow_token or "").strip()
+    action = flow_action_data if isinstance(flow_action_data, dict) else {}
+    if token or action:
+        template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
+        template["buttonValues"] = {
+            "0": [token[:256]],
+            "1": [json.dumps(action, ensure_ascii=True)[:4096]],
+        }
+    else:
+        template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
+        template["buttonValues"] = {"0": [""], "1": [""]}
+
+    payload: dict[str, Any] = {
+        "countryCode": "+91",
+        "phoneNumber": phone_to_10(phone),
+        "type": "Template",
+        "template": template,
+    }
+    if callback_data:
+        payload["callbackData"] = callback_data[:512]
+    return _post(payload)
+
+
+def send_visitor_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send visitor WhatsApp Form template (env VISITOR_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("VISITOR_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("VISITOR_FLOW_TEMPLATE_NAME not set — cannot send visitor form")
+        return False
+    lang = (os.getenv("VISITOR_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("VISITOR_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys]
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="visitor-flow",
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info("visitor flow template sent phone=%s template=%s", phone_to_10(phone), template_name)
+        return True
+    except Exception:
+        logger.exception("visitor flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
 def send_guest_visit_otp(
     phone: str,
     *,

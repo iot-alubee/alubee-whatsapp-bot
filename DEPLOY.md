@@ -19,6 +19,7 @@ Deploy **only** from `Interakt/Production/`. Local dev uses parent `Interakt/` w
 - Firestore project `whatsapp-approval-system`
 - Interakt API key + webhook on your WhatsApp number
 - Template **`visitor_pass_code`** approved (guest OTP)
+- Template **`visitor_request_form`** (or your name) approved — WhatsApp Flow button → published Visitor Request form
 
 ## 1. Sync code before deploy
 
@@ -70,6 +71,9 @@ Minimum:
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
 | `VISITOR_OTP_TEMPLATE_AUTH_BUTTON` | `true` |
+| `VISITOR_FLOW_TEMPLATE_NAME` | e.g. `visitor_request_form` |
+| `VISITOR_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` |
+| `VISITOR_FLOW_TEMPLATE_BODY_FIELDS` | `name` |
 
 Optional pilot testing (test JMD/MD for listed employees only):
 
@@ -79,7 +83,7 @@ Optional pilot testing (test JMD/MD for listed employees only):
 ## 5. Interakt webhook
 
 - URL: `https://YOUR-SERVICE.run.app/webhook`
-- Event: `message_received`
+- Events: `message_received` + **Completed Flow** / flow response (for form submit)
 - Disable conflicting Interakt greeting automations
 
 ## 6. Health check
@@ -88,12 +92,15 @@ Optional pilot testing (test JMD/MD for listed employees only):
 curl "https://YOUR-SERVICE.run.app/health"
 ```
 
-Expect: `"status":"ok"`, `"api_key_set":true`, `"runtime":"cloud_run"`, `"visitor_approvers_configured":true`, `"visitor_otp_template":"visitor_pass_code"`.
+Expect: `"status":"ok"`, `"api_key_set":true`, `"runtime":"cloud_run"`, `"visitor_approvers_configured":true`, `"visitor_flow_enabled":true`, `"visitor_otp_template":"visitor_pass_code"`.
 
 ## 7. Flows
 
-- **OD:** Employee → OD JMD (by unit) → OD MD  
-- **Visitor:** People 1–5 → comma-separated names → Coming from (text) → Coming for (Customer Visit / Technical Work / Other) → guest WhatsApp → Submit → Visitor JMD → Visitor MD → OTP to employee + guest (`visitor_pass_code`)  
+- **OD:** Employee → OD JMD (by unit) → OD MD (unchanged)  
+- **Visitor:** Hi → Visitor Request → **WhatsApp Form** → Submit → Visitor JMD → Visitor MD → OTP to employee + guest (`visitor_pass_code`)  
+- If `VISITOR_FLOW_TEMPLATE_NAME` is unset, visitor falls back to chat Q&A.  
 - Approvers need **Hi** to Alubee within 24h for Approve/Deny buttons. Guests do not.
+
+See **`VISITOR_FLOW_SETUP.md`** for form + template setup.
 
 Run `python load_users.py` from repo root after changing employees.
