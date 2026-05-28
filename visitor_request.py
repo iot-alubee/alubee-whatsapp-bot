@@ -13,13 +13,10 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Callable
 
-import os
-
 from interakt_api import (
     send_guest_visit_otp,
     send_list_menu,
     send_reply_buttons,
-    send_visitor_flow_form,
     wa_id_to_phone,
 )
 
@@ -38,7 +35,6 @@ VISITOR_COUNT = "VISITOR_COUNT"
 VISITOR_NAMES = "VISITOR_NAMES"
 VISITOR_GUEST_PHONE = "VISITOR_GUEST_PHONE"
 VISITOR_CONFIRM = "VISITOR_CONFIRM"
-VISITOR_AWAITING_FLOW = "VISITOR_AWAITING_FLOW"
 
 VISITOR_STATES = frozenset({
     VISITOR_COMING_ON,
@@ -49,7 +45,6 @@ VISITOR_STATES = frozenset({
     VISITOR_NAMES,
     VISITOR_GUEST_PHONE,
     VISITOR_CONFIRM,
-    VISITOR_AWAITING_FLOW,
 })
 
 PURPOSE_CUSTOMER = "CUSTOMER_VISIT"
@@ -158,35 +153,12 @@ def send_otps_after_md_approve(ref, rd: dict, send_to: Callable[[str, str], None
 
 
 def visitor_flow_enabled() -> bool:
-    return bool((os.getenv("VISITOR_FLOW_TEMPLATE_NAME") or "").strip())
+    return False
 
 
 def try_start(sender: str, deps: VisitorDeps) -> None:
-    """Start visitor request — WhatsApp Form if configured, else chat steps."""
-    if visitor_flow_enabled():
-        try_start_flow(sender, deps)
-        return
+    """Start visitor request in chat (message-by-message)."""
     _try_start_chat(sender, deps)
-
-
-def try_start_flow(sender: str, deps: VisitorDeps) -> None:
-    if find_open_request(sender, "VISITOR"):
-        deps.send_to(sender, deps.already_pending_msg)
-        return
-    user_doc = deps.db.collection("users").document(sender).get()
-    if not user_doc.exists:
-        deps.send_to(sender, "User not registered.\nPlease contact admin.")
-        return
-    name = (user_doc.to_dict() or {}).get("name") or "Employee"
-    ok = send_visitor_flow_form(wa_id_to_phone(sender), employee_name=name)
-    if not ok:
-        deps.send_to(
-            sender,
-            "Visitor form could not be sent.\nPlease contact admin (flow template not configured).",
-        )
-        return
-    deps.session_merge(sender, state=VISITOR_AWAITING_FLOW)
-    deps.send_to(sender, "Please fill the Visitor form sent above and tap Submit.")
 
 
 def _try_start_chat(sender: str, deps: VisitorDeps) -> None:

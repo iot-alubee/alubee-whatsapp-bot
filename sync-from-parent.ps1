@@ -19,22 +19,8 @@ foreach ($name in $modules) {
     Write-Host "Copied $name"
 }
 
-$extras = @(
-    "visitor_flow.json",
-    "visitor_flow_schema.py",
-    "generate_visitor_flow_json.py",
-    "VISITOR_FLOW_SETUP.md"
-)
-foreach ($name in $extras) {
-    $src = Join-Path $parent $name
-    if (Test-Path $src) {
-        Copy-Item -Force $src (Join-Path $here $name)
-        Write-Host "Copied $name"
-    }
-}
-
 Write-Host ""
-Write-Host "Synced: visitor WhatsApp Form + webhook submit, OTP, OD unchanged."
+Write-Host "Synced: visitor message-by-message flow + OTP, OD unchanged."
 Write-Host "Production/main.py is NOT overwritten (Cloud Run bootstrap)."
 Write-Host ""
 Write-Host "Deploy:"
