@@ -65,11 +65,11 @@ class ApprovalDeps:
     whatsapp_session_hours: int
     menu_idle_state: str
     on_visitor_md_approved: Callable[[object, dict], None]
-    # All visitor requests use these (not OD jmd_i / jmd_ii / md).
+    # Visitor uses same approvers as OD (jmd_i / jmd_ii / md); fields kept for optional overrides.
     visitor_jmd_i: str = ""
     visitor_jmd_ii: str = ""
     visitor_md: str = ""
-    # If true, Unit II employees (jmd_route JMD2) use visitor_jmd_ii; else everyone uses visitor_jmd_i.
+    # If true, Unit II employees (jmd_route JMD2) use jmd_ii; else everyone uses jmd_i.
     visitor_route_by_unit: bool = False
     # Optional: listed employees use test numbers instead (for pilot testing).
     visitor_test_jmd_i: str = ""
@@ -102,13 +102,13 @@ def _use_visitor_test_approvers(employee_wa: str) -> bool:
 def _visitor_approver_numbers(
     d: ApprovalDeps, *, use_test: bool
 ) -> tuple[str, str, str]:
-    """Prefer live env vars (Cloud Run) over values captured at process start."""
-    live_i = wa_from_env(
-        "VISITOR_JMD_I_WHATSAPP_NUMBER",
-        "VISITOR_JMD_WHATSAPP_NUMBER",
-    )
-    live_ii = wa_from_env("VISITOR_JMD_II_WHATSAPP_NUMBER")
-    live_md = wa_from_env("VISITOR_MD_WHATSAPP_NUMBER")
+    """Same env as OD: JMD_I / JMD_II / MD (prefer live Cloud Run vars at request time)."""
+    live_i = wa_from_env("JMD_I_WHATSAPP_NUMBER", "JMD_WHATSAPP_NUMBER")
+    live_ii = wa_from_env("JMD_II_WHATSAPP_NUMBER")
+    live_md = wa_from_env("MD_WHATSAPP_NUMBER")
+    jmd_i_od = live_i or d.visitor_jmd_i or d.jmd_i
+    jmd_ii_od = live_ii or d.visitor_jmd_ii or d.jmd_ii
+    md_od = live_md or d.visitor_md or d.md
     if use_test:
         jmd_i = (
             wa_from_env(
@@ -116,25 +116,22 @@ def _visitor_approver_numbers(
                 "VISITOR_TEST_JMD_WHATSAPP_NUMBER",
             )
             or d.visitor_test_jmd_i
-            or live_i
-            or d.visitor_jmd_i
+            or jmd_i_od
         )
         jmd_ii = (
             wa_from_env("VISITOR_TEST_JMD_II_WHATSAPP_NUMBER")
             or d.visitor_test_jmd_ii
-            or live_ii
-            or d.visitor_jmd_ii
+            or jmd_ii_od
         )
         md = (
             wa_from_env("VISITOR_TEST_MD_WHATSAPP_NUMBER")
             or d.visitor_test_md
-            or live_md
-            or d.visitor_md
+            or md_od
         )
     else:
-        jmd_i = live_i or d.visitor_jmd_i
-        jmd_ii = live_ii or d.visitor_jmd_ii
-        md = live_md or d.visitor_md
+        jmd_i = jmd_i_od
+        jmd_ii = jmd_ii_od
+        md = md_od
     return jmd_i, jmd_ii, md
 
 
@@ -152,18 +149,18 @@ def visitor_chain_failure_message(
     if vt == VISITING_BOTH:
         if not md:
             return (
-                "Visitor MD is not configured on the server "
-                "(VISITOR_MD_WHATSAPP_NUMBER).\nPlease contact admin."
+                "MD is not configured on the server "
+                "(MD_WHATSAPP_NUMBER).\nPlease contact admin."
             )
         if not jmd_i:
             return (
-                "Visitor Unit I JMD is not configured "
-                "(VISITOR_JMD_I_WHATSAPP_NUMBER).\nPlease contact admin."
+                "Unit I JMD is not configured "
+                "(JMD_I_WHATSAPP_NUMBER).\nPlease contact admin."
             )
         if not jmd_ii:
             return (
-                "Visitor Unit II JMD is not configured "
-                "(VISITOR_JMD_II_WHATSAPP_NUMBER).\n"
+                "Unit II JMD is not configured "
+                "(JMD_II_WHATSAPP_NUMBER).\n"
                 "Add it in Cloud Run → Variables, then deploy a new revision.\n"
                 "Please contact admin."
             )
@@ -190,13 +187,13 @@ def _build_visitor_approval_chain(
     vt = normalize_visiting_to(visiting_to)
 
     if not md:
-        logger.error("visitor MD not configured — set VISITOR_MD_WHATSAPP_NUMBER")
+        logger.error("visitor MD not configured — set MD_WHATSAPP_NUMBER")
         return None
 
     if vt == VISITING_BOTH:
         if not jmd_i or not jmd_ii:
             logger.error(
-                "visitor BOTH requires VISITOR_JMD_I and II on Cloud Run "
+                "visitor BOTH requires JMD_I and JMD_II on Cloud Run "
                 "(jmd_i=%r jmd_ii=%r md=%r)",
                 jmd_i or "(missing)",
                 jmd_ii or "(missing)",
@@ -205,8 +202,8 @@ def _build_visitor_approval_chain(
             return None
         if d.same_whatsapp(jmd_i, jmd_ii):
             logger.error(
-                "visitor BOTH: VISITOR_JMD_II_WHATSAPP_NUMBER must differ from "
-                "VISITOR_JMD_I (remove fallback / set a separate Unit II number)"
+                "visitor BOTH: JMD_II_WHATSAPP_NUMBER must differ from "
+                "JMD_I_WHATSAPP_NUMBER"
             )
             return None
         chain: dict = {
@@ -233,8 +230,8 @@ def _build_visitor_approval_chain(
             host_route = emp_route
         if not host_jmd:
             logger.error(
-                "visitor approvers not configured — set VISITOR_JMD_I_WHATSAPP_NUMBER "
-                "(and VISITOR_JMD_II for Unit II / Both)"
+                "visitor approvers not configured — set JMD_I_WHATSAPP_NUMBER "
+                "(and JMD_II_WHATSAPP_NUMBER for Unit II / Both)"
             )
             return None
         chain = {
@@ -253,17 +250,19 @@ def _build_visitor_approval_chain(
 
 
 def _visitor_jmd_for_route(d: ApprovalDeps, jmd_route: str, *, use_test: bool) -> str:
-    """Dedicated visitor JMD — never OD approvers. Default: same JMD for every employee."""
+    """Same JMD numbers as OD (jmd_i / jmd_ii). Default: Unit I JMD for every employee."""
     route = (jmd_route or "").strip().upper()
     by_unit = d.visitor_route_by_unit and route == "JMD2"
+    jmd_i = d.visitor_jmd_i or d.jmd_i
+    jmd_ii = d.visitor_jmd_ii or d.jmd_ii
     if use_test and d.visitor_test_jmd_i:
         if by_unit and d.visitor_test_jmd_ii:
             return d.visitor_test_jmd_ii
         return d.visitor_test_jmd_i
-    if d.visitor_jmd_i:
-        if by_unit and d.visitor_jmd_ii:
-            return d.visitor_jmd_ii
-        return d.visitor_jmd_i
+    if jmd_i:
+        if by_unit and jmd_ii:
+            return jmd_ii
+        return jmd_i
     return ""
 
 
@@ -286,8 +285,8 @@ def request_md_whatsapp(rd: dict) -> str:
     if stored:
         return stored
     d = _require()
-    if (rd.get("type") or "").strip().upper() == "VISITOR" and d.visitor_md:
-        return d.visitor_md
+    if (rd.get("type") or "").strip().upper() == "VISITOR":
+        return d.visitor_md or d.md
     return d.md
 
 

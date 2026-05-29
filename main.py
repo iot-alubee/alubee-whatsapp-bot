@@ -19,7 +19,6 @@ from firebase_admin import credentials, firestore
 
 import approval
 import bot_shared
-from bot_shared import wa_from_env as _visitor_wa_from_env
 import od_request
 import visitor_request
 from interakt_api import phone_to_wa_id, send_list_menu, send_text, wa_id_to_phone
@@ -105,14 +104,7 @@ def _parse_whatsapp_id_set(env_value: str) -> frozenset[str]:
     return frozenset(out)
 
 
-# Visitor approvers (all visitor requests). OD uses JMD_I / JMD_II / MD above.
-VISITOR_JMD_I_WHATSAPP_NUMBER = _visitor_wa_from_env(
-    "VISITOR_JMD_I_WHATSAPP_NUMBER",
-    "VISITOR_JMD_WHATSAPP_NUMBER",
-)
-# Do not fall back to JMD I — BOTH needs a separate Unit II visitor JMD.
-VISITOR_JMD_II_WHATSAPP_NUMBER = _visitor_wa_from_env("VISITOR_JMD_II_WHATSAPP_NUMBER")
-VISITOR_MD_WHATSAPP_NUMBER = _visitor_wa_from_env("VISITOR_MD_WHATSAPP_NUMBER")
+# Visitor uses same approvers as OD (JMD_I / JMD_II / MD above).
 VISITOR_ROUTE_BY_UNIT = os.getenv("VISITOR_ROUTE_BY_UNIT", "").strip().lower() in (
     "1",
     "true",
@@ -312,9 +304,9 @@ approval.configure(
         whatsapp_session_hours=WHATSAPP_SESSION_HOURS,
         menu_idle_state=SESSION_MENU_IDLE,
         on_visitor_md_approved=_on_visitor_md_approved,
-        visitor_jmd_i=VISITOR_JMD_I_WHATSAPP_NUMBER,
-        visitor_jmd_ii=VISITOR_JMD_II_WHATSAPP_NUMBER,
-        visitor_md=VISITOR_MD_WHATSAPP_NUMBER,
+        visitor_jmd_i=JMD_I_WHATSAPP_NUMBER,
+        visitor_jmd_ii=JMD_II_WHATSAPP_NUMBER,
+        visitor_md=MD_WHATSAPP_NUMBER,
         visitor_route_by_unit=VISITOR_ROUTE_BY_UNIT,
         visitor_test_jmd_i=VISITOR_TEST_JMD_I_WHATSAPP_NUMBER,
         visitor_test_jmd_ii=VISITOR_TEST_JMD_II_WHATSAPP_NUMBER,
@@ -323,16 +315,14 @@ approval.configure(
     )
 )
 logger.info(
-    "visitor approvers loaded jmd_i=%s jmd_ii=%s md=%s both_units_ok=%s",
-    VISITOR_JMD_I_WHATSAPP_NUMBER or "(missing)",
-    VISITOR_JMD_II_WHATSAPP_NUMBER or "(missing)",
-    VISITOR_MD_WHATSAPP_NUMBER or "(missing)",
+    "visitor approvers (same as OD) jmd_i=%s jmd_ii=%s md=%s both_units_ok=%s",
+    JMD_I_WHATSAPP_NUMBER or "(missing)",
+    JMD_II_WHATSAPP_NUMBER or "(missing)",
+    MD_WHATSAPP_NUMBER or "(missing)",
     bool(
-        VISITOR_JMD_I_WHATSAPP_NUMBER
-        and VISITOR_JMD_II_WHATSAPP_NUMBER
-        and not _same_whatsapp(
-            VISITOR_JMD_I_WHATSAPP_NUMBER, VISITOR_JMD_II_WHATSAPP_NUMBER
-        )
+        JMD_I_WHATSAPP_NUMBER
+        and JMD_II_WHATSAPP_NUMBER
+        and not _same_whatsapp(JMD_I_WHATSAPP_NUMBER, JMD_II_WHATSAPP_NUMBER)
     ),
 )
 
@@ -574,10 +564,9 @@ def health():
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,
         "md": MD_WHATSAPP_NUMBER,
-        "visitor_jmd_i": VISITOR_JMD_I_WHATSAPP_NUMBER or None,
-        "visitor_md": VISITOR_MD_WHATSAPP_NUMBER or None,
+        "visitor_uses_od_approvers": True,
         "visitor_approvers_configured": bool(
-            VISITOR_JMD_I_WHATSAPP_NUMBER and VISITOR_MD_WHATSAPP_NUMBER
+            JMD_I_WHATSAPP_NUMBER and MD_WHATSAPP_NUMBER
         ),
         "visitor_test_approvers_configured": bool(
             VISITOR_TEST_JMD_I_WHATSAPP_NUMBER

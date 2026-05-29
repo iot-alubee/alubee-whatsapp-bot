@@ -60,12 +60,9 @@ Minimum:
 |----------|---------|
 | `INTERAKT_API_KEY` | **Required** |
 | `FIREBASE_PROJECT_ID` | `whatsapp-approval-system` |
-| `JMD_I_WHATSAPP_NUMBER` | OD — Unit I JMD |
-| `JMD_II_WHATSAPP_NUMBER` | OD — Unit II JMD |
-| `MD_WHATSAPP_NUMBER` | OD — final approver |
-| `VISITOR_JMD_I_WHATSAPP_NUMBER` | Visitor — Unit I JMD |
-| `VISITOR_JMD_II_WHATSAPP_NUMBER` | Visitor — Unit II JMD |
-| `VISITOR_MD_WHATSAPP_NUMBER` | Visitor — final approver |
+| `JMD_I_WHATSAPP_NUMBER` | Unit I JMD (OD + visitor) |
+| `JMD_II_WHATSAPP_NUMBER` | Unit II JMD (OD + visitor; required for Visiting to = Both) |
+| `MD_WHATSAPP_NUMBER` | Final MD (OD + visitor) |
 | `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
