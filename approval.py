@@ -13,6 +13,16 @@ from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
 
+VISITING_UNIT_I = "UNIT_I"
+VISITING_UNIT_II = "UNIT_II"
+VISITING_BOTH = "BOTH"
+
+VISITING_TO_LABELS = {
+    VISITING_UNIT_I: "Unit I",
+    VISITING_UNIT_II: "Unit II",
+    VISITING_BOTH: "Both",
+}
+
 
 @dataclass
 class ApprovalDeps:
@@ -62,6 +72,85 @@ def _use_visitor_test_approvers(employee_wa: str) -> bool:
     if not d.visitor_test_employee_wa_ids or not employee_wa:
         return False
     return employee_wa.strip().lower() in d.visitor_test_employee_wa_ids
+
+
+def _visitor_approver_numbers(
+    d: ApprovalDeps, *, use_test: bool
+) -> tuple[str, str, str]:
+    if use_test:
+        jmd_i = d.visitor_test_jmd_i or d.visitor_jmd_i
+        jmd_ii = d.visitor_test_jmd_ii or d.visitor_jmd_ii
+        md = d.visitor_test_md or d.visitor_md
+    else:
+        jmd_i = d.visitor_jmd_i
+        jmd_ii = d.visitor_jmd_ii
+        md = d.visitor_md
+    return jmd_i, jmd_ii, md
+
+
+def _build_visitor_approval_chain(
+    d: ApprovalDeps,
+    user_data: dict,
+    employee_wa: str,
+    visiting_to: str,
+) -> dict | None:
+    """Route visitor JMD(s) by destination unit vs employee home unit (jmd_route)."""
+    use_test = _use_visitor_test_approvers(employee_wa)
+    jmd_i, jmd_ii, md = _visitor_approver_numbers(d, use_test=use_test)
+    emp_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
+    vt = (visiting_to or VISITING_UNIT_I).strip().upper()
+
+    if not md:
+        logger.error("visitor MD not configured — set VISITOR_MD_WHATSAPP_NUMBER")
+        return None
+
+    if vt == VISITING_BOTH:
+        if not jmd_i or not jmd_ii:
+            logger.error(
+                "visitor BOTH requires VISITOR_JMD_I and VISITOR_JMD_II WhatsApp numbers"
+            )
+            return None
+        chain: dict = {
+            "mode": "dual",
+            "visiting_to": vt,
+            "employee_jmd_route": emp_route,
+            "jmd_i": jmd_i,
+            "jmd_ii": jmd_ii,
+            "md": md,
+            "visitor_approval": True,
+        }
+    else:
+        cross = False
+        if vt == VISITING_UNIT_I:
+            host_jmd = jmd_i
+            host_route = "JMD1"
+            cross = emp_route == "JMD2"
+        elif vt == VISITING_UNIT_II:
+            host_jmd = jmd_ii or jmd_i
+            host_route = "JMD2"
+            cross = emp_route == "JMD1"
+        else:
+            host_jmd = _visitor_jmd_for_route(d, emp_route, use_test=use_test)
+            host_route = emp_route
+        if not host_jmd:
+            logger.error(
+                "visitor approvers not configured — set VISITOR_JMD_I_WHATSAPP_NUMBER "
+                "(and VISITOR_JMD_II for Unit II / Both)"
+            )
+            return None
+        chain = {
+            "mode": "single",
+            "visiting_to": vt,
+            "employee_jmd_route": emp_route,
+            "jmd": host_jmd,
+            "jmd_route": host_route,
+            "md": md,
+            "cross": cross,
+            "visitor_approval": True,
+        }
+    if use_test:
+        chain["approval_test"] = True
+    return chain
 
 
 def _visitor_jmd_for_route(d: ApprovalDeps, jmd_route: str, *, use_test: bool) -> str:
@@ -123,6 +212,7 @@ def build_approval_chain(
     *,
     request_type: str = "OD",
     employee_wa: str = "",
+    visiting_to: str = "",
 ) -> dict | None:
     if not user_data:
         return None
@@ -131,24 +221,9 @@ def build_approval_chain(
     req_type = (request_type or "OD").strip().upper()
 
     if req_type == "VISITOR":
-        use_test = _use_visitor_test_approvers(employee_wa)
-        jmd = _visitor_jmd_for_route(d, jmd_route, use_test=use_test)
-        if use_test and d.visitor_test_md:
-            md = d.visitor_test_md
-        elif d.visitor_md:
-            md = d.visitor_md
-        else:
-            md = ""
-        if not jmd or not md:
-            logger.error(
-                "visitor approvers not configured — set VISITOR_JMD_I_WHATSAPP_NUMBER "
-                "and VISITOR_MD_WHATSAPP_NUMBER on Cloud Run (separate from OD JMD/MD)"
-            )
-            return None
-        chain = {"jmd": jmd, "jmd_route": jmd_route, "md": md, "visitor_approval": True}
-        if use_test:
-            chain["approval_test"] = True
-        return chain
+        return _build_visitor_approval_chain(
+            d, user_data, employee_wa, visiting_to or VISITING_UNIT_I
+        )
 
     jmd = jmd_whatsapp_for_route(jmd_route, for_request_type="OD")
     md = d.md
@@ -190,11 +265,19 @@ def _approval_message_body(
             ).strip()
             or "—"
         )
+        visiting = (
+            (rd.get("visiting_to_label") or "").strip()
+            or VISITING_TO_LABELS.get(
+                (rd.get("visiting_to") or "").strip().upper(), ""
+            )
+            or "—"
+        )
         test_tag = "[TEST] " if rd.get("approval_test") else ""
         return (
             f"{test_tag}Visitor approval request\n\n"
             f"Employee: {emp}\n"
             f"Department: {dept}\n"
+            f"Visiting to: {visiting}\n"
             f"Coming on: {coming_on}\n"
             f"People: {rd.get('people_count') or '—'}\n"
             f"Names: {names}\n"
@@ -300,8 +383,25 @@ def _approval_role(sender: str, rd: dict) -> str | None:
     d = _require()
     jmd_st = (rd.get("jmd_status") or "").strip().upper()
     md_st = (rd.get("md_status") or "").strip().upper()
-    jmd_wa = request_jmd_whatsapp(rd)
 
+    if rd.get("visitor_dual_jmd"):
+        jmd_i_st = (rd.get("jmd_i_status") or "").strip().upper()
+        jmd_ii_st = (rd.get("jmd_ii_status") or "").strip().upper()
+        if d.same_whatsapp(sender, (rd.get("jmd_i") or "")) and jmd_i_st == "PENDING":
+            return "jmd_i"
+        if d.same_whatsapp(sender, (rd.get("jmd_ii") or "")) and jmd_ii_st == "PENDING":
+            return "jmd_ii"
+        md_wa = request_md_whatsapp(rd)
+        if (
+            d.same_whatsapp(sender, md_wa)
+            and jmd_i_st == "APPROVED"
+            and jmd_ii_st == "APPROVED"
+            and md_st == "PENDING"
+        ):
+            return "md"
+        return None
+
+    jmd_wa = request_jmd_whatsapp(rd)
     if d.same_whatsapp(sender, jmd_wa) and jmd_st in ("PENDING", "AWAITING_MANAGER"):
         return "jmd"
 
@@ -310,6 +410,25 @@ def _approval_role(sender: str, rd: dict) -> str | None:
         return "md"
 
     return None
+
+
+def _dual_jmd_both_approved(rd: dict) -> bool:
+    return (
+        (rd.get("jmd_i_status") or "").strip().upper() == "APPROVED"
+        and (rd.get("jmd_ii_status") or "").strip().upper() == "APPROVED"
+    )
+
+
+def notify_visitor_on_submit(rd: dict, request_id: str, chain: dict) -> bool:
+    """Notify host-unit JMD(s) when a visitor request is submitted."""
+    if chain.get("mode") == "dual":
+        ok_i = notify_jmd(chain["jmd_i"], rd, request_id) if chain.get("jmd_i") else False
+        ok_ii = (
+            notify_jmd(chain["jmd_ii"], rd, request_id) if chain.get("jmd_ii") else False
+        )
+        return ok_i or ok_ii
+    jmd = chain.get("jmd") or ""
+    return notify_jmd(jmd, rd, request_id) if jmd else False
 
 
 def notify_jmd(jmd_wa: str, rd: dict, request_id: str) -> bool:
@@ -379,7 +498,38 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
         )
         return True
 
-    if role == "jmd":
+    if role in ("jmd_i", "jmd_ii"):
+        status_field = "jmd_i_status" if role == "jmd_i" else "jmd_ii_status"
+        if is_approve:
+            ref.update({status_field: "APPROVED"})
+            rd = ref.get().to_dict() or {}
+            if _dual_jmd_both_approved(rd):
+                md_wa = request_md_whatsapp(rd)
+                ref.update({
+                    "jmd_status": "APPROVED",
+                    "md_status": "PENDING",
+                    "md": md_wa,
+                    "manager_status": "N/A",
+                })
+                notify_approver(md_wa, rd, request_id)
+                logger.info("visitor dual JMD approved request_id=%s → md", request_id)
+            else:
+                logger.info(
+                    "visitor %s approved request_id=%s (awaiting other JMD)",
+                    role,
+                    request_id,
+                )
+        else:
+            ref.update({
+                status_field: "DENIED",
+                "jmd_status": "DENIED",
+                "md_status": "N/A",
+                "manager_status": "N/A",
+            })
+            d.send_to(employee, f"Your {req_label} request was not approved.")
+            logger.info("visitor %s denied request_id=%s", role, request_id)
+
+    elif role == "jmd":
         if is_approve:
             md_wa = request_md_whatsapp(rd)
             ref.update({

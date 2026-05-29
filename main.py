@@ -171,6 +171,9 @@ _ROW_IDS = {
     "visitor_coming_for_customer": "CUSTOMER_VISIT",
     "visitor_coming_for_technical": "TECHNICAL_WORK",
     "visitor_coming_for_other": "OTHER",
+    "visitor_visit_unit_i": "UNIT_I",
+    "visitor_visit_unit_ii": "UNIT_II",
+    "visitor_visit_both": "BOTH",
     "customer_visit": "CUSTOMER_VISIT",
     "technical_work": "TECHNICAL_WORK",
 }
@@ -324,11 +327,14 @@ approval.configure(
 )
 
 
-def _build_visitor_approval_chain(user_data: dict, employee_wa: str) -> dict | None:
+def _build_visitor_approval_chain(
+    user_data: dict, employee_wa: str, visiting_to: str = ""
+) -> dict | None:
     return approval.build_approval_chain(
         user_data,
         request_type="VISITOR",
         employee_wa=employee_wa,
+        visiting_to=visiting_to,
     )
 
 
@@ -365,7 +371,7 @@ VISITOR_DEPS = visitor_request.VisitorDeps(
     session_ref=_session_ref,
     utcnow=_utcnow,
     build_approval_chain=_build_visitor_approval_chain,
-    notify_jmd=approval.notify_jmd,
+    notify_visitor_on_submit=approval.notify_visitor_on_submit,
     clear_session=lambda sender: _session_ref(sender).delete(),
     go_main_menu=_go_main_menu_for_employee,
     already_pending_msg=VISITOR_ALREADY_PENDING_MSG,

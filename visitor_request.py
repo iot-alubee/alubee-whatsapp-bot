@@ -1,7 +1,8 @@
 """
 Visitor request flow:
 Coming On date -> Coming From -> Purpose (Customer Visit / Other) -> if Other, text purpose ->
-No of people -> Visitor name(s) -> Visitor mobile -> Confirm -> JMD -> MD -> OTP.
+Visiting to (Unit I / Unit II / Both) -> No of people -> Visitor name(s) -> Visitor mobile ->
+Confirm -> JMD(s) -> MD -> OTP.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from interakt_api import (
     wa_id_to_phone,
 )
 
+from approval import VISITING_BOTH, VISITING_TO_LABELS, VISITING_UNIT_I, VISITING_UNIT_II
+
 from bot_shared import digits, find_open_request, wa_from_10
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,7 @@ VISITOR_COMING_ON = "VISITOR_COMING_ON"
 VISITOR_COMING_FROM = "VISITOR_COMING_FROM"
 VISITOR_PURPOSE = "VISITOR_PURPOSE"
 VISITOR_PURPOSE_OTHER = "VISITOR_PURPOSE_OTHER"
+VISITOR_VISITING_TO = "VISITOR_VISITING_TO"
 VISITOR_COUNT = "VISITOR_COUNT"
 VISITOR_NAMES = "VISITOR_NAMES"
 VISITOR_GUEST_PHONE = "VISITOR_GUEST_PHONE"
@@ -41,6 +45,7 @@ VISITOR_STATES = frozenset({
     VISITOR_COMING_FROM,
     VISITOR_PURPOSE,
     VISITOR_PURPOSE_OTHER,
+    VISITOR_VISITING_TO,
     VISITOR_COUNT,
     VISITOR_NAMES,
     VISITOR_GUEST_PHONE,
@@ -63,8 +68,8 @@ class VisitorDeps:
     session_merge: Callable[..., None]
     session_ref: Callable[[str], object]
     utcnow: Callable
-    build_approval_chain: Callable[[dict, str], dict | None]
-    notify_jmd: Callable[[str, dict, str], bool]
+    build_approval_chain: Callable[..., dict | None]
+    notify_visitor_on_submit: Callable[[dict, str, dict], bool]
     clear_session: Callable[[str], None]
     go_main_menu: Callable[[str], None]
     already_pending_msg: str
@@ -176,6 +181,8 @@ def _try_start_chat(sender: str, deps: VisitorDeps) -> None:
         purpose_detail="",
         coming_for="",
         coming_for_label="",  # compatibility with existing consumers
+        visiting_to="",
+        visiting_to_label="",
         visitor_names=[],
         guest_phone="",
     )
@@ -205,6 +212,9 @@ def handle(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None
         return
     if state == VISITOR_PURPOSE_OTHER:
         _handle_purpose_other(sender, incoming, session, deps)
+        return
+    if state == VISITOR_VISITING_TO:
+        _handle_visiting_to(sender, incoming, session, deps)
         return
     if state == VISITOR_COUNT:
         _handle_count(sender, incoming, session, deps)
@@ -240,6 +250,47 @@ def _parse_count_choice(incoming: str) -> int | None:
     if VISITOR_MIN_PEOPLE <= n <= VISITOR_MAX_PEOPLE:
         return n
     return None
+
+
+def _visiting_to_label(code: str) -> str:
+    return VISITING_TO_LABELS.get((code or "").strip().upper(), code or "—")
+
+
+def _parse_visiting_to_choice(incoming: str) -> str | None:
+    key = (incoming or "").strip().lower().replace(" ", "_")
+    mapping = {
+        "visitor_visit_unit_i": VISITING_UNIT_I,
+        "visitor_visit_unit_ii": VISITING_UNIT_II,
+        "visitor_visit_both": VISITING_BOTH,
+        "unit_i": VISITING_UNIT_I,
+        "unit_ii": VISITING_UNIT_II,
+        "unit_1": VISITING_UNIT_I,
+        "unit_2": VISITING_UNIT_II,
+        "both": VISITING_BOTH,
+    }
+    if key in mapping:
+        return mapping[key]
+    um = (incoming or "").strip().upper()
+    if um in (VISITING_UNIT_I, VISITING_UNIT_II, VISITING_BOTH):
+        return um
+    return None
+
+
+def _send_visiting_to_picker(sender: str, deps: VisitorDeps) -> None:
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            "Visiting to?",
+            [
+                ("visitor_visit_unit_i", "Unit I"),
+                ("visitor_visit_unit_ii", "Unit II"),
+                ("visitor_visit_both", "Both"),
+            ],
+            callback_data="visitor-visiting-to",
+        )
+    except Exception:
+        logger.exception("visitor visiting-to buttons failed")
+        deps.send_to(sender, "Visiting to? Reply UNIT I, UNIT II, or BOTH.")
 
 
 def _parse_purpose_choice(incoming: str) -> str | None:
@@ -366,14 +417,14 @@ def _handle_purpose(sender: str, incoming: str, session: dict, deps: VisitorDeps
         return
     deps.session_merge(
         sender,
-        state=VISITOR_COUNT,
+        state=VISITOR_VISITING_TO,
         purpose=choice,
         purpose_label=PURPOSE_LABELS[choice],
         purpose_detail="",
         coming_for=choice,
         coming_for_label=PURPOSE_LABELS[choice],
     )
-    deps.send_to(sender, "No of people?")
+    _send_visiting_to_picker(sender, deps)
 
 
 def _handle_purpose_other(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -388,17 +439,17 @@ def _handle_purpose_other(sender: str, incoming: str, session: dict, deps: Visit
         return
     deps.session_merge(
         sender,
-        state=VISITOR_COUNT,
+        state=VISITOR_VISITING_TO,
         purpose=PURPOSE_OTHER,
         purpose_label=detail,
         purpose_detail=detail,
         coming_for=PURPOSE_OTHER,
         coming_for_label=detail,
     )
-    deps.send_to(sender, "No of people?")
+    _send_visiting_to_picker(sender, deps)
 
 
-def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
+def _handle_visiting_to(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
     um = (incoming or "").strip().upper()
     if um == "BACK":
         if (session.get("purpose") or "").strip().upper() == PURPOSE_OTHER:
@@ -407,6 +458,26 @@ def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) 
         else:
             deps.session_merge(sender, state=VISITOR_PURPOSE)
             _send_purpose_picker(sender, deps)
+        return
+    choice = _parse_visiting_to_choice(incoming)
+    if not choice:
+        deps.send_to(sender, "Select Unit I, Unit II, or Both.")
+        _send_visiting_to_picker(sender, deps)
+        return
+    deps.session_merge(
+        sender,
+        state=VISITOR_COUNT,
+        visiting_to=choice,
+        visiting_to_label=_visiting_to_label(choice),
+    )
+    deps.send_to(sender, "No of people?")
+
+
+def _handle_count(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
+    um = (incoming or "").strip().upper()
+    if um == "BACK":
+        deps.session_merge(sender, state=VISITOR_VISITING_TO)
+        _send_visiting_to_picker(sender, deps)
         return
     count = _parse_count_choice(incoming)
     if count is None:
@@ -458,6 +529,10 @@ def _show_confirm(sender: str, session: dict, deps: VisitorDeps, **updates) -> N
         or data.get("coming_for_label")
         or ""
     ).strip() or "—"
+    visiting = (
+        data.get("visiting_to_label")
+        or _visiting_to_label(data.get("visiting_to") or "")
+    )
     guest = data.get("guest_phone") or ""
 
     body = (
@@ -465,6 +540,7 @@ def _show_confirm(sender: str, session: dict, deps: VisitorDeps, **updates) -> N
         f"Coming On: {coming_on}\n"
         f"Coming From: {coming_from}\n"
         f"Purpose: {coming_for}\n"
+        f"Visiting to: {visiting}\n"
         f"People: {count}\n"
         f"Names: {', '.join(names)}\n"
         f"Visitor Mobile: {guest}\n"
@@ -484,6 +560,7 @@ def _build_summary(
     coming_on: str,
     coming_from: str,
     purpose: str,
+    visiting_to: str,
     names: list,
     count: int,
     guest_phone: str,
@@ -491,7 +568,8 @@ def _build_summary(
     name_str = ", ".join(names) if names else "—"
     return (
         f"Coming On: {coming_on} | From: {coming_from} | Purpose: {purpose} | "
-        f"People: {count} | Names: {name_str} | Visitor Mobile: {guest_phone}"
+        f"Visiting to: {visiting_to} | People: {count} | Names: {name_str} | "
+        f"Visitor Mobile: {guest_phone}"
     )
 
 
@@ -641,6 +719,8 @@ def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
         "people_count": _people_count(session),
         "visitor_names": list(session.get("visitor_names") or []),
         "guest_phone": (session.get("guest_phone") or "").strip(),
+        "visiting_to": (session.get("visiting_to") or "").strip(),
+        "visiting_to_label": (session.get("visiting_to_label") or "").strip(),
     }
     _submit_payload(sender, payload, deps)
 
@@ -658,7 +738,8 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
         return
 
     ud = user_doc.to_dict()
-    chain = deps.build_approval_chain(ud, sender)
+    visiting_to = (data.get("visiting_to") or VISITING_UNIT_I).strip()
+    chain = deps.build_approval_chain(ud, sender, visiting_to=visiting_to)
     if not chain:
         deps.clear_session(sender)
         deps.send_to(
@@ -675,8 +756,19 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
     purpose = (data.get("purpose") or data.get("coming_for") or "").strip()
     purpose_label = (data.get("purpose_label") or data.get("coming_for_label") or "").strip()
     purpose_detail = (data.get("purpose_detail") or "").strip()
+    visiting_to_label = (
+        data.get("visiting_to_label") or _visiting_to_label(visiting_to)
+    ).strip()
     guest_wa = wa_from_10(guest_phone)
-    summary = _build_summary(coming_on, coming_from, purpose_label, names, count, guest_phone)
+    summary = _build_summary(
+        coming_on,
+        coming_from,
+        purpose_label,
+        visiting_to_label,
+        names,
+        count,
+        guest_phone,
+    )
 
     ref = deps.db.collection("requests").document()
     request_id = ref.id
@@ -705,31 +797,62 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
         "organization": coming_from,
         "guest_phone": guest_phone,
         "guest_whatsapp": guest_wa,
-        "submission_source": "whatsapp_flow",
-        "jmd": chain["jmd"],
-        "jmd_route": chain["jmd_route"],
+        "submission_source": "chat",
+        "visiting_to": visiting_to,
+        "visiting_to_label": visiting_to_label,
+        "employee_jmd_route": chain.get("employee_jmd_route")
+        or (ud.get("jmd_route") or "JMD1").strip().upper(),
         "md": chain["md"],
         "manager_status": "N/A",
-        "jmd_status": "PENDING",
         "md_status": "AWAITING_JMD",
         "visitor_otp": "",
     }
+    if chain.get("mode") == "dual":
+        payload.update({
+            "visitor_dual_jmd": True,
+            "jmd_i": chain["jmd_i"],
+            "jmd_ii": chain["jmd_ii"],
+            "jmd": chain["jmd_i"],
+            "jmd_route": chain.get("employee_jmd_route") or "JMD1",
+            "jmd_i_status": "PENDING",
+            "jmd_ii_status": "PENDING",
+            "jmd_status": "PENDING",
+        })
+    else:
+        payload.update({
+            "visitor_dual_jmd": False,
+            "jmd": chain["jmd"],
+            "jmd_route": chain["jmd_route"],
+            "jmd_status": "PENDING",
+            "cross_unit": bool(chain.get("cross")),
+        })
     if chain.get("approval_test"):
         payload["approval_test"] = True
     ref.set(payload)
-    logger.info("VISITOR created %s jmd_route=%s (flow)", request_id, chain["jmd_route"])
+    logger.info(
+        "VISITOR created %s visiting_to=%s mode=%s",
+        request_id,
+        visiting_to,
+        chain.get("mode"),
+    )
 
     rd = ref.get().to_dict()
-    jmd_ok = deps.notify_jmd(chain["jmd"], rd, request_id)
+    jmd_ok = deps.notify_visitor_on_submit(rd, request_id, chain)
 
     deps.clear_session(sender)
     msg = "Visitor request is submitted."
     if chain.get("approval_test"):
         msg += " (pilot test JMD/MD — OD approvers unchanged)."
     if not jmd_ok:
-        route = chain["jmd_route"]
-        msg += (
-            f"\n\nJMD ({route}) could not be notified on WhatsApp. "
-            "Ask them to send Hi to this Alubee number once, then contact admin."
-        )
+        if chain.get("mode") == "dual":
+            msg += (
+                "\n\nUnit I / Unit II JMD could not be notified on WhatsApp. "
+                "Ask them to send Hi to this Alubee number once, then contact admin."
+            )
+        else:
+            route = chain.get("jmd_route") or "JMD"
+            msg += (
+                f"\n\nJMD ({route}) could not be notified on WhatsApp. "
+                "Ask them to send Hi to this Alubee number once, then contact admin."
+            )
     deps.send_to(sender, msg)
