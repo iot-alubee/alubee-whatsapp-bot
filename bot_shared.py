@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -40,6 +41,22 @@ def wa_from_10(mobile: str) -> str:
         return f"whatsapp:+91{d}"
     if len(d) == 12 and d.startswith("91"):
         return f"whatsapp:+{d}"
+    return ""
+
+
+def wa_from_env(*env_keys: str) -> str:
+    """Read Cloud Run / .env approver ids at request time (whatsapp:+91… or digits)."""
+    for key in env_keys:
+        raw = (os.getenv(key) or "").strip().strip('"').strip("'")
+        if not raw:
+            continue
+        d = digits(raw)
+        if len(d) == 10:
+            return f"whatsapp:+91{d}"
+        if len(d) >= 12 and d.startswith("91"):
+            return f"whatsapp:+{d[-12:]}" if len(d) > 12 else f"whatsapp:+{d}"
+        if len(d) > 10:
+            return f"whatsapp:+91{d[-10:]}"
     return ""
 
 

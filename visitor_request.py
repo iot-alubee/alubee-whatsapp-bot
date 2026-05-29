@@ -21,7 +21,13 @@ from interakt_api import (
     wa_id_to_phone,
 )
 
-from approval import VISITING_BOTH, VISITING_TO_LABELS, VISITING_UNIT_I, VISITING_UNIT_II
+from approval import (
+    VISITING_BOTH,
+    VISITING_TO_LABELS,
+    VISITING_UNIT_I,
+    VISITING_UNIT_II,
+    visitor_chain_failure_message,
+)
 
 from bot_shared import digits, find_open_request, wa_from_10
 
@@ -742,19 +748,14 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
     chain = deps.build_approval_chain(ud, sender, visiting_to=visiting_to)
     if not chain:
         deps.clear_session(sender)
-        vt_upper = (visiting_to or "").strip().upper()
-        if vt_upper == VISITING_BOTH:
-            deps.send_to(
-                sender,
-                "Both units needs two visitor JMD numbers on the server "
-                "(VISITOR_JMD_I and VISITOR_JMD_II, different WhatsApp numbers).\n"
-                "Please contact admin.",
-            )
-        else:
-            deps.send_to(
-                sender,
-                "Visitor approvers are not configured on the server.\nPlease contact admin.",
-            )
+        deps.send_to(
+            sender,
+            visitor_chain_failure_message(
+                ud,
+                visiting_to=visiting_to,
+                employee_wa=sender,
+            ),
+        )
         return
     if (visiting_to or "").strip().upper() == VISITING_BOTH and chain.get("mode") != "dual":
         deps.clear_session(sender)

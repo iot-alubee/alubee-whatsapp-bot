@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
+from bot_shared import wa_from_env
+
 from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
@@ -100,15 +102,79 @@ def _use_visitor_test_approvers(employee_wa: str) -> bool:
 def _visitor_approver_numbers(
     d: ApprovalDeps, *, use_test: bool
 ) -> tuple[str, str, str]:
+    """Prefer live env vars (Cloud Run) over values captured at process start."""
+    live_i = wa_from_env(
+        "VISITOR_JMD_I_WHATSAPP_NUMBER",
+        "VISITOR_JMD_WHATSAPP_NUMBER",
+    )
+    live_ii = wa_from_env("VISITOR_JMD_II_WHATSAPP_NUMBER")
+    live_md = wa_from_env("VISITOR_MD_WHATSAPP_NUMBER")
     if use_test:
-        jmd_i = d.visitor_test_jmd_i or d.visitor_jmd_i
-        jmd_ii = d.visitor_test_jmd_ii or d.visitor_jmd_ii
-        md = d.visitor_test_md or d.visitor_md
+        jmd_i = (
+            wa_from_env(
+                "VISITOR_TEST_JMD_I_WHATSAPP_NUMBER",
+                "VISITOR_TEST_JMD_WHATSAPP_NUMBER",
+            )
+            or d.visitor_test_jmd_i
+            or live_i
+            or d.visitor_jmd_i
+        )
+        jmd_ii = (
+            wa_from_env("VISITOR_TEST_JMD_II_WHATSAPP_NUMBER")
+            or d.visitor_test_jmd_ii
+            or live_ii
+            or d.visitor_jmd_ii
+        )
+        md = (
+            wa_from_env("VISITOR_TEST_MD_WHATSAPP_NUMBER")
+            or d.visitor_test_md
+            or live_md
+            or d.visitor_md
+        )
     else:
-        jmd_i = d.visitor_jmd_i
-        jmd_ii = d.visitor_jmd_ii
-        md = d.visitor_md
+        jmd_i = live_i or d.visitor_jmd_i
+        jmd_ii = live_ii or d.visitor_jmd_ii
+        md = live_md or d.visitor_md
     return jmd_i, jmd_ii, md
+
+
+def visitor_chain_failure_message(
+    user_data: dict | None,
+    *,
+    visiting_to: str = "",
+    employee_wa: str = "",
+) -> str:
+    """User-facing hint when build_approval_chain returns None."""
+    d = _require()
+    use_test = _use_visitor_test_approvers(employee_wa)
+    jmd_i, jmd_ii, md = _visitor_approver_numbers(d, use_test=use_test)
+    vt = normalize_visiting_to(visiting_to)
+    if vt == VISITING_BOTH:
+        if not md:
+            return (
+                "Visitor MD is not configured on the server "
+                "(VISITOR_MD_WHATSAPP_NUMBER).\nPlease contact admin."
+            )
+        if not jmd_i:
+            return (
+                "Visitor Unit I JMD is not configured "
+                "(VISITOR_JMD_I_WHATSAPP_NUMBER).\nPlease contact admin."
+            )
+        if not jmd_ii:
+            return (
+                "Visitor Unit II JMD is not configured "
+                "(VISITOR_JMD_II_WHATSAPP_NUMBER).\n"
+                "Add it in Cloud Run → Variables, then deploy a new revision.\n"
+                "Please contact admin."
+            )
+        if d.same_whatsapp(jmd_i, jmd_ii):
+            return (
+                "Unit I and Unit II visitor JMD must use different WhatsApp numbers.\n"
+                "Please contact admin."
+            )
+    return (
+        "Visitor approvers are not configured on the server.\nPlease contact admin."
+    )
 
 
 def _build_visitor_approval_chain(
@@ -130,8 +196,11 @@ def _build_visitor_approval_chain(
     if vt == VISITING_BOTH:
         if not jmd_i or not jmd_ii:
             logger.error(
-                "visitor BOTH requires VISITOR_JMD_I_WHATSAPP_NUMBER and "
-                "VISITOR_JMD_II_WHATSAPP_NUMBER (both set on Cloud Run)"
+                "visitor BOTH requires VISITOR_JMD_I and II on Cloud Run "
+                "(jmd_i=%r jmd_ii=%r md=%r)",
+                jmd_i or "(missing)",
+                jmd_ii or "(missing)",
+                md or "(missing)",
             )
             return None
         if d.same_whatsapp(jmd_i, jmd_ii):

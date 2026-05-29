@@ -19,6 +19,7 @@ from firebase_admin import credentials, firestore
 
 import approval
 import bot_shared
+from bot_shared import wa_from_env as _visitor_wa_from_env
 import od_request
 import visitor_request
 from interakt_api import phone_to_wa_id, send_list_menu, send_text, wa_id_to_phone
@@ -104,18 +105,6 @@ def _parse_whatsapp_id_set(env_value: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def _visitor_wa_from_env(*env_keys: str) -> str:
-    """Normalize visitor approver id from Cloud Run env (whatsapp:+91… or digits)."""
-    for key in env_keys:
-        raw = (os.getenv(key) or "").strip()
-        if not raw:
-            continue
-        if raw.lower().startswith("whatsapp:"):
-            return phone_to_wa_id(raw.split(":", 1)[-1])
-        return phone_to_wa_id(raw)
-    return ""
-
-
 # Visitor approvers (all visitor requests). OD uses JMD_I / JMD_II / MD above.
 VISITOR_JMD_I_WHATSAPP_NUMBER = _visitor_wa_from_env(
     "VISITOR_JMD_I_WHATSAPP_NUMBER",
@@ -123,7 +112,7 @@ VISITOR_JMD_I_WHATSAPP_NUMBER = _visitor_wa_from_env(
 )
 # Do not fall back to JMD I — BOTH needs a separate Unit II visitor JMD.
 VISITOR_JMD_II_WHATSAPP_NUMBER = _visitor_wa_from_env("VISITOR_JMD_II_WHATSAPP_NUMBER")
-VISITOR_MD_WHATSAPP_NUMBER = (os.getenv("VISITOR_MD_WHATSAPP_NUMBER") or "").strip()
+VISITOR_MD_WHATSAPP_NUMBER = _visitor_wa_from_env("VISITOR_MD_WHATSAPP_NUMBER")
 VISITOR_ROUTE_BY_UNIT = os.getenv("VISITOR_ROUTE_BY_UNIT", "").strip().lower() in (
     "1",
     "true",
