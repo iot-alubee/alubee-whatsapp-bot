@@ -10,9 +10,12 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from datetime import datetime
+from datetime import date, datetime
 from dataclasses import dataclass
 from typing import Callable
+from zoneinfo import ZoneInfo
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 from interakt_api import (
     send_guest_visit_otp,
@@ -234,10 +237,7 @@ def _try_start_chat(sender: str, deps: VisitorDeps) -> None:
         visitor_names=[],
         guest_phone="",
     )
-    deps.send_to(
-        sender,
-        "Visitor form\n\nComing On (DD-MM-YYYY)?",
-    )
+    deps.send_to(sender, "Coming On(DD-MM-YYYY)")
 
 
 def handle(sender: str, incoming: str, session: dict, deps: VisitorDeps) -> None:
@@ -360,17 +360,54 @@ def _parse_purpose_choice(incoming: str) -> str | None:
     return None
 
 
-def _parse_visit_date(text: str) -> str | None:
+def _today_ist() -> date:
+    return datetime.now(_IST).date()
+
+
+def _parse_visit_date(text: str) -> tuple[str | None, str]:
+    """
+    Parse Coming On date. Returns (DD-MM-YYYY, error_message).
+    Must be DD-MM-YYYY (or DD/MM/YYYY), current year (IST), today or future only.
+    """
     raw = (text or "").strip()
     if not raw:
-        return None
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        return None, (
+            "Enter Coming On as DD-MM-YYYY\n"
+            f"(e.g. {_today_ist().strftime('%d-%m-%Y')})."
+        )
+
+    parsed: date | None = None
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y"):
         try:
-            d = datetime.strptime(raw, fmt).date()
-            return d.strftime("%d-%m-%Y")
+            parsed = datetime.strptime(raw, fmt).date()
+            break
         except ValueError:
             continue
-    return None
+    if parsed is None and len(raw) >= 10:
+        try:
+            parsed = datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            parsed = None
+
+    if parsed is None:
+        return None, (
+            "Date format is not correct.\n"
+            "Enter Coming On again as DD-MM-YYYY (e.g. 30-05-2026)."
+        )
+
+    today = _today_ist()
+    if parsed.year != today.year:
+        return None, (
+            f"Coming On must be in {today.year}.\n"
+            "Enter the date again as DD-MM-YYYY (today or a future date)."
+        )
+    if parsed < today:
+        return None, (
+            "Coming On cannot be a past date.\n"
+            f"Enter today ({today.strftime('%d-%m-%Y')}) or a future date (DD-MM-YYYY)."
+        )
+
+    return parsed.strftime("%d-%m-%Y"), ""
 
 
 def _parse_names(text: str) -> tuple[list[str] | None, str]:
@@ -418,9 +455,9 @@ def _handle_coming_on(sender: str, incoming: str, session: dict, deps: VisitorDe
         deps.clear_session(sender)
         deps.go_main_menu(sender)
         return
-    visit_date = _parse_visit_date(incoming)
+    visit_date, err = _parse_visit_date(incoming)
     if not visit_date:
-        deps.send_to(sender, "Coming On (DD-MM-YYYY)?")
+        deps.send_to(sender, err or "Coming On(DD-MM-YYYY)")
         return
     deps.session_merge(sender, state=VISITOR_COMING_FROM, coming_on_date=visit_date)
     deps.send_to(sender, "Coming From?")
@@ -430,7 +467,7 @@ def _handle_coming_from(sender: str, incoming: str, session: dict, deps: Visitor
     um = (incoming or "").strip().upper()
     if um == "BACK":
         deps.session_merge(sender, state=VISITOR_COMING_ON)
-        deps.send_to(sender, "Coming On (DD-MM-YYYY)?")
+        deps.send_to(sender, "Coming On(DD-MM-YYYY)")
         return
     detail = (incoming or "").strip()
     if len(detail) < 2:
@@ -651,15 +688,8 @@ def _flow_pick(data: dict, *needles: str) -> str:
 
 
 def _normalize_flow_date(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text:
-        return ""
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text[:10], fmt).strftime("%d-%m-%Y")
-        except ValueError:
-            continue
-    return text[:32]
+    normalized, _ = _parse_visit_date(raw)
+    return normalized or ""
 
 
 def parse_flow_response(response_json: dict | str | None) -> dict | None:
