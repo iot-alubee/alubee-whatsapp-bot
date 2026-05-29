@@ -462,10 +462,10 @@ def resolve_approval(incoming: str, approver: str):
     raw = (incoming or "").strip()
     upper = raw.upper()
     if upper.startswith("APPROVE_"):
-        rid = raw[8:].strip()
+        rid = raw.split("_", 1)[1].strip()
         return (True, rid) if rid else (None, None)
     if upper.startswith("DENY_"):
-        rid = raw[4:].strip()
+        rid = raw.split("_", 1)[1].strip()
         return (False, rid) if rid else (None, None)
     if upper in ("APPROVE", "DENY"):
         snap = d.session_ref(approver).get()
