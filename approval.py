@@ -23,6 +23,29 @@ VISITING_TO_LABELS = {
     VISITING_BOTH: "Both",
 }
 
+_VISITING_TO_ALIASES = {
+    "unit_i": VISITING_UNIT_I,
+    "unit_ii": VISITING_UNIT_II,
+    "unit_1": VISITING_UNIT_I,
+    "unit_2": VISITING_UNIT_II,
+    "both": VISITING_BOTH,
+    "visitor_visit_unit_i": VISITING_UNIT_I,
+    "visitor_visit_unit_ii": VISITING_UNIT_II,
+    "visitor_visit_both": VISITING_BOTH,
+}
+
+
+def normalize_visiting_to(visiting_to: str) -> str:
+    """Map button ids / labels to UNIT_I, UNIT_II, or BOTH."""
+    raw = (visiting_to or "").strip()
+    if not raw:
+        return VISITING_UNIT_I
+    upper = raw.upper()
+    if upper in (VISITING_UNIT_I, VISITING_UNIT_II, VISITING_BOTH):
+        return upper
+    slug = raw.lower().replace(" ", "_").replace("-", "_")
+    return _VISITING_TO_ALIASES.get(slug, VISITING_UNIT_I)
+
 
 @dataclass
 class ApprovalDeps:
@@ -98,7 +121,7 @@ def _build_visitor_approval_chain(
     use_test = _use_visitor_test_approvers(employee_wa)
     jmd_i, jmd_ii, md = _visitor_approver_numbers(d, use_test=use_test)
     emp_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
-    vt = (visiting_to or VISITING_UNIT_I).strip().upper()
+    vt = normalize_visiting_to(visiting_to)
 
     if not md:
         logger.error("visitor MD not configured — set VISITOR_MD_WHATSAPP_NUMBER")
@@ -107,7 +130,14 @@ def _build_visitor_approval_chain(
     if vt == VISITING_BOTH:
         if not jmd_i or not jmd_ii:
             logger.error(
-                "visitor BOTH requires VISITOR_JMD_I and VISITOR_JMD_II WhatsApp numbers"
+                "visitor BOTH requires VISITOR_JMD_I_WHATSAPP_NUMBER and "
+                "VISITOR_JMD_II_WHATSAPP_NUMBER (both set on Cloud Run)"
+            )
+            return None
+        if d.same_whatsapp(jmd_i, jmd_ii):
+            logger.error(
+                "visitor BOTH: VISITOR_JMD_II_WHATSAPP_NUMBER must differ from "
+                "VISITOR_JMD_I (remove fallback / set a separate Unit II number)"
             )
             return None
         chain: dict = {
@@ -222,7 +252,7 @@ def build_approval_chain(
 
     if req_type == "VISITOR":
         return _build_visitor_approval_chain(
-            d, user_data, employee_wa, visiting_to or VISITING_UNIT_I
+            d, user_data, employee_wa, normalize_visiting_to(visiting_to)
         )
 
     jmd = jmd_whatsapp_for_route(jmd_route, for_request_type="OD")
@@ -421,12 +451,37 @@ def _dual_jmd_both_approved(rd: dict) -> bool:
 
 def notify_visitor_on_submit(rd: dict, request_id: str, chain: dict) -> bool:
     """Notify host-unit JMD(s) when a visitor request is submitted."""
+    d = _require()
     if chain.get("mode") == "dual":
-        ok_i = notify_jmd(chain["jmd_i"], rd, request_id) if chain.get("jmd_i") else False
-        ok_ii = (
-            notify_jmd(chain["jmd_ii"], rd, request_id) if chain.get("jmd_ii") else False
+        jmd_i = (chain.get("jmd_i") or "").strip()
+        jmd_ii = (chain.get("jmd_ii") or "").strip()
+        ok_i = notify_jmd(jmd_i, rd, request_id) if jmd_i else False
+        ok_ii = False
+        if jmd_ii and not d.same_whatsapp(jmd_i, jmd_ii):
+            ok_ii = notify_jmd(jmd_ii, rd, request_id)
+        elif jmd_ii:
+            logger.warning(
+                "visitor dual notify: JMD II same as JMD I request_id=%s", request_id
+            )
+        if not ok_i:
+            logger.error(
+                "visitor JMD I notify failed request_id=%s jmd_i=%s",
+                request_id,
+                jmd_i,
+            )
+        if not ok_ii:
+            logger.error(
+                "visitor JMD II notify failed request_id=%s jmd_ii=%s",
+                request_id,
+                jmd_ii,
+            )
+        logger.info(
+            "visitor dual notify request_id=%s jmd_i_ok=%s jmd_ii_ok=%s",
+            request_id,
+            ok_i,
+            ok_ii,
         )
-        return ok_i or ok_ii
+        return ok_i and ok_ii
     jmd = chain.get("jmd") or ""
     return notify_jmd(jmd, rd, request_id) if jmd else False
 

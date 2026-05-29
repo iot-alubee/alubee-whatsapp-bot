@@ -738,13 +738,34 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
         return
 
     ud = user_doc.to_dict()
-    visiting_to = (data.get("visiting_to") or VISITING_UNIT_I).strip()
+    visiting_to = (data.get("visiting_to") or "").strip()
     chain = deps.build_approval_chain(ud, sender, visiting_to=visiting_to)
     if not chain:
         deps.clear_session(sender)
+        vt_upper = (visiting_to or "").strip().upper()
+        if vt_upper == VISITING_BOTH:
+            deps.send_to(
+                sender,
+                "Both units needs two visitor JMD numbers on the server "
+                "(VISITOR_JMD_I and VISITOR_JMD_II, different WhatsApp numbers).\n"
+                "Please contact admin.",
+            )
+        else:
+            deps.send_to(
+                sender,
+                "Visitor approvers are not configured on the server.\nPlease contact admin.",
+            )
+        return
+    if (visiting_to or "").strip().upper() == VISITING_BOTH and chain.get("mode") != "dual":
+        deps.clear_session(sender)
         deps.send_to(
             sender,
-            "Visitor approvers are not configured on the server.\nPlease contact admin.",
+            "Both units could not be routed to two JMDs.\nPlease contact admin.",
+        )
+        logger.error(
+            "VISITOR BOTH misconfigured visiting_to=%s chain_mode=%s",
+            visiting_to,
+            chain.get("mode"),
         )
         return
 
@@ -846,8 +867,8 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
     if not jmd_ok:
         if chain.get("mode") == "dual":
             msg += (
-                "\n\nUnit I / Unit II JMD could not be notified on WhatsApp. "
-                "Ask them to send Hi to this Alubee number once, then contact admin."
+                "\n\nUnit I and Unit II JMD must both be notified on WhatsApp. "
+                "Ask each JMD to send Hi to this Alubee number once, then contact admin."
             )
         else:
             route = chain.get("jmd_route") or "JMD"

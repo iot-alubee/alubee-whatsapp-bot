@@ -104,17 +104,25 @@ def _parse_whatsapp_id_set(env_value: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def _visitor_wa_from_env(*env_keys: str) -> str:
+    """Normalize visitor approver id from Cloud Run env (whatsapp:+91… or digits)."""
+    for key in env_keys:
+        raw = (os.getenv(key) or "").strip()
+        if not raw:
+            continue
+        if raw.lower().startswith("whatsapp:"):
+            return phone_to_wa_id(raw.split(":", 1)[-1])
+        return phone_to_wa_id(raw)
+    return ""
+
+
 # Visitor approvers (all visitor requests). OD uses JMD_I / JMD_II / MD above.
-VISITOR_JMD_I_WHATSAPP_NUMBER = (
-    os.getenv("VISITOR_JMD_I_WHATSAPP_NUMBER")
-    or os.getenv("VISITOR_JMD_WHATSAPP_NUMBER")
-    or ""
-).strip()
-VISITOR_JMD_II_WHATSAPP_NUMBER = (
-    os.getenv("VISITOR_JMD_II_WHATSAPP_NUMBER")
-    or os.getenv("VISITOR_JMD_WHATSAPP_NUMBER")
-    or VISITOR_JMD_I_WHATSAPP_NUMBER
-).strip()
+VISITOR_JMD_I_WHATSAPP_NUMBER = _visitor_wa_from_env(
+    "VISITOR_JMD_I_WHATSAPP_NUMBER",
+    "VISITOR_JMD_WHATSAPP_NUMBER",
+)
+# Do not fall back to JMD I — BOTH needs a separate Unit II visitor JMD.
+VISITOR_JMD_II_WHATSAPP_NUMBER = _visitor_wa_from_env("VISITOR_JMD_II_WHATSAPP_NUMBER")
 VISITOR_MD_WHATSAPP_NUMBER = (os.getenv("VISITOR_MD_WHATSAPP_NUMBER") or "").strip()
 VISITOR_ROUTE_BY_UNIT = os.getenv("VISITOR_ROUTE_BY_UNIT", "").strip().lower() in (
     "1",
@@ -324,6 +332,19 @@ approval.configure(
         visitor_test_md=VISITOR_TEST_MD_WHATSAPP_NUMBER,
         visitor_test_employee_wa_ids=VISITOR_TEST_EMPLOYEE_WA_IDS,
     )
+)
+logger.info(
+    "visitor approvers loaded jmd_i=%s jmd_ii=%s md=%s both_units_ok=%s",
+    VISITOR_JMD_I_WHATSAPP_NUMBER or "(missing)",
+    VISITOR_JMD_II_WHATSAPP_NUMBER or "(missing)",
+    VISITOR_MD_WHATSAPP_NUMBER or "(missing)",
+    bool(
+        VISITOR_JMD_I_WHATSAPP_NUMBER
+        and VISITOR_JMD_II_WHATSAPP_NUMBER
+        and not _same_whatsapp(
+            VISITOR_JMD_I_WHATSAPP_NUMBER, VISITOR_JMD_II_WHATSAPP_NUMBER
+        )
+    ),
 )
 
 
