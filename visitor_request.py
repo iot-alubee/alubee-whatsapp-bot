@@ -115,20 +115,40 @@ def _coming_on_label(rd: dict) -> str:
     return (rd.get("coming_on_date") or rd.get("visit_date") or "").strip() or "—"
 
 
+def _resolve_guest_contact(rd: dict) -> tuple[str, str]:
+    """Return (whatsapp_wa_id, 10-digit phone) for the visitor guest."""
+    for key in ("guest_whatsapp", "guest_wa", "guest_mobile", "visitor_mobile"):
+        raw = (rd.get(key) or "").strip()
+        if not raw:
+            continue
+        d = digits(raw)
+        if len(d) >= 10:
+            phone10 = d[-10:]
+            return wa_from_10(phone10), phone10
+    raw = (rd.get("guest_phone") or "").strip()
+    d = digits(str(raw))
+    if len(d) >= 10:
+        phone10 = d[-10:]
+        return wa_from_10(phone10), phone10
+    return "", ""
+
+
 def send_otps_after_md_approve(ref, rd: dict, send_to: Callable[[str, str], None]) -> str:
     """OTP to employee (session) and guest (template) after MD approval."""
+    snap = ref.get()
+    if snap.exists:
+        rd = snap.to_dict() or rd
+
     otp = f"{secrets.randbelow(1_000_000):06d}"
-    ref.update({"visitor_otp": otp})
+    ref.update({"visitor_otp": otp, "guest_otp_sent": False})
+
     names = ", ".join(rd.get("visitor_names") or []) or "—"
     coming_on = _coming_on_label(rd)
     coming_from = _coming_from_label(rd)
     coming_for = _coming_for_label(rd)
     employee = rd.get("employee")
-    guest_wa = (rd.get("guest_whatsapp") or "").strip()
-    if not guest_wa and rd.get("guest_phone"):
-        d = digits(str(rd.get("guest_phone")))
-        if len(d) >= 10:
-            guest_wa = wa_from_10(d[-10:])
+    guest_wa, guest_phone10 = _resolve_guest_contact(rd)
+    request_id = (rd.get("request_id") or "").strip()
 
     send_to(
         employee,
@@ -143,23 +163,45 @@ def send_otps_after_md_approve(ref, rd: dict, send_to: Callable[[str, str], None
         ),
     )
 
-    if guest_wa:
-        guest_name = (rd.get("visitor_names") or ["Guest"])[0]
-        guest_phone = wa_id_to_phone(guest_wa)
-        guest_ok = send_guest_visit_otp(
-            guest_phone,
-            guest_name=str(guest_name)[:50],
-            otp=otp,
-            organization=coming_from,
+    if not guest_phone10:
+        logger.warning(
+            "visitor OTP: no guest phone on request_id=%s keys=%s",
+            request_id,
+            [k for k in ("guest_phone", "guest_whatsapp") if rd.get(k)],
         )
-        if not guest_ok:
-            send_to(
-                employee,
-                (
-                    f"Visitor OTP {otp} could not be sent on WhatsApp to {guest_phone}. "
-                    "Share the OTP with the guest manually."
-                ),
-            )
+        send_to(
+            employee,
+            "Visitor WhatsApp number was not saved on this request. "
+            "Share the OTP with the guest manually.",
+        )
+        return otp
+
+    raw_names = rd.get("visitor_names") or []
+    if isinstance(raw_names, str):
+        guest_name = raw_names.split(",")[0].strip() or "Guest"
+    else:
+        guest_name = (raw_names[0] if raw_names else "Guest") or "Guest"
+
+    guest_ok = send_guest_visit_otp(
+        guest_phone10,
+        guest_name=str(guest_name)[:50],
+        otp=otp,
+        organization=coming_from,
+    )
+    if guest_ok:
+        ref.update({"guest_otp_sent": True, "guest_phone": guest_phone10})
+        send_to(
+            employee,
+            f"Entry OTP was also sent on WhatsApp to the visitor ({guest_phone10}).",
+        )
+    else:
+        send_to(
+            employee,
+            (
+                f"Visitor OTP {otp} could not be sent on WhatsApp to {guest_phone10}. "
+                "Ask the guest to send Hi to this Alubee number once, or share the OTP manually."
+            ),
+        )
     return otp
 
 

@@ -75,18 +75,31 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def ensure_customer(phone: str, *, name: str = "", user_id: str = "") -> None:
+def ensure_customer(
+    phone: str,
+    *,
+    name: str = "",
+    user_id: str = "",
+    required: bool = False,
+) -> bool:
     """
     Register/update contact in Interakt before messaging (fixes
     'Customer is not available for the organization' for manager/MD).
+    Returns True when track user succeeds (or is optional and fails softly).
     """
+    phone10 = phone_to_10(phone)
+    if not phone10:
+        if required:
+            logger.error("ensure_customer: invalid phone %r", phone)
+        return False
     payload: dict[str, Any] = {
-        "phoneNumber": phone_to_10(phone),
+        "phoneNumber": phone10,
         "countryCode": "+91",
         "traits": {
             "name": (name or "Contact")[:256],
             "whatsapp_opted_in": True,
         },
+        "tags": ["visitor_guest"],
     }
     if user_id:
         payload["userId"] = user_id[:256]
@@ -98,11 +111,18 @@ def ensure_customer(phone: str, *, name: str = "", user_id: str = "") -> None:
             timeout=15,
         )
         if resp.status_code >= 400:
-            logger.warning("Interakt track user %s: %s", resp.status_code, resp.text[:300])
-        else:
-            logger.info("Interakt track user ok phone=%s", phone_to_10(phone))
+            logger.warning(
+                "Interakt track user %s phone=%s: %s",
+                resp.status_code,
+                phone10,
+                resp.text[:500],
+            )
+            return not required
+        logger.info("Interakt track user ok phone=%s", phone10)
+        return True
     except Exception:
-        logger.exception("Interakt track user failed phone=%s", phone_to_10(phone))
+        logger.exception("Interakt track user failed phone=%s", phone10)
+        return not required
 
 
 def send_template(
@@ -427,34 +447,83 @@ def send_guest_visit_otp(
         logger.error("VISITOR_OTP_TEMPLATE_NAME is empty — cannot WhatsApp guest")
         return False
 
+    phone10 = phone_to_10(phone)
+    if not phone10:
+        logger.error("guest visit OTP: invalid phone %r", phone)
+        return False
+
+    if not ensure_customer(
+        phone10,
+        name=(guest_name or "Guest")[:50],
+        user_id=f"visitor_{phone10}",
+        required=True,
+    ):
+        logger.error("guest visit OTP: could not register guest phone=%s", phone10)
+        return False
+
     lang = (os.getenv("VISITOR_OTP_TEMPLATE_LANGUAGE_CODE") or "en").strip()
     body_spec = (os.getenv("VISITOR_OTP_TEMPLATE_BODY_FIELDS") or "otp").strip()
     otp_code = str(otp or "").strip()[:15]
-    body_values = _template_body_values_from_spec(
-        body_spec,
-        {
-            "name": (guest_name or "Guest")[:50],
-            "otp": otp_code,
-            "organization": (organization or "Alubee")[:200],
-        },
-    )
+    if not otp_code:
+        logger.error("guest visit OTP: empty otp")
+        return False
+
+    # Authentication templates: same OTP in bodyValues and buttonValues (Interakt docs).
+    body_values = [otp_code]
+    if body_spec and body_spec.strip().lower() != "otp":
+        body_values = _template_body_values_from_spec(
+            body_spec,
+            {
+                "name": (guest_name or "Guest")[:50],
+                "otp": otp_code,
+                "organization": (organization or "Alubee")[:200],
+            },
+        )
+
     button_values = None
     if _env_flag("VISITOR_OTP_TEMPLATE_AUTH_BUTTON", default=True):
         button_values = {"0": [otp_code]}
 
-    try:
-        send_template(
-            phone,
+    def _send(*, with_button: bool) -> dict[str, Any]:
+        return send_template(
+            phone10,
             template_name,
             language_code=lang,
             body_values=body_values,
-            button_values=button_values,
+            button_values=button_values if with_button else None,
             callback_data="visitor-otp",
-            ensure_contact=True,
+            ensure_contact=False,
             contact_name=(guest_name or "Guest")[:50],
         )
-        logger.info("guest visit OTP template sent phone=%s", phone_to_10(phone))
+
+    try:
+        data = _send(with_button=bool(button_values))
+        logger.info(
+            "guest visit OTP template sent phone=%s template=%s response=%s",
+            phone10,
+            template_name,
+            str(data)[:200],
+        )
         return True
     except Exception:
-        logger.exception("guest visit OTP template failed phone=%s", phone_to_10(phone))
+        logger.exception(
+            "guest visit OTP template failed phone=%s template=%s body=%s button=%s",
+            phone10,
+            template_name,
+            body_values,
+            button_values,
+        )
+        if button_values:
+            try:
+                data = _send(with_button=False)
+                logger.info(
+                    "guest visit OTP sent without auth button phone=%s response=%s",
+                    phone10,
+                    str(data)[:200],
+                )
+                return True
+            except Exception:
+                logger.exception(
+                    "guest visit OTP retry without button failed phone=%s", phone10
+                )
         return False

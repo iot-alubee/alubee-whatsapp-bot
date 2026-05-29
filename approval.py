@@ -688,7 +688,9 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 patch["jmd_status"] = "APPROVED"
             ref.update(patch)
             if (rd.get("type") or "").strip().upper() == "VISITOR":
-                d.on_visitor_md_approved(ref, rd)
+                fresh = ref.get()
+                rd_fresh = fresh.to_dict() if fresh.exists else rd
+                d.on_visitor_md_approved(ref, rd_fresh)
             else:
                 d.send_to(employee, "Your OD has been Approved.")
             logger.info("md approved (final) request_id=%s", request_id)
