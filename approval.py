@@ -11,6 +11,8 @@ from typing import Callable
 
 from bot_shared import wa_from_env
 
+import approver_availability
+
 from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class ApprovalDeps:
     jmd_i: str
     jmd_ii: str
     md: str
+    test_md: str = ""
     whatsapp_session_hours: int
     menu_idle_state: str
     on_visitor_md_approved: Callable[[object, dict], None]
@@ -479,6 +482,8 @@ def resolve_approval(incoming: str, approver: str):
 
 def _approval_role(sender: str, rd: dict) -> str | None:
     d = _require()
+    if approver_availability.is_test_md_sender(sender, d.test_md, d.same_whatsapp):
+        return None
     jmd_st = (rd.get("jmd_status") or "").strip().upper()
     md_st = (rd.get("md_status") or "").strip().upper()
 
@@ -665,6 +670,12 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             })
             notify_approver(md_wa, rd, request_id)
             logger.info("jmd approved request_id=%s → md", request_id)
+            if (
+                req_label == "OD"
+                and md_wa
+                and approver_availability.is_offline(d.db, md_wa)
+            ):
+                d.send_to(employee, "Your OD has been Approved.")
         else:
             ref.update({
                 "manager_status": "N/A",

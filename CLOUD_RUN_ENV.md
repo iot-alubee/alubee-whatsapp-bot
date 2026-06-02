@@ -40,6 +40,7 @@ Optional: `VISITOR_ROUTE_BY_UNIT=true` — Unit II employees (`jmd_route` JMD2) 
 | Name | Default | Purpose |
 |------|---------|---------|
 | `WHATSAPP_SESSION_HOURS` | `24` | Approver must message Alubee within this window for Approve/Deny buttons |
+| `TEST_MD_WHATSAPP_NUMBER` | — | **Testing only** — Online/Offline menu via Hi; does **not** receive approvals |
 | `VISITOR_ROUTE_BY_UNIT` | `false` | `true` = Unit II employees use `JMD_II` for visitor routing |
 | `VISITOR_TEST_*` | — | **Pilot only** — alternate JMD/MD for listed test employees |
 

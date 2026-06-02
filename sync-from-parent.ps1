@@ -9,6 +9,7 @@ $modules = @(
     "interakt_api.py",
     "bot_shared.py",
     "approval.py",
+    "approver_availability.py",
     "od_request.py",
     "visitor_request.py",
     "requirements.txt"
@@ -20,7 +21,7 @@ foreach ($name in $modules) {
 }
 
 Write-Host ""
-Write-Host "Synced: visitor message-by-message flow + OTP, OD unchanged."
+Write-Host "Synced: approval, OD, visitor, approver Online/Offline (approver_availability.py)."
 Write-Host "Production/main.py is NOT overwritten (Cloud Run bootstrap)."
 Write-Host ""
 Write-Host "Deploy:"

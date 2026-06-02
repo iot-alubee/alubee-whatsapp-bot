@@ -63,6 +63,7 @@ Minimum:
 | `JMD_I_WHATSAPP_NUMBER` | Unit I JMD (OD + visitor) |
 | `JMD_II_WHATSAPP_NUMBER` | Unit II JMD (OD + visitor; required for Visiting to = Both) |
 | `MD_WHATSAPP_NUMBER` | Final MD (OD + visitor) |
+| `TEST_MD_WHATSAPP_NUMBER` | Optional — test Online/Offline only (no approval messages) |
 | `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |

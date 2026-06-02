@@ -18,10 +18,18 @@ from fastapi import FastAPI, Request
 from firebase_admin import credentials, firestore
 
 import approval
+import approver_availability
 import bot_shared
+from bot_shared import wa_from_env
 import od_request
 import visitor_request
-from interakt_api import phone_to_wa_id, send_list_menu, send_text, wa_id_to_phone
+from interakt_api import (
+    phone_to_wa_id,
+    send_list_menu,
+    send_reply_buttons,
+    send_text,
+    wa_id_to_phone,
+)
 
 _APP_DIR = Path(__file__).resolve().parent
 
@@ -82,6 +90,8 @@ JMD_II_WHATSAPP_NUMBER = (
 MD_WHATSAPP_NUMBER = (
     os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
 ).strip()
+# Online/Offline testing only — never receives approval requests.
+TEST_MD_WHATSAPP_NUMBER = wa_from_env("TEST_MD_WHATSAPP_NUMBER")
 
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
 
@@ -138,6 +148,7 @@ _UNSUPPORTED_REQUEST_IDS = frozenset({
 
 SESSION_MENU_IDLE = "MENU_IDLE"
 SESSION_AWAITING_HI = "AWAITING_HI"
+SESSION_APPROVER_AVAILABILITY = "APPROVER_AVAILABILITY"
 
 _ROW_IDS = {
     "od_request": "OD_REQUEST",
@@ -157,6 +168,8 @@ _ROW_IDS = {
     "cancel": "CANCEL",
     "approve": "APPROVE",
     "deny": "DENY",
+    "online": "ONLINE",
+    "offline": "OFFLINE",
     "visitor_coming_for_customer": "CUSTOMER_VISIT",
     "visitor_coming_for_technical": "TECHNICAL_WORK",
     "visitor_coming_for_other": "OTHER",
@@ -301,6 +314,7 @@ approval.configure(
         jmd_i=JMD_I_WHATSAPP_NUMBER,
         jmd_ii=JMD_II_WHATSAPP_NUMBER,
         md=MD_WHATSAPP_NUMBER,
+        test_md=TEST_MD_WHATSAPP_NUMBER,
         whatsapp_session_hours=WHATSAPP_SESSION_HOURS,
         menu_idle_state=SESSION_MENU_IDLE,
         on_visitor_md_approved=_on_visitor_md_approved,
@@ -393,6 +407,55 @@ def _numbered_request_menu(employee_name: str) -> str:
 
 def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
     return [{"id": row_id, "title": title[:24]} for row_id, title in items]
+
+
+def _send_approver_availability_menu(wa_id: str, current: str) -> None:
+    label = "Offline" if current == "offline" else "Online"
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            f"Approver status: {label}\n\nSet your availability:",
+            [("ONLINE", "Online"), ("OFFLINE", "Offline")],
+        )
+    except Exception:
+        logger.exception("approver availability menu failed to=%s", wa_id)
+        _send_to(
+            wa_id,
+            f"Status: {label}\nReply ONLINE or OFFLINE to change.",
+        )
+
+
+def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
+    upper = (incoming or "").strip().upper()
+    if upper not in ("ONLINE", "OFFLINE"):
+        return False
+    snap = _session_ref(sender).get()
+    data = snap.to_dict() if snap.exists else {}
+    role = (data.get("approver_role") or "").strip()
+    if data.get("state") != SESSION_APPROVER_AVAILABILITY and not role:
+        role = approver_availability.approver_role_for_sender(
+            sender,
+            md=MD_WHATSAPP_NUMBER,
+            jmd_i=JMD_I_WHATSAPP_NUMBER,
+            jmd_ii=JMD_II_WHATSAPP_NUMBER,
+            same_whatsapp=_same_whatsapp,
+            test_md=TEST_MD_WHATSAPP_NUMBER,
+        )
+        if not role:
+            return False
+    availability = "offline" if upper == "OFFLINE" else "online"
+    approver_availability.set_availability(
+        db, sender, availability, role=role or "approver"
+    )
+    _send_to(sender, f"You are now {availability.title()}.")
+    user = db.collection("users").document(sender).get()
+    if user.exists:
+        name = user.to_dict().get("name", "Approver")
+        _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
+        _send_main_menu(sender, name)
+    else:
+        _session_merge(sender, state=SESSION_APPROVER_AVAILABILITY, approver_role=role)
+    return True
 
 
 def _send_main_menu(wa_id: str, employee_name: str) -> None:
@@ -498,6 +561,26 @@ def _process(sender: str, incoming: str) -> None:
     _touch_whatsapp_inbound(sender)
 
     if incoming.lower() in ("hi", "hello"):
+        approver_role = approver_availability.approver_role_for_sender(
+            sender,
+            md=MD_WHATSAPP_NUMBER,
+            jmd_i=JMD_I_WHATSAPP_NUMBER,
+            jmd_ii=JMD_II_WHATSAPP_NUMBER,
+            same_whatsapp=_same_whatsapp,
+            test_md=TEST_MD_WHATSAPP_NUMBER,
+        )
+        if approver_role:
+            approver_availability.ensure_online_default(
+                db, sender, role=approver_role
+            )
+            current = approver_availability.get_availability(db, sender)
+            _session_merge(
+                sender,
+                state=SESSION_APPROVER_AVAILABILITY,
+                approver_role=approver_role,
+            )
+            _send_approver_availability_menu(sender, current)
+            return
         user = db.collection("users").document(sender).get()
         if user.exists:
             name = user.to_dict().get("name", "Employee")
@@ -506,6 +589,9 @@ def _process(sender: str, incoming: str) -> None:
         else:
             _session_ref(sender).delete()
             _send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+
+    if _try_handle_approver_availability(sender, incoming):
         return
 
     if approval.handle_approval_gate(sender, incoming):
@@ -564,6 +650,7 @@ def health():
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,
         "md": MD_WHATSAPP_NUMBER,
+        "test_md_configured": bool(TEST_MD_WHATSAPP_NUMBER),
         "visitor_uses_od_approvers": True,
         "visitor_approvers_configured": bool(
             JMD_I_WHATSAPP_NUMBER and MD_WHATSAPP_NUMBER
