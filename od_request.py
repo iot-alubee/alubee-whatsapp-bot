@@ -6,7 +6,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[misc, assignment]
 
 from interakt_api import send_list_menu, send_reply_buttons, wa_id_to_phone
 
@@ -176,6 +182,37 @@ def handle(sender: str, incoming: str, session: dict, deps: OdDeps) -> None:
             )
 
 
+def _ist_tzinfo():
+    if ZoneInfo:
+        return ZoneInfo("Asia/Kolkata")
+    return timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist_today():
+    return datetime.now(_ist_tzinfo()).date()
+
+
+def _requested_datetime_ist_date(d: dict):
+    """Calendar date in IST for ``requested_datetime``."""
+    val = d.get("requested_datetime")
+    if val is None:
+        return None
+    try:
+        if hasattr(val, "timestamp") and callable(val.timestamp):
+            dtu = datetime.fromtimestamp(val.timestamp(), tz=timezone.utc)
+        elif isinstance(val, datetime):
+            dtu = (
+                val.replace(tzinfo=timezone.utc)
+                if val.tzinfo is None
+                else val.astimezone(timezone.utc)
+            )
+        else:
+            return None
+        return dtu.astimezone(_ist_tzinfo()).date()
+    except Exception:
+        return None
+
+
 def _od_request_is_closed(d: dict) -> bool:
     for key in ("manager_status", "jmd_status", "md_status"):
         if (d.get(key) or "").strip().upper() == "DENIED":
@@ -185,14 +222,31 @@ def _od_request_is_closed(d: dict) -> bool:
     return False
 
 
+def _od_approval_still_pending(d: dict) -> bool:
+    """JMD/MD approval not finished (excludes denied and fully MD-approved)."""
+    if _od_request_is_closed(d):
+        return False
+    md = (d.get("md_status") or "").strip().upper()
+    if md == "APPROVED":
+        return False
+    jmd = (d.get("jmd_status") or "").strip().upper()
+    if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
+        return True
+    return md == "PENDING"
+
+
 def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
+    """Block a new OD only when today's request is still awaiting approval."""
+    today = _ist_today()
     for snap in deps.db.collection("requests").stream():
         d = snap.to_dict() or {}
         if (d.get("type") or "").strip().upper() != "OD":
             continue
         if not deps.same_whatsapp(d.get("employee"), employee):
             continue
-        if _od_request_is_closed(d):
+        if _requested_datetime_ist_date(d) != today:
+            continue
+        if not _od_approval_still_pending(d):
             continue
         return d
     return None
