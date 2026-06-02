@@ -64,10 +64,10 @@ class ApprovalDeps:
     jmd_i: str
     jmd_ii: str
     md: str
-    test_md: str = ""
     whatsapp_session_hours: int
     menu_idle_state: str
     on_visitor_md_approved: Callable[[object, dict], None]
+    test_md: str = ""
     # Visitor uses same approvers as OD (jmd_i / jmd_ii / md); fields kept for optional overrides.
     visitor_jmd_i: str = ""
     visitor_jmd_ii: str = ""
