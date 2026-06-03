@@ -495,6 +495,8 @@ def _approval_role(sender: str, rd: dict) -> str | None:
         if d.same_whatsapp(sender, (rd.get("jmd_ii") or "")) and jmd_ii_st == "PENDING":
             return "jmd_ii"
         md_wa = request_md_whatsapp(rd)
+        if _md_offline_closed(rd):
+            return None
         if (
             d.same_whatsapp(sender, md_wa)
             and jmd_i_st == "APPROVED"
@@ -509,6 +511,8 @@ def _approval_role(sender: str, rd: dict) -> str | None:
         return "jmd"
 
     md_wa = request_md_whatsapp(rd)
+    if _md_offline_closed(rd):
+        return None
     if d.same_whatsapp(sender, md_wa) and jmd_st == "APPROVED" and md_st == "PENDING":
         return "md"
 
@@ -528,19 +532,53 @@ def _visitor_jmd_fully_approved(rd: dict) -> bool:
     return (rd.get("jmd_status") or "").strip().upper() == "APPROVED"
 
 
-def _maybe_finalize_visitor_md_offline(
-    d: ApprovalDeps, ref, rd: dict, md_wa: str
+def _md_is_offline_now(d: ApprovalDeps, md_wa: str) -> bool:
+    return bool(md_wa and approver_availability.is_offline(d.db, md_wa))
+
+
+def _md_offline_closed(rd: dict) -> bool:
+    """MD step finished via offline bypass — must not ask MD again when back online."""
+    if rd.get("md_offline_bypass"):
+        return True
+    return (rd.get("md_status") or "").strip().upper() == "OFFLINE"
+
+
+def _md_status_after_jmd(md_offline: bool) -> str:
+    return "OFFLINE" if md_offline else "PENDING"
+
+
+def _md_offline_bypass_fields(d: ApprovalDeps, md_offline: bool) -> dict:
+    if not md_offline:
+        return {}
+    return {
+        "md_offline_bypass": True,
+        "approved_datetime": d.utcnow(),
+    }
+
+
+def _after_jmd_when_md_offline(
+    d: ApprovalDeps,
+    ref,
+    rd: dict,
+    md_wa: str,
+    *,
+    employee: str,
+    req_label: str,
+    request_id: str,
 ) -> None:
-    """When MD is offline and JMD step is done, issue visitor OTP (same as MD approve)."""
-    if (rd.get("type") or "").strip().upper() != "VISITOR":
-        return
-    if not md_wa or not approver_availability.is_offline(d.db, md_wa):
-        return
-    fresh = ref.get()
-    rd_fresh = fresh.to_dict() if fresh.exists else rd
-    if not _visitor_jmd_fully_approved(rd_fresh):
-        return
-    d.on_visitor_md_approved(ref, rd_fresh)
+    """Close MD on request + employee/visitor completion; do not leave MD pending."""
+    fresh_snap = ref.get()
+    rd_fresh = fresh_snap.to_dict() if fresh_snap.exists else rd
+    if req_label == "visitor":
+        if _visitor_jmd_fully_approved(rd_fresh):
+            d.on_visitor_md_approved(ref, rd_fresh)
+    else:
+        d.send_to(employee, "Your OD has been Approved.")
+    logger.info(
+        "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
+        request_id,
+        req_label,
+    )
 
 
 def notify_visitor_on_submit(rd: dict, request_id: str, chain: dict) -> bool:
@@ -654,15 +692,31 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             rd = ref.get().to_dict() or {}
             if _dual_jmd_both_approved(rd):
                 md_wa = request_md_whatsapp(rd)
+                md_off = _md_is_offline_now(d, md_wa)
                 ref.update({
                     "jmd_status": "APPROVED",
-                    "md_status": "PENDING",
+                    "md_status": _md_status_after_jmd(md_off),
                     "md": md_wa,
                     "manager_status": "N/A",
+                    **_md_offline_bypass_fields(d, md_off),
                 })
-                notify_approver(md_wa, rd, request_id)
-                logger.info("visitor dual JMD approved request_id=%s → md", request_id)
-                _maybe_finalize_visitor_md_offline(d, ref, rd, md_wa)
+                rd = ref.get().to_dict() or rd
+                if md_off:
+                    _after_jmd_when_md_offline(
+                        d,
+                        ref,
+                        rd,
+                        md_wa,
+                        employee=employee,
+                        req_label=req_label,
+                        request_id=request_id,
+                    )
+                else:
+                    notify_approver(md_wa, rd, request_id)
+                    logger.info(
+                        "visitor dual JMD approved request_id=%s → md",
+                        request_id,
+                    )
             else:
                 logger.info(
                     "visitor %s approved request_id=%s (awaiting other JMD)",
@@ -682,21 +736,30 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
     elif role == "jmd":
         if is_approve:
             md_wa = request_md_whatsapp(rd)
+            md_off = _md_is_offline_now(d, md_wa)
             ref.update({
                 "jmd": request_jmd_whatsapp(rd),
                 "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
                 "md": md_wa,
                 "manager_status": "N/A",
                 "jmd_status": "APPROVED",
-                "md_status": "PENDING",
+                "md_status": _md_status_after_jmd(md_off),
+                **_md_offline_bypass_fields(d, md_off),
             })
-            notify_approver(md_wa, rd, request_id)
-            logger.info("jmd approved request_id=%s → md", request_id)
-            if md_wa and approver_availability.is_offline(d.db, md_wa):
-                if req_label == "OD":
-                    d.send_to(employee, "Your OD has been Approved.")
-                else:
-                    _maybe_finalize_visitor_md_offline(d, ref, rd, md_wa)
+            rd = ref.get().to_dict() or rd
+            if md_off:
+                _after_jmd_when_md_offline(
+                    d,
+                    ref,
+                    rd,
+                    md_wa,
+                    employee=employee,
+                    req_label=req_label,
+                    request_id=request_id,
+                )
+            else:
+                notify_approver(md_wa, rd, request_id)
+                logger.info("jmd approved request_id=%s → md", request_id)
         else:
             ref.update({
                 "manager_status": "N/A",
