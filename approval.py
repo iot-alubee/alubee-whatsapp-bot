@@ -522,6 +522,27 @@ def _dual_jmd_both_approved(rd: dict) -> bool:
     )
 
 
+def _visitor_jmd_fully_approved(rd: dict) -> bool:
+    if rd.get("visitor_dual_jmd"):
+        return _dual_jmd_both_approved(rd)
+    return (rd.get("jmd_status") or "").strip().upper() == "APPROVED"
+
+
+def _maybe_finalize_visitor_md_offline(
+    d: ApprovalDeps, ref, rd: dict, md_wa: str
+) -> None:
+    """When MD is offline and JMD step is done, issue visitor OTP (same as MD approve)."""
+    if (rd.get("type") or "").strip().upper() != "VISITOR":
+        return
+    if not md_wa or not approver_availability.is_offline(d.db, md_wa):
+        return
+    fresh = ref.get()
+    rd_fresh = fresh.to_dict() if fresh.exists else rd
+    if not _visitor_jmd_fully_approved(rd_fresh):
+        return
+    d.on_visitor_md_approved(ref, rd_fresh)
+
+
 def notify_visitor_on_submit(rd: dict, request_id: str, chain: dict) -> bool:
     """Notify host-unit JMD(s) when a visitor request is submitted."""
     d = _require()
@@ -641,6 +662,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 })
                 notify_approver(md_wa, rd, request_id)
                 logger.info("visitor dual JMD approved request_id=%s → md", request_id)
+                _maybe_finalize_visitor_md_offline(d, ref, rd, md_wa)
             else:
                 logger.info(
                     "visitor %s approved request_id=%s (awaiting other JMD)",
@@ -670,12 +692,11 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             })
             notify_approver(md_wa, rd, request_id)
             logger.info("jmd approved request_id=%s → md", request_id)
-            if (
-                req_label == "OD"
-                and md_wa
-                and approver_availability.is_offline(d.db, md_wa)
-            ):
-                d.send_to(employee, "Your OD has been Approved.")
+            if md_wa and approver_availability.is_offline(d.db, md_wa):
+                if req_label == "OD":
+                    d.send_to(employee, "Your OD has been Approved.")
+                else:
+                    _maybe_finalize_visitor_md_offline(d, ref, rd, md_wa)
         else:
             ref.update({
                 "manager_status": "N/A",

@@ -77,3 +77,26 @@ def is_test_md_sender(
     sender: str, test_md: str, same_whatsapp: Callable[[str, str], bool]
 ) -> bool:
     return bool(test_md) and same_whatsapp(sender, test_md)
+
+
+def offline_blocked_message(
+    db,
+    role: str,
+    *,
+    md: str,
+    jmd_i: str,
+    jmd_ii: str,
+) -> str | None:
+    """If going offline is not allowed, return a polite message; else None."""
+    r = (role or "").strip().lower()
+    if r == "test_md":
+        return None
+    if r == "md":
+        if (jmd_i and is_offline(db, jmd_i)) or (jmd_ii and is_offline(db, jmd_ii)):
+            return "JMD is already offline. Please be Online."
+        return None
+    if r in ("jmd_i", "jmd_ii"):
+        if md and is_offline(db, md):
+            return "MD is already offline. Please be Online."
+        return None
+    return None

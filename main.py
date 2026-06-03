@@ -444,6 +444,17 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
         if not role:
             return False
     availability = "offline" if upper == "OFFLINE" else "online"
+    if availability == "offline":
+        blocked = approver_availability.offline_blocked_message(
+            db,
+            role,
+            md=MD_WHATSAPP_NUMBER,
+            jmd_i=JMD_I_WHATSAPP_NUMBER,
+            jmd_ii=JMD_II_WHATSAPP_NUMBER,
+        )
+        if blocked:
+            _send_to(sender, blocked)
+            return True
     approver_availability.set_availability(
         db, sender, availability, role=role or "approver"
     )
