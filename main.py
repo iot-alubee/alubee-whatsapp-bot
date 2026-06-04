@@ -16,6 +16,7 @@ from pathlib import Path
 import firebase_admin
 from fastapi import FastAPI, Request
 from firebase_admin import credentials, firestore
+from google.api_core.exceptions import ResourceExhausted
 
 import approval
 import approver_availability
@@ -353,9 +354,9 @@ def _build_visitor_approval_chain(
 
 
 def _go_main_menu_for_employee(sender: str) -> None:
-    user = db.collection("users").document(sender).get()
-    if user.exists:
-        name = user.to_dict().get("name", "Employee")
+    exists, ud = bot_shared.get_user_record(sender)
+    if exists and ud:
+        name = ud.get("name", "Employee")
         _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
         _send_main_menu(sender, name)
     else:
@@ -459,9 +460,9 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
         db, sender, availability, role=role or "approver"
     )
     _send_to(sender, f"You are now {availability.title()}.")
-    user = db.collection("users").document(sender).get()
-    if user.exists:
-        name = user.to_dict().get("name", "Approver")
+    exists, ud = bot_shared.get_user_record(sender)
+    if exists and ud:
+        name = ud.get("name", "Approver")
         _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
         _send_main_menu(sender, name)
     else:
@@ -592,9 +593,9 @@ def _process(sender: str, incoming: str) -> None:
             )
             _send_approver_availability_menu(sender, current)
             return
-        user = db.collection("users").document(sender).get()
-        if user.exists:
-            name = user.to_dict().get("name", "Employee")
+        exists, ud = bot_shared.get_user_record(sender)
+        if exists and ud:
+            name = ud.get("name", "Employee")
             _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
             _send_main_menu(sender, name)
         else:
@@ -689,6 +690,16 @@ async def webhook(request: Request):
         sender, incoming = parsed
         try:
             _process(sender, incoming)
+        except ResourceExhausted:
+            logger.error("Firestore quota exceeded sender=%s", sender)
+            try:
+                _send_to(
+                    sender,
+                    "Service is busy (database limit). "
+                    "Please wait 1-2 minutes and send Hi again.",
+                )
+            except Exception:
+                logger.exception("could not notify user after quota error")
         except Exception:
             logger.exception("process failed")
 

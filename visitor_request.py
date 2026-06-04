@@ -809,13 +809,13 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
         deps.send_to(sender, deps.already_pending_msg)
         return
 
-    user_doc = deps.db.collection("users").document(sender).get()
-    if not user_doc.exists:
+    from bot_shared import get_user_record
+
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
         deps.clear_session(sender)
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
-
-    ud = user_doc.to_dict()
     visiting_to = (data.get("visiting_to") or "").strip()
     chain = deps.build_approval_chain(ud, sender, visiting_to=visiting_to)
     if not chain:

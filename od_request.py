@@ -57,10 +57,12 @@ def try_start(sender: str, deps: OdDeps) -> None:
     if _find_open_od_for_employee(deps, sender):
         deps.send_to(sender, deps.already_pending_msg)
         return
-    user = deps.db.collection("users").document(sender).get()
+    from bot_shared import get_user_record
+
+    exists, ud = get_user_record(sender)
     name = "Employee"
-    if user.exists:
-        name = user.to_dict().get("name") or name
+    if exists and ud:
+        name = ud.get("name") or name
     deps.session_merge(
         sender,
         state="WAITING_OD_REASON_PICK",
@@ -223,11 +225,13 @@ def _od_request_is_closed(d: dict) -> bool:
 
 
 def _od_approval_still_pending(d: dict) -> bool:
-    """JMD/MD approval not finished (excludes denied and fully MD-approved)."""
+    """JMD/MD approval not finished (excludes denied, MD offline bypass)."""
     if _od_request_is_closed(d):
         return False
     md = (d.get("md_status") or "").strip().upper()
-    if md == "APPROVED":
+    if md in ("APPROVED", "OFFLINE"):
+        return False
+    if d.get("md_offline_bypass"):
         return False
     jmd = (d.get("jmd_status") or "").strip().upper()
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
@@ -237,13 +241,11 @@ def _od_approval_still_pending(d: dict) -> bool:
 
 def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
     """Block a new OD only when today's request is still awaiting approval."""
+    from bot_shared import query_requests_for_employee
+
     today = _ist_today()
-    for snap in deps.db.collection("requests").stream():
+    for snap in query_requests_for_employee(deps.db, "OD", employee):
         d = snap.to_dict() or {}
-        if (d.get("type") or "").strip().upper() != "OD":
-            continue
-        if not deps.same_whatsapp(d.get("employee"), employee):
-            continue
         if _requested_datetime_ist_date(d) != today:
             continue
         if not _od_approval_still_pending(d):
@@ -253,11 +255,11 @@ def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
 
 
 def _vehicles_out_ids(deps: OdDeps):
+    from bot_shared import query_requests_by_type
+
     out = set()
-    for snap in deps.db.collection("requests").stream():
+    for snap in query_requests_by_type(deps.db, "OD"):
         d = snap.to_dict() or {}
-        if (d.get("type") or "").upper() != "OD":
-            continue
         vid = (d.get("company_vehicle_id") or "").strip().upper()
         if vid and d.get("security_out_at") and not d.get("security_in_at"):
             out.add(vid)
@@ -315,9 +317,11 @@ def _resolve_vehicle_pick(deps: OdDeps, incoming: str, vehicle_ids: list):
 def _employee_name_for(deps: OdDeps, sender: str, session: dict | None) -> str:
     if session and session.get("employee_name"):
         return deps.chat_name(session["employee_name"])
-    user = deps.db.collection("users").document(sender).get()
-    if user.exists:
-        return deps.chat_name(user.to_dict().get("name"))
+    from bot_shared import get_user_record
+
+    exists, ud = get_user_record(sender)
+    if exists and ud:
+        return deps.chat_name(ud.get("name"))
     return "Employee"
 
 
@@ -465,13 +469,13 @@ def _submit(
         deps.send_to(sender, deps.already_pending_msg)
         return
 
-    user_doc = deps.db.collection("users").document(sender).get()
-    if not user_doc.exists:
+    from bot_shared import get_user_record
+
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
         deps.session_ref(sender).delete()
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
-
-    ud = user_doc.to_dict()
     chain = deps.build_approval_chain(ud)
     if not chain:
         deps.session_ref(sender).delete()
