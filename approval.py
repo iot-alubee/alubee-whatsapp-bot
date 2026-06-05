@@ -333,6 +333,29 @@ def build_approval_chain(
     return {"jmd": jmd, "jmd_route": jmd_route, "md": md}
 
 
+def build_leave_approval_chain(user_data: dict | None = None) -> dict | None:
+    """
+    Leave approval chain. While testing, routes directly to TEST_MD (no JMD step).
+    Set TEST_MD_WHATSAPP_NUMBER in env. Falls back to JMD-only when unset.
+    """
+    if not user_data:
+        return None
+    d = _require()
+    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
+    test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
+    if test_md:
+        return {
+            "jmd": test_md,
+            "jmd_route": jmd_route,
+            "md": "",
+            "leave_test_approver": True,
+        }
+    jmd = jmd_whatsapp_for_route(jmd_route, for_request_type="OD")
+    if not jmd:
+        return None
+    return {"jmd": jmd, "jmd_route": jmd_route, "md": d.md or ""}
+
+
 def _approval_message_body(
     *,
     employee_name: str,
@@ -385,6 +408,27 @@ def _approval_message_body(
             f"Coming from: {coming_from}\n"
             f"Purpose: {coming_for}\n"
             f"Guest WhatsApp: {rd.get('guest_phone') or '—'}\n\n"
+            "Please approve or deny."
+        )
+    if req_type == "LEAVE":
+        rd = request_rd or {}
+        from_d = (rd.get("leave_from_date") or "").strip()
+        to_d = (rd.get("leave_to_date") or from_d).strip()
+        days = rd.get("leave_days") or 1
+        if from_d and to_d and from_d == to_d:
+            date_lines = f"From Date: {from_d}\n"
+        else:
+            date_lines = f"From Date: {from_d or '—'}\nTo Date: {to_d or '—'}\n"
+        test_tag = "[TEST] " if rd.get("leave_test_approver") else ""
+        return (
+            f"{test_tag}Leave approval request\n\n"
+            f"Name: {emp}\n"
+            f"Department: {dept}\n"
+            f"No. of days leave: {days}\n"
+            f"{date_lines}"
+            f"Reason: {reason or '—'}\n"
+            f"Leaves in Last month: {rd.get('leaves_last_month', 0)}\n"
+            f"Leaves in current month: {rd.get('leaves_current_month', 0)}\n\n"
             "Please approve or deny."
         )
     return (
@@ -482,10 +526,21 @@ def resolve_approval(incoming: str, approver: str):
 
 def _approval_role(sender: str, rd: dict) -> str | None:
     d = _require()
-    if approver_availability.is_test_md_sender(sender, d.test_md, d.same_whatsapp):
-        return None
     jmd_st = (rd.get("jmd_status") or "").strip().upper()
     md_st = (rd.get("md_status") or "").strip().upper()
+    req_type = (rd.get("type") or "").strip().upper()
+
+    if req_type == "LEAVE" and rd.get("leave_test_approver"):
+        test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
+        if (
+            test_md
+            and d.same_whatsapp(sender, test_md)
+            and jmd_st in ("PENDING", "AWAITING_MANAGER")
+        ):
+            return "jmd"
+
+    if approver_availability.is_test_md_sender(sender, d.test_md, d.same_whatsapp):
+        return None
 
     if rd.get("visitor_dual_jmd"):
         jmd_i_st = (rd.get("jmd_i_status") or "").strip().upper()
@@ -649,8 +704,11 @@ def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
 
 
 def _request_type_label(rd: dict) -> str:
-    if (rd.get("type") or "").strip().upper() == "VISITOR":
+    t = (rd.get("type") or "").strip().upper()
+    if t == "VISITOR":
         return "visitor"
+    if t == "LEAVE":
+        return "leave"
     return "OD"
 
 
@@ -734,7 +792,27 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             logger.info("visitor %s denied request_id=%s", role, request_id)
 
     elif role == "jmd":
-        if is_approve:
+        if (rd.get("type") or "").strip().upper() == "LEAVE":
+            if is_approve:
+                ref.update({
+                    "jmd": request_jmd_whatsapp(rd),
+                    "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                    "manager_status": "N/A",
+                    "jmd_status": "APPROVED",
+                    "md_status": "N/A",
+                    "approved_datetime": d.utcnow(),
+                })
+                d.send_to(employee, "Your leave request has been approved.")
+                logger.info("jmd approved leave (final) request_id=%s", request_id)
+            else:
+                ref.update({
+                    "manager_status": "N/A",
+                    "jmd_status": "DENIED",
+                    "md_status": "N/A",
+                })
+                d.send_to(employee, "Your leave request was not approved.")
+                logger.info("jmd denied leave request_id=%s", request_id)
+        elif is_approve:
             md_wa = request_md_whatsapp(rd)
             md_off = _md_is_offline_now(d, md_wa)
             ref.update({

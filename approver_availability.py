@@ -61,7 +61,7 @@ def approver_role_for_sender(
     same_whatsapp: Callable[[str, str], bool],
     test_md: str = "",
 ) -> str | None:
-    """Approver menu role, or None. ``test_md`` gets Online/Offline only — no approval traffic."""
+    """Approver menu role, or None. ``test_md`` gets Online/Offline; leave test approvals only."""
     if md and same_whatsapp(sender, md):
         return "md"
     if jmd_i and same_whatsapp(sender, jmd_i):

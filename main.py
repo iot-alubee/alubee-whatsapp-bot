@@ -1,7 +1,11 @@
 """
-Alubee WhatsApp bot (Interakt) — Cloud Run entry: webhook, menu, routing.
+Alubee WhatsApp bot (Interakt) — main entry: webhook, menu, routing.
 
-Request flows: od_request.py, visitor_request.py, approval.py
+Request flows live in separate modules:
+  - od_request.py
+  - visitor_request.py
+  - leave_request.py
+  - approval.py (shared JMD → MD)
 """
 
 from __future__ import annotations
@@ -9,11 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import firebase_admin
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from firebase_admin import credentials, firestore
 from google.api_core.exceptions import ResourceExhausted
@@ -22,6 +26,7 @@ import approval
 import approver_availability
 import bot_shared
 from bot_shared import wa_from_env
+import leave_request
 import od_request
 import visitor_request
 from interakt_api import (
@@ -34,39 +39,27 @@ from interakt_api import (
 
 _APP_DIR = Path(__file__).resolve().parent
 
-_CLOUD_RUN_STRIP_CRED_ENV = (
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "FIREBASE_CREDENTIALS_PATH",
-    "FIREBASE_CREDENTIALS_JSON",
-)
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _running_on_cloud_run() -> bool:
-    return bool(os.environ.get("K_SERVICE"))
-
-
-if not _running_on_cloud_run():
-    from dotenv import load_dotenv
-
+def _load_env() -> None:
     env_file = _APP_DIR / ".env"
     if env_file.is_file():
         load_dotenv(env_file, override=True)
-    else:
-        example = _APP_DIR / ".env.example"
-        if example.is_file():
-            load_dotenv(example, override=True)
+        return
+    example = _APP_DIR / ".env.example"
+    if example.is_file():
+        load_dotenv(example, override=True)
+        logger.warning(
+            "Interakt/.env not found — loaded .env.example. "
+            "Copy .env.example to .env for your real API key."
+        )
+        return
+    logger.warning("No Interakt/.env — set INTERAKT_API_KEY before sending messages.")
 
 
-@contextmanager
-def _cloud_run_metadata_credentials_env():
-    saved = {k: os.environ.pop(k) for k in _CLOUD_RUN_STRIP_CRED_ENV if k in os.environ}
-    try:
-        yield
-    finally:
-        os.environ.update(saved)
+_load_env()
 
 FIREBASE_PROJECT_ID = (os.getenv("FIREBASE_PROJECT_ID") or "whatsapp-approval-system").strip()
 
@@ -91,7 +84,7 @@ JMD_II_WHATSAPP_NUMBER = (
 MD_WHATSAPP_NUMBER = (
     os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
 ).strip()
-# Online/Offline testing only — never receives approval requests.
+# Leave testing → direct approvals; Online/Offline only for OD/visitor.
 TEST_MD_WHATSAPP_NUMBER = wa_from_env("TEST_MD_WHATSAPP_NUMBER")
 
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
@@ -143,7 +136,6 @@ VISITOR_ALREADY_PENDING_MSG = "You already have a visitor request pending approv
 
 _UNSUPPORTED_REQUEST_IDS = frozenset({
     "VEHICLE_REQUEST",
-    "LEAVE_REQUEST",
     "PERMISSION_REQUEST",
 })
 
@@ -179,56 +171,37 @@ _ROW_IDS = {
     "visitor_visit_both": "BOTH",
     "customer_visit": "CUSTOMER_VISIT",
     "technical_work": "TECHNICAL_WORK",
+    "leave_today": "LEAVE_TODAY",
+    "leave_tomorrow": "LEAVE_TOMORROW",
+    "leave_other": "LEAVE_OTHER",
+    "sick_leave": "SICK_LEAVE",
+    "casual_leave": "CASUAL_LEAVE",
+    "leave_reason_other": "LEAVE_REASON_OTHER",
 }
 
 
 def _init_firebase() -> None:
     opts = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
-
-    def _try_adc():
-        cred = credentials.ApplicationDefault()
-        firebase_admin.initialize_app(cred, opts)
-
     try:
         firebase_admin.get_app()
         return
     except ValueError:
         pass
-
-    if _running_on_cloud_run():
-        if any(os.environ.get(k) for k in _CLOUD_RUN_STRIP_CRED_ENV):
-            logger.warning(
-                "Cloud Run: use service account IAM for Firestore; "
-                "ignoring GOOGLE_APPLICATION_CREDENTIALS / FIREBASE_CREDENTIALS_JSON."
-            )
-        with _cloud_run_metadata_credentials_env():
-            _try_adc()
-        return
-
-    json_raw = (os.getenv("FIREBASE_CREDENTIALS_JSON") or "").strip()
-    if json_raw:
-        firebase_admin.initialize_app(credentials.Certificate(json.loads(json_raw)), opts)
-        return
-
     cred_path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
     if not cred_path:
         cred_path = str(_APP_DIR / "firebase-adminsdk.json")
     elif not os.path.isabs(cred_path):
         cred_path = str(_APP_DIR / cred_path)
-    if not cred_path or not os.path.isfile(cred_path):
+    if not os.path.isfile(cred_path):
         cred_path = str(_APP_DIR.parent / "firebase-adminsdk.json")
     if os.path.isfile(cred_path):
         firebase_admin.initialize_app(credentials.Certificate(cred_path), opts)
         return
-
-    _try_adc()
+    firebase_admin.initialize_app(options=opts)
 
 
 _init_firebase()
 db = firestore.client()
-
-if _running_on_cloud_run() and not (os.getenv("INTERAKT_API_KEY") or "").strip():
-    raise RuntimeError("Cloud Run requires INTERAKT_API_KEY environment variable.")
 
 app = FastAPI(title="Alubee Interakt bot")
 
@@ -379,6 +352,19 @@ OD_DEPS = od_request.OdDeps(
     already_pending_msg=od_request.OD_ALREADY_PENDING_MSG,
 )
 
+LEAVE_DEPS = leave_request.LeaveDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    chat_name=_chat_name,
+    build_approval_chain=approval.build_leave_approval_chain,
+    notify_jmd=approval.notify_jmd,
+    go_main_menu=_go_main_menu_for_employee,
+    already_pending_msg=leave_request.LEAVE_ALREADY_PENDING_MSG,
+)
+
 VISITOR_DEPS = visitor_request.VisitorDeps(
     db=db,
     send_to=_send_to,
@@ -427,6 +413,7 @@ def _send_approver_availability_menu(wa_id: str, current: str) -> None:
 
 
 def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
+    """Online/Offline for JMD/MD; returns True if handled."""
     upper = (incoming or "").strip().upper()
     if upper not in ("ONLINE", "OFFLINE"):
         return False
@@ -625,9 +612,20 @@ def _process(sender: str, incoming: str) -> None:
         visitor_request.handle(sender, incoming, session or {}, VISITOR_DEPS)
         return
 
+    if leave_request.is_leave_state(state):
+        leave_request.handle(sender, incoming, session or {}, LEAVE_DEPS)
+        return
+
     if incoming == "1" or incoming == "OD_REQUEST":
         if state == SESSION_MENU_IDLE:
             od_request.try_start(sender, OD_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming == "3" or incoming == "LEAVE_REQUEST":
+        if state == SESSION_MENU_IDLE:
+            leave_request.try_start(sender, LEAVE_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
@@ -639,7 +637,7 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("2", "3", "4") or incoming in _UNSUPPORTED_REQUEST_IDS:
+    if incoming in ("2", "4") or incoming in _UNSUPPORTED_REQUEST_IDS:
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
@@ -657,7 +655,7 @@ def health():
         "status": "ok",
         "provider": "interakt",
         "api_key_set": bool(key),
-        "runtime": "cloud_run" if _running_on_cloud_run() else "local",
+        "env_file": "Interakt/.env" if (_APP_DIR / ".env").is_file() else "missing",
         "whatsapp_session_hours": WHATSAPP_SESSION_HOURS,
         "jmd_i": JMD_I_WHATSAPP_NUMBER,
         "jmd_ii": JMD_II_WHATSAPP_NUMBER,

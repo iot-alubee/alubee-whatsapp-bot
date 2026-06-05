@@ -5,8 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[misc, assignment]
 
 from firebase_admin import firestore
 
@@ -166,3 +171,122 @@ def find_open_request(employee: str, request_type: str) -> dict | None:
         if request_still_pending_approval(d):
             return d
     return None
+
+
+def _ist_now() -> datetime:
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("Asia/Kolkata"))
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+
+def _leave_calendar_months(ref: datetime | None = None) -> tuple[tuple[int, int], tuple[int, int]]:
+    """((prev_year, prev_month), (curr_year, curr_month)) in IST."""
+    ref = ref or _ist_now()
+    y, m = ref.year, ref.month
+    if m == 1:
+        return (y - 1, 12), (y, m)
+    return (y, m - 1), (y, m)
+
+
+def _parse_ddmmy(text: str) -> date | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
+    start = _parse_ddmmy(from_s)
+    end = _parse_ddmmy(to_s or from_s)
+    if not start or not end:
+        return []
+    if end < start:
+        start, end = end, start
+    out: list[str] = []
+    d = start
+    while d <= end:
+        out.append(d.strftime("%d-%m-%Y"))
+        d += timedelta(days=1)
+    return out
+
+
+def query_leave_requests_for_employee_id(
+    firestore_db, employee_id: str, *, limit: int = 80
+):
+    """LEAVE requests for one employee_id."""
+    eid = (employee_id or "").strip().upper()
+    if not eid:
+        return []
+    coll = firestore_db.collection("requests")
+    try:
+        snaps = list(
+            coll.where("type", "==", "LEAVE")
+            .where("employee_id", "==", eid)
+            .limit(limit)
+            .stream()
+        )
+        if snaps:
+            return snaps
+    except Exception as e:
+        logger.warning("Firestore leave query failed employee_id=%s: %s", eid, e)
+    out = []
+    for snap in query_requests_by_type(firestore_db, "LEAVE", limit=limit * 3):
+        d = snap.to_dict() or {}
+        if (d.get("employee_id") or "").strip().upper() == eid:
+            out.append(snap)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _leave_days_in_month(d: dict, year: int, month: int) -> int:
+    """Approved leave day count falling in the given calendar month."""
+    if (d.get("jmd_status") or "").strip().upper() != "APPROVED":
+        return 0
+    dates = d.get("leave_dates") or []
+    if dates:
+        n = 0
+        for ds in dates:
+            parsed = _parse_ddmmy(str(ds))
+            if parsed and parsed.year == year and parsed.month == month:
+                n += 1
+        return n
+    from_d = _parse_ddmmy(d.get("leave_from_date"))
+    to_d = _parse_ddmmy(d.get("leave_to_date") or d.get("leave_from_date"))
+    if not from_d:
+        return 0
+    if not to_d:
+        to_d = from_d
+    n = 0
+    cur = from_d
+    while cur <= to_d:
+        if cur.year == year and cur.month == month:
+            n += 1
+        cur += timedelta(days=1)
+    return n
+
+
+def _leave_month_days_count(firestore_db, employee_id: str, year: int, month: int) -> int:
+    total = 0
+    for snap in query_leave_requests_for_employee_id(firestore_db, employee_id):
+        total += _leave_days_in_month(snap.to_dict() or {}, year, month)
+    return total
+
+
+def get_employee_leave_counts(
+    employee_id: str,
+    *,
+    firestore_db=None,
+    reference: datetime | None = None,
+) -> tuple[int, int]:
+    """Sum approved LEAVE requests in `requests` for last and current month (IST)."""
+    _db = firestore_db or _require("db", db)
+    (prev_y, prev_m), (curr_y, curr_m) = _leave_calendar_months(reference)
+    last_month = _leave_month_days_count(_db, employee_id, prev_y, prev_m)
+    current_month = _leave_month_days_count(_db, employee_id, curr_y, curr_m)
+    return last_month, current_month

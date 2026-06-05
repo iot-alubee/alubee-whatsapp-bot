@@ -1,4 +1,4 @@
-# Alubee Interakt bot (OD + visitor)+1 — deploy from this folder only (Google Cloud Run)
+# Alubee Interakt bot (OD + visitor + leave) — deploy from this folder only (Google Cloud Run)
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py interakt_api.py bot_shared.py approval.py approver_availability.py od_request.py visitor_request.py ./
+COPY main.py interakt_api.py bot_shared.py approval.py approver_availability.py od_request.py visitor_request.py leave_request.py ./
 
 ENV PORT=8080
 ENV FIREBASE_PROJECT_ID=whatsapp-approval-system
