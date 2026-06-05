@@ -440,3 +440,159 @@ def get_employee_leave_counts(
         _db, employee_id, curr_y, curr_m, employee_wa=employee_wa
     )
     return last_month, current_month
+
+
+def query_permission_requests_for_employee_id(
+    firestore_db,
+    employee_id: str,
+    *,
+    employee_wa: str = "",
+    limit: int = 200,
+):
+    """PERMISSION requests for one employee (by employee_id and/or WhatsApp id)."""
+    eid = (employee_id or "").strip().upper()
+    wa = (employee_wa or "").strip()
+    if not eid and not wa:
+        return []
+
+    coll = firestore_db.collection("requests")
+    found: dict[str, object] = {}
+
+    def _add(snaps) -> None:
+        for snap in snaps:
+            found[snap.id] = snap
+
+    if eid:
+        try:
+            _add(
+                coll.where("type", "==", "PERMISSION")
+                .where("employee_id", "==", eid)
+                .limit(limit)
+                .stream()
+            )
+        except Exception as e:
+            logger.warning("Firestore permission query employee_id=%s: %s", eid, e)
+
+    if wa:
+        try:
+            _add(
+                coll.where("type", "==", "PERMISSION")
+                .where("employee", "==", wa)
+                .limit(limit)
+                .stream()
+            )
+        except Exception as e:
+            logger.warning("Firestore permission query employee=%s: %s", wa, e)
+
+    if found:
+        return list(found.values())
+
+    out = []
+    for snap in query_requests_by_type(firestore_db, "PERMISSION", limit=limit * 4):
+        d = snap.to_dict() or {}
+        match_id = eid and (d.get("employee_id") or "").strip().upper() == eid
+        match_wa = wa and (d.get("employee") or "").strip() == wa
+        if match_id or match_wa:
+            out.append(snap)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _permission_overlap_status_label(d: dict) -> str:
+    """User-facing status for duplicate-date check: pending, approved, or skip."""
+    jmd = (d.get("jmd_status") or "").strip().upper()
+    if jmd in ("DENIED", "CANCELLED") or d.get("cancelled_by_employee"):
+        return ""
+    if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
+        return "pending"
+    if jmd == "APPROVED":
+        return "approved"
+    return ""
+
+
+def find_overlapping_permission_request(
+    firestore_db,
+    employee_id: str,
+    permission_date: str,
+    *,
+    employee_wa: str = "",
+) -> tuple[dict | None, str]:
+    """
+    Existing WhatsApp PERMISSION for today.
+    Returns (doc, 'pending'|'approved') or (None, '').
+    """
+    target = (permission_date or "").strip()
+    if not target:
+        return None, ""
+
+    match: dict | None = None
+    match_status = ""
+    for snap in query_permission_requests_for_employee_id(
+        firestore_db,
+        employee_id,
+        employee_wa=employee_wa,
+    ):
+        d = snap.to_dict() or {}
+        if (d.get("permission_date") or "").strip() != target:
+            continue
+        status = _permission_overlap_status_label(d)
+        if not status:
+            continue
+        match = {**d, "request_id": snap.id}
+        match_status = status
+        if status == "pending":
+            break
+
+    return match, match_status
+
+
+def _permission_count_in_month(d: dict, year: int, month: int) -> int:
+    """Approved permission requests in month (one request = one count)."""
+    if (d.get("jmd_status") or "").strip().upper() != "APPROVED":
+        return 0
+    parsed = _parse_ddmmy(d.get("permission_date") or "")
+    if parsed and parsed.year == year and parsed.month == month:
+        return 1
+    return 0
+
+
+def _permission_month_count(
+    firestore_db,
+    employee_id: str,
+    year: int,
+    month: int,
+    *,
+    employee_wa: str = "",
+) -> int:
+    total = 0
+    for snap in query_permission_requests_for_employee_id(
+        firestore_db,
+        employee_id,
+        employee_wa=employee_wa,
+    ):
+        total += _permission_count_in_month(snap.to_dict() or {}, year, month)
+    return total
+
+
+def get_employee_permission_counts(
+    employee_id: str,
+    *,
+    employee_wa: str = "",
+    firestore_db=None,
+    reference: datetime | None = None,
+) -> tuple[int, int]:
+    """
+    Approved permission requests in last and current calendar month (IST).
+
+    Only jmd_status APPROVED counts.
+    """
+    _db = firestore_db or _require("db", db)
+    (prev_y, prev_m), (curr_y, curr_m) = _leave_calendar_months(reference)
+    last_month = _permission_month_count(
+        _db, employee_id, prev_y, prev_m, employee_wa=employee_wa
+    )
+    current_month = _permission_month_count(
+        _db, employee_id, curr_y, curr_m, employee_wa=employee_wa
+    )
+    return last_month, current_month

@@ -30,6 +30,8 @@ $modules = @(
 
     "leave_request.py",
 
+    "permission_request.py",
+
     "requirements.txt",
 
     ".env.example"
@@ -60,7 +62,7 @@ foreach ($name in $modules) {
 
 Write-Host ""
 
-Write-Host "Synced: OD, visitor, leave, approval, bot_shared, main.py."
+Write-Host "Synced: OD, visitor, leave, permission, approval, bot_shared, main.py."
 
 Write-Host ""
 

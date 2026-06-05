@@ -9,7 +9,11 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from bot_shared import get_employee_leave_counts, wa_from_env
+from bot_shared import (
+    get_employee_leave_counts,
+    get_employee_permission_counts,
+    wa_from_env,
+)
 
 import approver_availability
 
@@ -335,25 +339,42 @@ def build_approval_chain(
 
 def build_leave_approval_chain(user_data: dict | None = None) -> dict | None:
     """
-    Leave approval chain. While testing, routes directly to TEST_MD (no JMD step).
-    Set TEST_MD_WHATSAPP_NUMBER in env. Falls back to JMD-only when unset.
+    Leave approval chain — TEST_MD only while testing (no JMD).
+    Requires TEST_MD_WHATSAPP_NUMBER in env.
     """
     if not user_data:
         return None
     d = _require()
     jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
     test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
-    if test_md:
-        return {
-            "jmd": test_md,
-            "jmd_route": jmd_route,
-            "md": "",
-            "leave_test_approver": True,
-        }
-    jmd = jmd_whatsapp_for_route(jmd_route, for_request_type="OD")
-    if not jmd:
+    if not test_md:
         return None
-    return {"jmd": jmd, "jmd_route": jmd_route, "md": d.md or ""}
+    return {
+        "jmd": test_md,
+        "jmd_route": jmd_route,
+        "md": "",
+        "leave_test_approver": True,
+    }
+
+
+def build_permission_approval_chain(user_data: dict | None = None) -> dict | None:
+    """
+    Permission approval chain — TEST_MD only while testing (no JMD).
+    Requires TEST_MD_WHATSAPP_NUMBER in env.
+    """
+    if not user_data:
+        return None
+    d = _require()
+    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
+    test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
+    if not test_md:
+        return None
+    return {
+        "jmd": test_md,
+        "jmd_route": jmd_route,
+        "md": "",
+        "permission_test_approver": True,
+    }
 
 
 def _approval_message_body(
@@ -443,6 +464,32 @@ def _approval_message_body(
             f"Reason: {reason or '—'}\n"
             f"Leaves in Last month: {leaves_last}\n"
             f"Leaves in current month: {leaves_curr}\n\n"
+            "Please approve or deny."
+        )
+    if req_type == "PERMISSION":
+        rd = request_rd or {}
+        perms_last = 0
+        perms_curr = 0
+        eid = (rd.get("employee_id") or "").strip()
+        if eid:
+            try:
+                perms_last, perms_curr = get_employee_permission_counts(
+                    eid,
+                    employee_wa=(rd.get("employee") or "").strip(),
+                    firestore_db=_require().db,
+                )
+            except Exception:
+                logger.exception("permission count lookup failed employee_id=%s", eid)
+                perms_last = rd.get("permissions_last_month", 0)
+                perms_curr = rd.get("permissions_current_month", 0)
+        test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
+        return (
+            f"{test_tag}Permission approval request\n\n"
+            f"Name: {emp}\n"
+            f"Department: {dept}\n"
+            f"Reason: {reason or '—'}\n"
+            f"Permission in last month: {perms_last}\n"
+            f"Permission in current month: {perms_curr}\n\n"
             "Please approve or deny."
         )
     return (
@@ -553,6 +600,15 @@ def _approval_role(sender: str, rd: dict) -> str | None:
         ):
             return "jmd"
 
+    if req_type == "PERMISSION" and rd.get("permission_test_approver"):
+        test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
+        if (
+            test_md
+            and d.same_whatsapp(sender, test_md)
+            and jmd_st in ("PENDING", "AWAITING_MANAGER")
+        ):
+            return "jmd"
+
     if approver_availability.is_test_md_sender(sender, d.test_md, d.same_whatsapp):
         return None
 
@@ -588,8 +644,9 @@ def _approval_role(sender: str, rd: dict) -> str | None:
     return None
 
 
-def _leave_cancelled_by_employee(rd: dict) -> bool:
-    if (rd.get("type") or "").strip().upper() != "LEAVE":
+def _request_cancelled_by_employee(rd: dict) -> bool:
+    req_type = (rd.get("type") or "").strip().upper()
+    if req_type not in ("LEAVE", "PERMISSION"):
         return False
     jmd = (rd.get("jmd_status") or "").strip().upper()
     if jmd == "CANCELLED":
@@ -597,10 +654,10 @@ def _leave_cancelled_by_employee(rd: dict) -> bool:
     return bool(rd.get("cancelled_by_employee")) and jmd == "DENIED"
 
 
-def _is_leave_approver_sender(sender: str, rd: dict) -> bool:
-    """True if sender is the JMD (or test MD) who was notified for this leave."""
+def _is_single_jmd_approver_sender(sender: str, rd: dict) -> bool:
+    """True if sender is the JMD (or test MD) notified for leave/permission."""
     d = _require()
-    if rd.get("leave_test_approver"):
+    if rd.get("leave_test_approver") or rd.get("permission_test_approver"):
         test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
         if test_md and d.same_whatsapp(sender, test_md):
             return True
@@ -742,6 +799,8 @@ def _request_type_label(rd: dict) -> str:
         return "visitor"
     if t == "LEAVE":
         return "leave"
+    if t == "PERMISSION":
+        return "permission"
     return "OD"
 
 
@@ -767,10 +826,13 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
     req_label = _request_type_label(rd)
     role = _approval_role(sender, rd)
     if not role:
-        if _leave_cancelled_by_employee(rd) and _is_leave_approver_sender(sender, rd):
+        if _request_cancelled_by_employee(rd) and _is_single_jmd_approver_sender(
+            sender, rd
+        ):
+            label = _request_type_label(rd)
             d.send_to(
                 sender,
-                "This leave request was already cancelled by the employee.",
+                f"This {label} request was already cancelled by the employee.",
             )
             return True
         logger.warning(
@@ -831,7 +893,9 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             logger.info("visitor %s denied request_id=%s", role, request_id)
 
     elif role == "jmd":
-        if (rd.get("type") or "").strip().upper() == "LEAVE":
+        req_type = (rd.get("type") or "").strip().upper()
+        if req_type in ("LEAVE", "PERMISSION"):
+            label = "leave" if req_type == "LEAVE" else "permission"
             if is_approve:
                 ref.update({
                     "jmd": request_jmd_whatsapp(rd),
@@ -841,16 +905,16 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                     "md_status": "N/A",
                     "approved_datetime": d.utcnow(),
                 })
-                d.send_to(employee, "Your leave request has been approved.")
-                logger.info("jmd approved leave (final) request_id=%s", request_id)
+                d.send_to(employee, f"Your {label} request has been approved.")
+                logger.info("jmd approved %s (final) request_id=%s", label, request_id)
             else:
                 ref.update({
                     "manager_status": "N/A",
                     "jmd_status": "DENIED",
                     "md_status": "N/A",
                 })
-                d.send_to(employee, "Your leave request was not approved.")
-                logger.info("jmd denied leave request_id=%s", request_id)
+                d.send_to(employee, f"Your {label} request was not approved.")
+                logger.info("jmd denied %s request_id=%s", label, request_id)
         elif is_approve:
             md_wa = request_md_whatsapp(rd)
             md_off = _md_is_offline_now(d, md_wa)

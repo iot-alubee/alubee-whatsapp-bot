@@ -5,6 +5,7 @@ Request flows live in separate modules:
   - od_request.py
   - visitor_request.py
   - leave_request.py
+  - permission_request.py
   - approval.py (shared JMD → MD)
 """
 
@@ -30,6 +31,7 @@ import bot_shared
 from bot_shared import wa_from_env
 import leave_request
 import od_request
+import permission_request
 import visitor_request
 from interakt_api import (
     phone_to_wa_id,
@@ -138,7 +140,6 @@ VISITOR_ALREADY_PENDING_MSG = "You already have a visitor request pending approv
 
 _UNSUPPORTED_REQUEST_IDS = frozenset({
     "VEHICLE_REQUEST",
-    "PERMISSION_REQUEST",
 })
 
 SESSION_MENU_IDLE = "MENU_IDLE"
@@ -182,6 +183,9 @@ _ROW_IDS = {
     "leave_cancel": "LEAVE_CANCEL",
     "cancel_leave": "LEAVE_CANCEL",
     "leave_exit": "LEAVE_EXIT",
+    "permission_cancel": "PERMISSION_CANCEL",
+    "cancel_permission": "PERMISSION_CANCEL",
+    "permission_exit": "PERMISSION_EXIT",
 }
 
 
@@ -389,6 +393,18 @@ LEAVE_DEPS = leave_request.LeaveDeps(
     utcnow=_utcnow,
     chat_name=_chat_name,
     build_approval_chain=approval.build_leave_approval_chain,
+    notify_jmd=approval.notify_jmd,
+    go_main_menu=_go_main_menu_for_employee,
+)
+
+PERMISSION_DEPS = permission_request.PermissionDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    chat_name=_chat_name,
+    build_approval_chain=approval.build_permission_approval_chain,
     notify_jmd=approval.notify_jmd,
     go_main_menu=_go_main_menu_for_employee,
 )
@@ -654,6 +670,10 @@ def _process(sender: str, incoming: str) -> None:
         leave_request.handle(sender, incoming, session or {}, LEAVE_DEPS)
         return
 
+    if permission_request.is_permission_state(state):
+        permission_request.handle(sender, incoming, session or {}, PERMISSION_DEPS)
+        return
+
     if incoming == "1" or incoming == "OD_REQUEST":
         if state == SESSION_MENU_IDLE:
             od_request.try_start(sender, OD_DEPS)
@@ -668,6 +688,13 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
+    if incoming == "4" or incoming == "PERMISSION_REQUEST":
+        if state == SESSION_MENU_IDLE:
+            permission_request.try_start(sender, PERMISSION_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
     if incoming == "5" or incoming == "VISITOR_REQUEST":
         if state == SESSION_MENU_IDLE:
             visitor_request.try_start(sender, VISITOR_DEPS)
@@ -675,7 +702,7 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("2", "4") or incoming in _UNSUPPORTED_REQUEST_IDS:
+    if incoming == "2" or incoming in _UNSUPPORTED_REQUEST_IDS:
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
