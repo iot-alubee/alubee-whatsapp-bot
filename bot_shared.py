@@ -320,16 +320,11 @@ def count_leave_days_in_month_from_dates(
     return n
 
 
-def _leave_days_in_month(
-    d: dict, year: int, month: int, *, include_pending: bool = False
-) -> int:
-    """Leave day count in month. Last month: approved only. Current: approved + pending."""
+def _leave_days_in_month(d: dict, year: int, month: int) -> int:
+    """Approved leave days in month. Pending and denied are not counted."""
     jmd_st = (d.get("jmd_status") or "").strip().upper()
-    if jmd_st == "DENIED":
-        return 0
     if jmd_st != "APPROVED":
-        if not include_pending or jmd_st not in ("PENDING", "AWAITING_MANAGER"):
-            return 0
+        return 0
     return _count_leave_days_in_month_from_doc(d, year, month)
 
 
@@ -340,31 +335,22 @@ def _leave_month_days_count(
     month: int,
     *,
     employee_wa: str = "",
-    include_pending: bool = False,
-    exclude_request_id: str = "",
 ) -> int:
     eid = (employee_id or "").strip().upper()
-    exclude = (exclude_request_id or "").strip()
     seen: set[str] = set()
     total = 0
     for snap in query_leave_requests_for_employee_id(
         firestore_db, eid, employee_wa=employee_wa
     ):
-        if exclude and snap.id == exclude:
-            continue
         seen.add(snap.id)
-        total += _leave_days_in_month(
-            snap.to_dict() or {}, year, month, include_pending=include_pending
-        )
+        total += _leave_days_in_month(snap.to_dict() or {}, year, month)
 
     if eid:
         imp_id = import_leave_doc_id(eid, year, month)
-        if imp_id not in seen and imp_id != exclude:
+        if imp_id not in seen:
             imp_snap = firestore_db.collection("requests").document(imp_id).get()
             if imp_snap.exists:
-                total += _leave_days_in_month(
-                    imp_snap.to_dict() or {}, year, month, include_pending=include_pending
-                )
+                total += _leave_days_in_month(imp_snap.to_dict() or {}, year, month)
     return total
 
 
@@ -374,34 +360,18 @@ def get_employee_leave_counts(
     employee_wa: str = "",
     firestore_db=None,
     reference: datetime | None = None,
-    exclude_request_id: str = "",
-    extra_current_month_days: int = 0,
 ) -> tuple[int, int]:
     """
-    Leave days in last and current month (IST) from Firestore `requests`.
+    Approved leave days in last and current calendar month (IST) from `requests`.
 
-    Last month: approved only.
-    Current month: approved + pending (awaiting approval).
+    Only jmd_status APPROVED counts. Pending and denied are ignored.
     """
     _db = firestore_db or _require("db", db)
     (prev_y, prev_m), (curr_y, curr_m) = _leave_calendar_months(reference)
     last_month = _leave_month_days_count(
-        _db,
-        employee_id,
-        prev_y,
-        prev_m,
-        employee_wa=employee_wa,
-        include_pending=False,
-        exclude_request_id=exclude_request_id,
+        _db, employee_id, prev_y, prev_m, employee_wa=employee_wa
     )
     current_month = _leave_month_days_count(
-        _db,
-        employee_id,
-        curr_y,
-        curr_m,
-        employee_wa=employee_wa,
-        include_pending=True,
-        exclude_request_id=exclude_request_id,
+        _db, employee_id, curr_y, curr_m, employee_wa=employee_wa
     )
-    current_month += max(0, int(extra_current_month_days or 0))
     return last_month, current_month
