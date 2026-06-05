@@ -591,9 +591,10 @@ def _approval_role(sender: str, rd: dict) -> str | None:
 def _leave_cancelled_by_employee(rd: dict) -> bool:
     if (rd.get("type") or "").strip().upper() != "LEAVE":
         return False
-    if not rd.get("cancelled_by_employee"):
-        return False
-    return (rd.get("jmd_status") or "").strip().upper() == "DENIED"
+    jmd = (rd.get("jmd_status") or "").strip().upper()
+    if jmd == "CANCELLED":
+        return True
+    return bool(rd.get("cancelled_by_employee")) and jmd == "DENIED"
 
 
 def _is_leave_approver_sender(sender: str, rd: dict) -> bool:

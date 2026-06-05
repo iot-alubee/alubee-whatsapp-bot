@@ -408,10 +408,10 @@ def _employee_cancel_leave(
         if owner_wa != sender and owner_id != employee_id:
             return False, "You can only cancel your own leave request."
         jmd = (d.get("jmd_status") or "").strip().upper()
-        if jmd == "DENIED":
+        if jmd in ("CANCELLED", "DENIED") or d.get("cancelled_by_employee"):
             return False, "This leave request is already cancelled."
         ref.update({
-            "jmd_status": "DENIED",
+            "jmd_status": "CANCELLED",
             "cancelled_by_employee": True,
             "cancelled_at": deps.utcnow(),
         })
