@@ -6,10 +6,18 @@ from __future__ import annotations
 
 import logging
 import os
+import ssl
+import time
 from pathlib import Path
 from typing import Any
 
+import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import SSLError as RequestsSSLError
+from requests.exceptions import Timeout as RequestsTimeout
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -57,13 +65,80 @@ def phone_to_wa_id(phone: str) -> str:
     return f"whatsapp:+{digits}"
 
 
-def _post(payload: dict[str, Any]) -> dict[str, Any]:
-    resp = requests.post(
-        INTERAKT_MESSAGE_URL,
-        json=payload,
-        headers=_headers(),
-        timeout=30,
+_HTTP_RETRY_ATTEMPTS = 5
+_HTTP_RETRY_BACKOFF_SEC = 1.0
+
+_http_session: requests.Session | None = None
+
+
+def _http_session_get() -> requests.Session:
+    global _http_session
+    if _http_session is not None:
+        return _http_session
+    session = requests.Session()
+    session.verify = certifi.where()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        raise_on_status=False,
     )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    _http_session = session
+    return session
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (RequestsSSLError, RequestsConnectionError, RequestsTimeout, ssl.SSLEOFError),
+    ):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    return isinstance(cause, ssl.SSLEOFError) if cause else False
+
+
+def _http_post(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 30,
+    label: str = "Interakt",
+) -> requests.Response:
+    """POST with retries on transient TLS/network errors (common on Cloud Run)."""
+    session = _http_session_get()
+    last_err: Exception | None = None
+    for attempt in range(1, _HTTP_RETRY_ATTEMPTS + 1):
+        try:
+            return session.post(
+                url,
+                json=payload,
+                headers=_headers(),
+                timeout=timeout,
+            )
+        except Exception as e:
+            if not _is_transient_http_error(e):
+                raise
+            last_err = e
+            logger.warning(
+                "%s POST attempt %s/%s failed: %s",
+                label,
+                attempt,
+                _HTTP_RETRY_ATTEMPTS,
+                e,
+            )
+            if attempt < _HTTP_RETRY_ATTEMPTS:
+                time.sleep(_HTTP_RETRY_BACKOFF_SEC * attempt)
+    assert last_err is not None
+    raise last_err
+
+
+def _post(payload: dict[str, Any]) -> dict[str, Any]:
+    resp = _http_post(INTERAKT_MESSAGE_URL, payload, timeout=30, label="Interakt message")
     try:
         data = resp.json()
     except Exception:
@@ -104,11 +179,11 @@ def ensure_customer(
     if user_id:
         payload["userId"] = user_id[:256]
     try:
-        resp = requests.post(
+        resp = _http_post(
             INTERAKT_TRACK_USERS_URL,
-            json=payload,
-            headers=_headers(),
+            payload,
             timeout=15,
+            label="Interakt track user",
         )
         if resp.status_code >= 400:
             logger.warning(

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -204,6 +206,30 @@ _init_firebase()
 db = firestore.client()
 
 app = FastAPI(title="Alubee Interakt bot")
+
+
+@app.on_event("startup")
+def _warmup_services() -> None:
+    """Warm Firestore + TLS before first webhook (reduces cold-start SSL failures)."""
+    try:
+        list(db.collection("users").limit(1).stream())
+        logger.info("Firestore warmup ok")
+    except Exception:
+        logger.exception("Firestore warmup failed (will retry on first message)")
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import SSLError as RequestsSSLError
+    from requests.exceptions import Timeout as RequestsTimeout
+
+    if isinstance(
+        exc,
+        (RequestsSSLError, RequestsConnectionError, RequestsTimeout, ssl.SSLEOFError),
+    ):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    return isinstance(cause, ssl.SSLEOFError) if cause else False
 
 
 def _utcnow():
@@ -459,6 +485,7 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
 
 def _send_main_menu(wa_id: str, employee_name: str) -> None:
     name = _chat_name(employee_name)
+    welcome = f"Welcome {name} 👋\n\nPlease choose an option:"
     rows = _list_rows(
         ("od_request", "OD Request"),
         ("vehicle_request", "Vehicle Request"),
@@ -469,13 +496,17 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
     try:
         send_list_menu(
             wa_id_to_phone(wa_id),
-            f"Welcome {name} 👋\n\nPlease choose an option:",
+            welcome,
             rows,
             callback_data="main-menu",
         )
     except Exception:
         logger.exception("main menu InteractiveList failed to=%s", wa_id)
-        _send_to(wa_id, _numbered_request_menu(employee_name))
+        try:
+            _send_to(wa_id, _numbered_request_menu(employee_name))
+        except Exception:
+            logger.exception("numbered menu text failed to=%s", wa_id)
+            _send_to(wa_id, f"{welcome}\n\nReply with 1 for OD, 3 for Leave, 5 for Visitor.")
 
 
 def _normalize_choice(raw: str) -> str:
@@ -557,9 +588,13 @@ def _parse_webhook(body: dict) -> tuple[str, str] | None:
 
 def _process(sender: str, incoming: str) -> None:
     logger.info("process sender=%s incoming=%s", sender, incoming)
-    _touch_whatsapp_inbound(sender)
 
     if incoming.lower() in ("hi", "hello"):
+        exists, ud = bot_shared.get_user_record(sender)
+        try:
+            _touch_whatsapp_inbound(sender)
+        except Exception:
+            logger.exception("whatsapp activity touch failed sender=%s", sender)
         approver_role = approver_availability.approver_role_for_sender(
             sender,
             md=MD_WHATSAPP_NUMBER,
@@ -580,7 +615,6 @@ def _process(sender: str, incoming: str) -> None:
             )
             _send_approver_availability_menu(sender, current)
             return
-        exists, ud = bot_shared.get_user_record(sender)
         if exists and ud:
             name = ud.get("name", "Employee")
             _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
@@ -589,6 +623,8 @@ def _process(sender: str, incoming: str) -> None:
             _session_ref(sender).delete()
             _send_to(sender, "User not registered.\nPlease contact admin.")
         return
+
+    _touch_whatsapp_inbound(sender)
 
     if _try_handle_approver_availability(sender, incoming):
         return
@@ -687,7 +723,18 @@ async def webhook(request: Request):
     if parsed:
         sender, incoming = parsed
         try:
-            _process(sender, incoming)
+            for attempt in range(2):
+                try:
+                    _process(sender, incoming)
+                    break
+                except Exception as e:
+                    if attempt == 0 and _is_transient_error(e):
+                        logger.warning(
+                            "transient error sender=%s retrying: %s", sender, e
+                        )
+                        time.sleep(1.5)
+                        continue
+                    raise
         except ResourceExhausted:
             logger.error("Firestore quota exceeded sender=%s", sender)
             try:
@@ -698,7 +745,16 @@ async def webhook(request: Request):
                 )
             except Exception:
                 logger.exception("could not notify user after quota error")
-        except Exception:
-            logger.exception("process failed")
+        except Exception as e:
+            logger.exception("process failed sender=%s incoming=%s", sender, incoming)
+            try:
+                _send_to(
+                    sender,
+                    "Sorry, the bot had a temporary error. Please send Hi again.",
+                )
+            except Exception:
+                logger.exception(
+                    "could not notify user after error (%s)", type(e).__name__
+                )
 
     return {"status": "success"}
