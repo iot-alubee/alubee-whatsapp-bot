@@ -15,6 +15,8 @@ except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
 from bot_shared import (
+    _leave_calendar_months,
+    count_leave_days_in_month_from_dates,
     expand_leave_date_range,
     find_open_request,
     get_employee_leave_counts,
@@ -344,9 +346,15 @@ def _submit(
     days = _leave_days(from_d, to_d)
     leave_dates = expand_leave_date_range(from_d, to_d)
     employee_id = ud.get("employee_id") or ""
+    _, (curr_y, curr_m) = _leave_calendar_months()
+    this_request_curr_days = count_leave_days_in_month_from_dates(
+        leave_dates, curr_y, curr_m
+    )
     leaves_last_month, leaves_current_month = get_employee_leave_counts(
         employee_id,
+        employee_wa=sender,
         firestore_db=deps.db,
+        extra_current_month_days=this_request_curr_days,
     )
     ref = deps.db.collection("requests").document()
     request_id = ref.id

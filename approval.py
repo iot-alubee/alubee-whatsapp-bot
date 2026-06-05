@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from bot_shared import wa_from_env
+from bot_shared import get_employee_leave_counts, wa_from_env
 
 import approver_availability
 
@@ -414,11 +414,25 @@ def _approval_message_body(
         rd = request_rd or {}
         from_d = (rd.get("leave_from_date") or "").strip()
         to_d = (rd.get("leave_to_date") or from_d).strip()
-        days = rd.get("leave_days") or 1
-        if from_d and to_d and from_d == to_d:
-            date_lines = f"From Date: {from_d}\n"
+        days = int(rd.get("leave_days") or 1)
+        if days <= 1 or (from_d and to_d and from_d == to_d):
+            date_lines = f"Date: {from_d or '—'}\n"
         else:
             date_lines = f"From Date: {from_d or '—'}\nTo Date: {to_d or '—'}\n"
+        leaves_last = 0
+        leaves_curr = 0
+        eid = (rd.get("employee_id") or "").strip()
+        if eid:
+            try:
+                leaves_last, leaves_curr = get_employee_leave_counts(
+                    eid,
+                    employee_wa=(rd.get("employee") or "").strip(),
+                    firestore_db=_require().db,
+                )
+            except Exception:
+                logger.exception("leave count lookup failed employee_id=%s", eid)
+                leaves_last = rd.get("leaves_last_month", 0)
+                leaves_curr = rd.get("leaves_current_month", 0)
         test_tag = "[TEST] " if rd.get("leave_test_approver") else ""
         return (
             f"{test_tag}Leave approval request\n\n"
@@ -427,8 +441,8 @@ def _approval_message_body(
             f"No. of days leave: {days}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
-            f"Leaves in Last month: {rd.get('leaves_last_month', 0)}\n"
-            f"Leaves in current month: {rd.get('leaves_current_month', 0)}\n\n"
+            f"Leaves in Last month: {leaves_last}\n"
+            f"Leaves in current month: {leaves_curr}\n\n"
             "Please approve or deny."
         )
     return (

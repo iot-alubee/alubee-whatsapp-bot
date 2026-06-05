@@ -215,39 +215,74 @@ def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
     return out
 
 
+def import_leave_doc_id(employee_id: str, year: int, month: int) -> str:
+    return f"IMPORT_{(employee_id or '').strip().upper()}_{year}_{month:02d}"
+
+
 def query_leave_requests_for_employee_id(
-    firestore_db, employee_id: str, *, limit: int = 80
+    firestore_db,
+    employee_id: str,
+    *,
+    employee_wa: str = "",
+    limit: int = 200,
 ):
-    """LEAVE requests for one employee_id."""
+    """LEAVE requests for one employee (by employee_id and/or WhatsApp id)."""
     eid = (employee_id or "").strip().upper()
-    if not eid:
+    wa = (employee_wa or "").strip()
+    if not eid and not wa:
         return []
+
     coll = firestore_db.collection("requests")
-    try:
-        snaps = list(
-            coll.where("type", "==", "LEAVE")
-            .where("employee_id", "==", eid)
-            .limit(limit)
-            .stream()
-        )
-        if snaps:
-            return snaps
-    except Exception as e:
-        logger.warning("Firestore leave query failed employee_id=%s: %s", eid, e)
+    found: dict[str, object] = {}
+
+    def _add(snaps) -> None:
+        for snap in snaps:
+            found[snap.id] = snap
+
+    if eid:
+        try:
+            _add(
+                coll.where("type", "==", "LEAVE")
+                .where("employee_id", "==", eid)
+                .limit(limit)
+                .stream()
+            )
+        except Exception as e:
+            logger.warning("Firestore leave query employee_id=%s: %s", eid, e)
+
+    if wa:
+        try:
+            _add(
+                coll.where("type", "==", "LEAVE")
+                .where("employee", "==", wa)
+                .limit(limit)
+                .stream()
+            )
+        except Exception as e:
+            logger.warning("Firestore leave query employee=%s: %s", wa, e)
+
+    if found:
+        return list(found.values())
+
     out = []
-    for snap in query_requests_by_type(firestore_db, "LEAVE", limit=limit * 3):
+    for snap in query_requests_by_type(firestore_db, "LEAVE", limit=limit * 4):
         d = snap.to_dict() or {}
-        if (d.get("employee_id") or "").strip().upper() == eid:
+        match_id = eid and (d.get("employee_id") or "").strip().upper() == eid
+        match_wa = wa and (d.get("employee") or "").strip() == wa
+        if match_id or match_wa:
             out.append(snap)
         if len(out) >= limit:
             break
     return out
 
 
-def _leave_days_in_month(d: dict, year: int, month: int) -> int:
-    """Approved leave day count falling in the given calendar month."""
-    if (d.get("jmd_status") or "").strip().upper() != "APPROVED":
-        return 0
+def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> int:
+    """Day count from leave_dates / from-to on one request document."""
+    month_key = f"{year}-{month:02d}"
+    if (d.get("source") or "").strip().lower() == "imported_history":
+        hist = (d.get("history_month") or "").strip()
+        if hist == month_key:
+            return int(d.get("leave_days") or len(d.get("leave_dates") or []) or 0)
     dates = d.get("leave_dates") or []
     if dates:
         n = 0
@@ -271,22 +306,102 @@ def _leave_days_in_month(d: dict, year: int, month: int) -> int:
     return n
 
 
-def _leave_month_days_count(firestore_db, employee_id: str, year: int, month: int) -> int:
+def count_leave_days_in_month_from_dates(
+    leave_dates: list[str],
+    year: int,
+    month: int,
+) -> int:
+    """Days from a date list (DD-MM-YYYY) falling in the given month."""
+    n = 0
+    for ds in leave_dates or []:
+        parsed = _parse_ddmmy(str(ds))
+        if parsed and parsed.year == year and parsed.month == month:
+            n += 1
+    return n
+
+
+def _leave_days_in_month(
+    d: dict, year: int, month: int, *, include_pending: bool = False
+) -> int:
+    """Leave day count in month. Last month: approved only. Current: approved + pending."""
+    jmd_st = (d.get("jmd_status") or "").strip().upper()
+    if jmd_st == "DENIED":
+        return 0
+    if jmd_st != "APPROVED":
+        if not include_pending or jmd_st not in ("PENDING", "AWAITING_MANAGER"):
+            return 0
+    return _count_leave_days_in_month_from_doc(d, year, month)
+
+
+def _leave_month_days_count(
+    firestore_db,
+    employee_id: str,
+    year: int,
+    month: int,
+    *,
+    employee_wa: str = "",
+    include_pending: bool = False,
+    exclude_request_id: str = "",
+) -> int:
+    eid = (employee_id or "").strip().upper()
+    exclude = (exclude_request_id or "").strip()
+    seen: set[str] = set()
     total = 0
-    for snap in query_leave_requests_for_employee_id(firestore_db, employee_id):
-        total += _leave_days_in_month(snap.to_dict() or {}, year, month)
+    for snap in query_leave_requests_for_employee_id(
+        firestore_db, eid, employee_wa=employee_wa
+    ):
+        if exclude and snap.id == exclude:
+            continue
+        seen.add(snap.id)
+        total += _leave_days_in_month(
+            snap.to_dict() or {}, year, month, include_pending=include_pending
+        )
+
+    if eid:
+        imp_id = import_leave_doc_id(eid, year, month)
+        if imp_id not in seen and imp_id != exclude:
+            imp_snap = firestore_db.collection("requests").document(imp_id).get()
+            if imp_snap.exists:
+                total += _leave_days_in_month(
+                    imp_snap.to_dict() or {}, year, month, include_pending=include_pending
+                )
     return total
 
 
 def get_employee_leave_counts(
     employee_id: str,
     *,
+    employee_wa: str = "",
     firestore_db=None,
     reference: datetime | None = None,
+    exclude_request_id: str = "",
+    extra_current_month_days: int = 0,
 ) -> tuple[int, int]:
-    """Sum approved LEAVE requests in `requests` for last and current month (IST)."""
+    """
+    Leave days in last and current month (IST) from Firestore `requests`.
+
+    Last month: approved only.
+    Current month: approved + pending (awaiting approval).
+    """
     _db = firestore_db or _require("db", db)
     (prev_y, prev_m), (curr_y, curr_m) = _leave_calendar_months(reference)
-    last_month = _leave_month_days_count(_db, employee_id, prev_y, prev_m)
-    current_month = _leave_month_days_count(_db, employee_id, curr_y, curr_m)
+    last_month = _leave_month_days_count(
+        _db,
+        employee_id,
+        prev_y,
+        prev_m,
+        employee_wa=employee_wa,
+        include_pending=False,
+        exclude_request_id=exclude_request_id,
+    )
+    current_month = _leave_month_days_count(
+        _db,
+        employee_id,
+        curr_y,
+        curr_m,
+        employee_wa=employee_wa,
+        include_pending=True,
+        exclude_request_id=exclude_request_id,
+    )
+    current_month += max(0, int(extra_current_month_days or 0))
     return last_month, current_month
