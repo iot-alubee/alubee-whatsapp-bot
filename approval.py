@@ -588,6 +588,24 @@ def _approval_role(sender: str, rd: dict) -> str | None:
     return None
 
 
+def _leave_cancelled_by_employee(rd: dict) -> bool:
+    if (rd.get("type") or "").strip().upper() != "LEAVE":
+        return False
+    if not rd.get("cancelled_by_employee"):
+        return False
+    return (rd.get("jmd_status") or "").strip().upper() == "DENIED"
+
+
+def _is_leave_approver_sender(sender: str, rd: dict) -> bool:
+    """True if sender is the JMD (or test MD) who was notified for this leave."""
+    d = _require()
+    if rd.get("leave_test_approver"):
+        test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
+        if test_md and d.same_whatsapp(sender, test_md):
+            return True
+    return d.same_whatsapp(sender, request_jmd_whatsapp(rd))
+
+
 def _dual_jmd_both_approved(rd: dict) -> bool:
     return (
         (rd.get("jmd_i_status") or "").strip().upper() == "APPROVED"
@@ -748,6 +766,12 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
     req_label = _request_type_label(rd)
     role = _approval_role(sender, rd)
     if not role:
+        if _leave_cancelled_by_employee(rd) and _is_leave_approver_sender(sender, rd):
+            d.send_to(
+                sender,
+                "This leave request was already cancelled by the employee.",
+            )
+            return True
         logger.warning(
             "approval ignored sender=%s request_id=%s jmd=%s md=%s",
             sender,

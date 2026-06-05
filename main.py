@@ -179,6 +179,9 @@ _ROW_IDS = {
     "sick_leave": "SICK_LEAVE",
     "casual_leave": "CASUAL_LEAVE",
     "leave_reason_other": "LEAVE_REASON_OTHER",
+    "leave_cancel": "LEAVE_CANCEL",
+    "cancel_leave": "LEAVE_CANCEL",
+    "leave_exit": "LEAVE_EXIT",
 }
 
 
@@ -388,7 +391,6 @@ LEAVE_DEPS = leave_request.LeaveDeps(
     build_approval_chain=approval.build_leave_approval_chain,
     notify_jmd=approval.notify_jmd,
     go_main_menu=_go_main_menu_for_employee,
-    already_pending_msg=leave_request.LEAVE_ALREADY_PENDING_MSG,
 )
 
 VISITOR_DEPS = visitor_request.VisitorDeps(

@@ -16,7 +16,7 @@ except ImportError:
 
 from bot_shared import (
     expand_leave_date_range,
-    find_open_request,
+    find_overlapping_leave_request,
     get_employee_leave_counts,
     get_user_record,
 )
@@ -24,15 +24,16 @@ from interakt_api import send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
 
-LEAVE_ALREADY_PENDING_MSG = "Your leave request is already pending approval."
-
 LEAVE_SESSION_STATES = frozenset({
     "WAITING_LEAVE_WHEN",
     "WAITING_LEAVE_FROM_DATE",
     "WAITING_LEAVE_TO_DATE",
     "WAITING_LEAVE_REASON_PICK",
     "WAITING_LEAVE_REASON_TYPING",
+    "WAITING_LEAVE_CANCEL_CHOICE",
 })
+
+CANCEL_CHOICES = frozenset({"LEAVE_CANCEL", "LEAVE_EXIT"})
 
 WHEN_CHOICES = frozenset({"TODAY", "TOMORROW", "OTHER"})
 REASON_CHOICES = frozenset({"SICK_LEAVE", "CASUAL_LEAVE", "LEAVE_REASON_OTHER"})
@@ -54,7 +55,6 @@ class LeaveDeps:
     build_approval_chain: Callable[[dict], dict | None]
     notify_jmd: Callable[[str, dict, str], bool]
     go_main_menu: Callable[[str], None]
-    already_pending_msg: str = LEAVE_ALREADY_PENDING_MSG
 
 
 def is_leave_state(state: str | None) -> bool:
@@ -62,9 +62,6 @@ def is_leave_state(state: str | None) -> bool:
 
 
 def try_start(sender: str, deps: LeaveDeps) -> None:
-    if find_open_request(sender, "LEAVE"):
-        deps.send_to(sender, deps.already_pending_msg)
-        return
     exists, ud = get_user_record(sender)
     if not exists or not ud:
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
@@ -160,6 +157,28 @@ def handle(sender: str, incoming: str, session: dict, deps: LeaveDeps) -> None:
         )
         return
 
+    if state == "WAITING_LEAVE_CANCEL_CHOICE":
+        cancel_choice = _normalize_cancel_choice(incoming)
+        if cancel_choice not in CANCEL_CHOICES:
+            _send_overlap_cancel_buttons(
+                sender,
+                deps,
+                _overlap_cancel_body(session.get("leave_overlap_status") or ""),
+            )
+            return
+        if cancel_choice == "LEAVE_EXIT":
+            deps.session_ref(sender).delete()
+            deps.send_to(sender, "Okay.")
+            return
+        req_id = (session.get("leave_overlap_request_id") or "").strip()
+        ok, err = _employee_cancel_leave(sender, req_id, deps)
+        deps.session_ref(sender).delete()
+        if ok:
+            deps.send_to(sender, "Your leave request has been cancelled.")
+        else:
+            deps.send_to(sender, err or "Could not cancel leave. Please contact admin.")
+        return
+
     deps.send_to(sender, "Invalid step. Send Hi to start over.")
 
 
@@ -245,6 +264,68 @@ def _leave_days(from_s: str, to_s: str) -> int:
     return max(1, (t - f).days + 1)
 
 
+def _overlap_cancel_body(overlap_status: str) -> str:
+    if overlap_status == "approved":
+        status_line = (
+            "A leave request for this date is already raised and is approved."
+        )
+    else:
+        status_line = (
+            "A leave request for this date is already raised and is pending approval."
+        )
+    return f"{status_line}\n\nDo you want to cancel leave?"
+
+
+def _prompt_leave_cancel_or_exit(
+    sender: str,
+    session: dict,
+    deps: LeaveDeps,
+    overlap_doc: dict,
+    overlap_status: str,
+    from_d: str,
+    to_d: str,
+) -> None:
+    req_id = (overlap_doc.get("request_id") or "").strip()
+    deps.session_merge(
+        sender,
+        state="WAITING_LEAVE_CANCEL_CHOICE",
+        leave_overlap_request_id=req_id,
+        leave_overlap_status=overlap_status,
+        leave_from_date=from_d,
+        leave_to_date=to_d,
+        employee_name=session.get("employee_name"),
+        department=session.get("department"),
+        form_type="LEAVE_REQUEST",
+    )
+    _send_overlap_cancel_buttons(sender, deps, _overlap_cancel_body(overlap_status))
+
+
+def _check_leave_overlap(
+    sender: str,
+    session: dict,
+    deps: LeaveDeps,
+    from_d: str,
+    to_d: str,
+) -> bool:
+    """True if overlap was found and cancel/exit prompt was sent."""
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
+        return False
+    overlap_doc, overlap_status = find_overlapping_leave_request(
+        deps.db,
+        ud.get("employee_id") or "",
+        from_d,
+        to_d,
+        employee_wa=sender,
+    )
+    if not overlap_status or not overlap_doc:
+        return False
+    _prompt_leave_cancel_or_exit(
+        sender, session, deps, overlap_doc, overlap_status, from_d, to_d
+    )
+    return True
+
+
 def _go_to_reason_pick(
     sender: str,
     session: dict,
@@ -252,6 +333,8 @@ def _go_to_reason_pick(
     from_d: str,
     to_d: str,
 ) -> None:
+    if _check_leave_overlap(sender, session, deps, from_d, to_d):
+        return
     deps.session_merge(
         sender,
         state="WAITING_LEAVE_REASON_PICK",
@@ -279,6 +362,64 @@ def _send_when_buttons(wa_id: str, deps: LeaveDeps) -> None:
     except Exception:
         logger.exception("leave when buttons failed")
         deps.send_to(wa_id, "When is your leave?\nReply: Today, Tomorrow, or Other.")
+
+
+def _send_overlap_cancel_buttons(wa_id: str, deps: LeaveDeps, body: str) -> None:
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            body,
+            [
+                ("LEAVE_CANCEL", "Cancel Leave"),
+                ("LEAVE_EXIT", "Exit"),
+            ],
+            callback_data="leave-overlap",
+        )
+    except Exception:
+        logger.exception("leave overlap buttons failed")
+        deps.send_to(
+            wa_id,
+            f"{body}\n\nReply: Cancel Leave or Exit.",
+        )
+
+
+def _employee_cancel_leave(
+    sender: str, request_id: str, deps: LeaveDeps
+) -> tuple[bool, str | None]:
+    rid = (request_id or "").strip()
+    if not rid:
+        return False, "Leave request not found."
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
+        return False, "User not registered.\nPlease contact admin."
+    employee_id = (ud.get("employee_id") or "").strip().upper()
+    try:
+        ref = deps.db.collection("requests").document(rid)
+        snap = ref.get()
+        if not snap.exists:
+            return False, "Leave request not found."
+        d = snap.to_dict() or {}
+        if (d.get("type") or "").strip().upper() != "LEAVE":
+            return False, "Not a leave request."
+        if (d.get("source") or "").strip().lower() == "imported_history":
+            return False, "This leave record cannot be cancelled here."
+        owner_wa = (d.get("employee") or "").strip()
+        owner_id = (d.get("employee_id") or "").strip().upper()
+        if owner_wa != sender and owner_id != employee_id:
+            return False, "You can only cancel your own leave request."
+        jmd = (d.get("jmd_status") or "").strip().upper()
+        if jmd == "DENIED":
+            return False, "This leave request is already cancelled."
+        ref.update({
+            "jmd_status": "DENIED",
+            "cancelled_by_employee": True,
+            "cancelled_at": deps.utcnow(),
+        })
+        logger.info("LEAVE cancelled by employee %s request_id=%s", sender, rid)
+        return True, None
+    except Exception:
+        logger.exception("employee leave cancel failed request_id=%s", rid)
+        return False, "Could not cancel leave. Please try again or contact admin."
 
 
 def _send_reason_buttons(wa_id: str, deps: LeaveDeps) -> None:
@@ -320,15 +461,13 @@ def _submit(
     from_d: str,
     to_d: str,
 ) -> None:
-    if find_open_request(sender, "LEAVE"):
-        deps.session_ref(sender).delete()
-        deps.send_to(sender, deps.already_pending_msg)
-        return
-
     exists, ud = get_user_record(sender)
     if not exists or not ud:
         deps.session_ref(sender).delete()
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+
+    if _check_leave_overlap(sender, session, deps, from_d, to_d):
         return
 
     chain = deps.build_approval_chain(ud)
@@ -343,7 +482,6 @@ def _submit(
 
     days = _leave_days(from_d, to_d)
     leave_dates = expand_leave_date_range(from_d, to_d)
-    employee_id = ud.get("employee_id") or ""
     leaves_last_month, leaves_current_month = get_employee_leave_counts(
         employee_id,
         employee_wa=sender,
@@ -418,6 +556,20 @@ def _normalize_when_choice(incoming: str) -> str:
         return "TOMORROW"
     if low == "other":
         return "OTHER"
+    return c
+
+
+def _normalize_cancel_choice(incoming: str) -> str:
+    c = _normalize_incoming(incoming)
+    if c in ("LEAVE_CANCEL", "CANCEL_LEAVE", "CANCEL"):
+        return "LEAVE_CANCEL"
+    if c in ("LEAVE_EXIT", "EXIT"):
+        return "LEAVE_EXIT"
+    low = (incoming or "").strip().lower()
+    if low in ("cancel leave", "cancel"):
+        return "LEAVE_CANCEL"
+    if low == "exit":
+        return "LEAVE_EXIT"
     return c
 
 

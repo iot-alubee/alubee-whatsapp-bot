@@ -215,6 +215,71 @@ def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
     return out
 
 
+def leave_dates_from_doc(d: dict) -> set[str]:
+    """Calendar days covered by one LEAVE request document."""
+    dates = d.get("leave_dates") or []
+    if dates:
+        return {str(x).strip() for x in dates if str(x).strip()}
+    return set(
+        expand_leave_date_range(
+            d.get("leave_from_date") or "",
+            d.get("leave_to_date") or d.get("leave_from_date") or "",
+        )
+    )
+
+
+def _leave_overlap_status_label(d: dict) -> str:
+    """User-facing status for duplicate-date check: pending, approved, or skip."""
+    if (d.get("jmd_status") or "").strip().upper() == "DENIED":
+        return ""
+    jmd = (d.get("jmd_status") or "").strip().upper()
+    if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
+        return "pending"
+    if jmd == "APPROVED":
+        return "approved"
+    return ""
+
+
+def find_overlapping_leave_request(
+    firestore_db,
+    employee_id: str,
+    from_d: str,
+    to_d: str,
+    *,
+    employee_wa: str = "",
+) -> tuple[dict | None, str]:
+    """
+    Existing WhatsApp LEAVE overlapping requested dates.
+    Returns (doc, 'pending'|'approved') or (None, '').
+    """
+    new_dates = set(expand_leave_date_range(from_d, to_d))
+    if not new_dates:
+        return None, ""
+
+    match: dict | None = None
+    match_status = ""
+    for snap in query_leave_requests_for_employee_id(
+        firestore_db,
+        employee_id,
+        employee_wa=employee_wa,
+    ):
+        d = snap.to_dict() or {}
+        if (d.get("source") or "").strip().lower() == "imported_history":
+            continue
+        status = _leave_overlap_status_label(d)
+        if not status:
+            continue
+        existing = leave_dates_from_doc(d)
+        if not existing or not (new_dates & existing):
+            continue
+        match = {**d, "request_id": snap.id}
+        match_status = status
+        if status == "pending":
+            break
+
+    return match, match_status
+
+
 def import_leave_doc_id(employee_id: str, year: int, month: int) -> str:
     return f"IMPORT_{(employee_id or '').strip().upper()}_{year}_{month:02d}"
 
