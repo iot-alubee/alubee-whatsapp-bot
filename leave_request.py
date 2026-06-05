@@ -470,6 +470,7 @@ def _submit(
     if _check_leave_overlap(sender, session, deps, from_d, to_d):
         return
 
+    employee_id = ud.get("employee_id") or ""
     chain = deps.build_approval_chain(ud)
     if not chain or not chain.get("jmd"):
         deps.session_ref(sender).delete()
