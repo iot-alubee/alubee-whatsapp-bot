@@ -482,11 +482,28 @@ def _approval_message_body(
                 logger.exception("permission count lookup failed employee_id=%s", eid)
                 perms_last = rd.get("permissions_last_month", 0)
                 perms_curr = rd.get("permissions_current_month", 0)
+        perm_type = (rd.get("permission_type") or "").strip() or "—"
         test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
+        if (rd.get("permission_for") or "").strip().lower() == "cl":
+            cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
+            shift = (rd.get("permission_shift") or "").strip()
+            shift_line = f"Shift: {shift}\n" if shift else ""
+            return (
+                f"{test_tag}Permission approval request (CL)\n\n"
+                f"Raised by: {emp}\n"
+                f"Department: {dept}\n"
+                f"CL name: {cl_name}\n"
+                f"{shift_line}"
+                f"Reason: {reason or '—'}\n"
+                f"Permission in last month: {perms_last}\n"
+                f"Permission in current month: {perms_curr}\n\n"
+                "Please approve or deny."
+            )
         return (
             f"{test_tag}Permission approval request\n\n"
             f"Name: {emp}\n"
             f"Department: {dept}\n"
+            f"Permission type: {perm_type}\n"
             f"Reason: {reason or '—'}\n"
             f"Permission in last month: {perms_last}\n"
             f"Permission in current month: {perms_curr}\n\n"

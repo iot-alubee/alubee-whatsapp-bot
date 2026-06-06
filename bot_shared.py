@@ -547,6 +547,58 @@ def find_overlapping_permission_request(
     return match, match_status
 
 
+def _normalize_cl_name(name: str) -> str:
+    return " ".join((name or "").strip().upper().split())
+
+
+def find_overlapping_cl_permission_request(
+    firestore_db,
+    cl_employee_name: str,
+    permission_date: str,
+) -> tuple[dict | None, str]:
+    """Existing CL permission for same name on same day."""
+    target_name = _normalize_cl_name(cl_employee_name)
+    target_date = (permission_date or "").strip()
+    if not target_name or not target_date:
+        return None, ""
+
+    match: dict | None = None
+    match_status = ""
+    coll = firestore_db.collection("requests")
+    try:
+        q = (
+            coll.where("type", "==", "PERMISSION")
+            .where("permission_date", "==", target_date)
+            .limit(200)
+        )
+        snaps = list(q.stream())
+    except Exception as e:
+        logger.warning("Firestore CL permission query failed: %s", e)
+        try:
+            snaps = list(coll.where("type", "==", "PERMISSION").limit(500).stream())
+        except Exception as e2:
+            logger.warning("Firestore CL permission fallback query failed: %s", e2)
+            snaps = []
+
+    for snap in snaps:
+        d = snap.to_dict() or {}
+        if (d.get("permission_for") or "").strip().lower() != "cl":
+            continue
+        if (d.get("permission_date") or "").strip() != target_date:
+            continue
+        if _normalize_cl_name(d.get("cl_employee_name") or "") != target_name:
+            continue
+        status = _permission_overlap_status_label(d)
+        if not status:
+            continue
+        match = {**d, "request_id": snap.id}
+        match_status = status
+        if status == "pending":
+            break
+
+    return match, match_status
+
+
 def _permission_count_in_month(d: dict, year: int, month: int) -> int:
     """Approved permission requests in month (one request = one count)."""
     if (d.get("jmd_status") or "").strip().upper() != "APPROVED":

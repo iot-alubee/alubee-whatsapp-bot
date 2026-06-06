@@ -186,6 +186,19 @@ _ROW_IDS = {
     "permission_cancel": "PERMISSION_CANCEL",
     "cancel_permission": "PERMISSION_CANCEL",
     "permission_exit": "PERMISSION_EXIT",
+    "permission_late_in": "PERMISSION_LATE_IN",
+    "late_in": "PERMISSION_LATE_IN",
+    "permission_early_out": "PERMISSION_EARLY_OUT",
+    "early_out": "PERMISSION_EARLY_OUT",
+    "permission_other": "PERMISSION_OTHER",
+    "permission_for_myself": "PERMISSION_FOR_MYSELF",
+    "for_myself": "PERMISSION_FOR_MYSELF",
+    "permission_for_cl": "PERMISSION_FOR_CL",
+    "for_cl": "PERMISSION_FOR_CL",
+    "permission_shift_i": "PERMISSION_SHIFT_I",
+    "shift_i": "PERMISSION_SHIFT_I",
+    "permission_shift_ii": "PERMISSION_SHIFT_II",
+    "shift_ii": "PERMISSION_SHIFT_II",
 }
 
 

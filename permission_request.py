@@ -1,5 +1,5 @@
 """
-Permission request flow — reason for today (IST), JMD approval only.
+Permission request flow — myself / CL (supervisor), shift, type, reason; TEST_MD approval.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
 from bot_shared import (
+    find_overlapping_cl_permission_request,
     find_overlapping_permission_request,
     get_employee_permission_counts,
     get_user_record,
@@ -24,9 +25,28 @@ from interakt_api import send_reply_buttons, wa_id_to_phone
 logger = logging.getLogger(__name__)
 
 PERMISSION_SESSION_STATES = frozenset({
+    "WAITING_PERMISSION_FOR",
+    "WAITING_PERMISSION_SHIFT",
+    "WAITING_PERMISSION_CL_NAME",
+    "WAITING_PERMISSION_TYPE",
     "WAITING_PERMISSION_REASON",
     "WAITING_PERMISSION_CANCEL_CHOICE",
 })
+
+FOR_CHOICES = frozenset({"PERMISSION_FOR_MYSELF", "PERMISSION_FOR_CL"})
+SHIFT_CHOICES = frozenset({"PERMISSION_SHIFT_I", "PERMISSION_SHIFT_II"})
+
+TYPE_CHOICES = frozenset({
+    "PERMISSION_LATE_IN",
+    "PERMISSION_EARLY_OUT",
+    "PERMISSION_OTHER",
+})
+
+TYPE_LABELS = {
+    "PERMISSION_LATE_IN": "Late IN",
+    "PERMISSION_EARLY_OUT": "Early OUT",
+    "PERMISSION_OTHER": "Other",
+}
 
 CANCEL_CHOICES = frozenset({"PERMISSION_CANCEL", "PERMISSION_EXIT"})
 
@@ -62,39 +82,129 @@ def _today_ddmmy() -> str:
     return _today_ist().strftime("%d-%m-%Y")
 
 
+def _is_supervisor(ud: dict | None) -> bool:
+    return bool(ud and ud.get("is_supervisor"))
+
+
+def _is_rotational_shift(ud: dict | None) -> bool:
+    return (ud or {}).get("shift_type", "").strip().upper() == "RS"
+
+
+def _session_base(ud: dict) -> dict:
+    return {
+        "employee_name": ud.get("name") or "Employee",
+        "department": ud.get("department") or "",
+        "permission_date": _today_ddmmy(),
+        "form_type": "PERMISSION_REQUEST",
+    }
+
+
 def try_start(sender: str, deps: PermissionDeps) -> None:
     exists, ud = get_user_record(sender)
     if not exists or not ud:
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
-    session = {
-        "employee_name": ud.get("name") or "Employee",
-        "department": ud.get("department") or "",
-    }
-    if _check_permission_overlap(sender, session, deps):
+    session = _session_base(ud)
+    if _is_supervisor(ud):
+        deps.session_merge(sender, state="WAITING_PERMISSION_FOR", **session)
+        _send_for_buttons(sender, deps)
         return
 
-    deps.session_merge(
-        sender,
-        state="WAITING_PERMISSION_REASON",
-        employee_name=session["employee_name"],
-        department=session["department"],
-        permission_date=_today_ddmmy(),
-        form_type="PERMISSION_REQUEST",
-    )
-    deps.send_to(sender, "Please type your permission reason:")
+    _start_myself_flow(sender, session, deps, ud)
 
 
 def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> None:
     state = session.get("state")
+    choice = _normalize_incoming(incoming)
+
+    if state == "WAITING_PERMISSION_FOR":
+        for_choice = _normalize_for_choice(incoming)
+        if for_choice not in FOR_CHOICES:
+            _send_for_buttons(sender, deps)
+            return
+        exists, ud = get_user_record(sender)
+        if not exists or not ud:
+            deps.send_to(sender, "User not registered.\nPlease contact admin.")
+            return
+        if for_choice == "PERMISSION_FOR_MYSELF":
+            deps.session_merge(
+                sender,
+                permission_for="myself",
+                **{k: session.get(k) for k in ("employee_name", "department", "permission_date", "form_type")},
+            )
+            _start_myself_flow(sender, session, deps, ud)
+            return
+        deps.session_merge(
+            sender,
+            state="WAITING_PERMISSION_CL_NAME",
+            permission_for="cl",
+        )
+        deps.send_to(sender, "Please type the employee name:")
+        return
+
+    if state == "WAITING_PERMISSION_CL_NAME":
+        if choice in FOR_CHOICES or choice in SHIFT_CHOICES or choice in TYPE_CHOICES:
+            deps.send_to(sender, "Please type the employee name:")
+            return
+        cl_name = (incoming or "").strip()
+        if not cl_name:
+            deps.send_to(sender, "Please type the employee name:")
+            return
+        deps.session_merge(
+            sender,
+            state="WAITING_PERMISSION_SHIFT",
+            cl_employee_name=cl_name[:200],
+        )
+        _send_shift_buttons(sender, deps)
+        return
+
+    if state == "WAITING_PERMISSION_SHIFT":
+        shift_code = _normalize_shift_choice(incoming)
+        if shift_code not in SHIFT_CHOICES:
+            _send_shift_buttons(sender, deps)
+            return
+        shift_label = "I" if shift_code == "PERMISSION_SHIFT_I" else "II"
+        permission_for = (session.get("permission_for") or "myself").strip().lower()
+        if permission_for == "cl":
+            deps.session_merge(
+                sender,
+                state="WAITING_PERMISSION_REASON",
+                permission_shift=shift_label,
+            )
+            deps.send_to(sender, "Please type your permission reason:")
+            return
+        deps.session_merge(
+            sender,
+            state="WAITING_PERMISSION_TYPE",
+            permission_shift=shift_label,
+        )
+        _send_type_buttons(sender, deps)
+        return
+
+    if state == "WAITING_PERMISSION_TYPE":
+        type_code = _normalize_type_choice(incoming)
+        if type_code not in TYPE_CHOICES:
+            _send_type_buttons(sender, deps)
+            return
+        deps.session_merge(
+            sender,
+            state="WAITING_PERMISSION_REASON",
+            permission_type_code=type_code,
+            permission_type=TYPE_LABELS[type_code],
+        )
+        deps.send_to(sender, "Please type your permission reason:")
+        return
 
     if state == "WAITING_PERMISSION_REASON":
+        if choice in FOR_CHOICES or choice in SHIFT_CHOICES or choice in TYPE_CHOICES:
+            deps.send_to(sender, "Please type your permission reason:")
+            return
         reason = (incoming or "").strip()
         if not reason:
             deps.send_to(sender, "Please type your permission reason:")
             return
-        if _normalize_incoming(incoming) in CANCEL_CHOICES:
+        if choice in CANCEL_CHOICES:
             deps.send_to(sender, "Please type your permission reason:")
             return
         _submit(sender, session, deps, reason=reason[:500])
@@ -125,6 +235,31 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
         return
 
     deps.send_to(sender, "Invalid step. Send Hi to start over.")
+
+
+def _start_myself_flow(
+    sender: str, session: dict, deps: PermissionDeps, ud: dict
+) -> None:
+    session = {**session, "permission_for": "myself"}
+    if _check_myself_overlap(sender, session, deps, ud):
+        return
+    base = _session_base(ud)
+    if _is_rotational_shift(ud):
+        deps.session_merge(
+            sender,
+            state="WAITING_PERMISSION_SHIFT",
+            permission_for="myself",
+            **base,
+        )
+        _send_shift_buttons(sender, deps)
+        return
+    deps.session_merge(
+        sender,
+        state="WAITING_PERMISSION_TYPE",
+        permission_for="myself",
+        **base,
+    )
+    _send_type_buttons(sender, deps)
 
 
 def _overlap_cancel_body(overlap_status: str) -> str:
@@ -160,12 +295,9 @@ def _prompt_permission_cancel_or_exit(
     _send_overlap_cancel_buttons(sender, deps, _overlap_cancel_body(overlap_status))
 
 
-def _check_permission_overlap(
-    sender: str, session: dict, deps: PermissionDeps
+def _check_myself_overlap(
+    sender: str, session: dict, deps: PermissionDeps, ud: dict
 ) -> bool:
-    exists, ud = get_user_record(sender)
-    if not exists or not ud:
-        return False
     overlap_doc, overlap_status = find_overlapping_permission_request(
         deps.db,
         ud.get("employee_id") or "",
@@ -178,6 +310,74 @@ def _check_permission_overlap(
         sender, session, deps, overlap_doc, overlap_status
     )
     return True
+
+
+def _check_cl_overlap(
+    sender: str, session: dict, deps: PermissionDeps, cl_name: str
+) -> bool:
+    overlap_doc, overlap_status = find_overlapping_cl_permission_request(
+        deps.db,
+        cl_name,
+        _today_ddmmy(),
+    )
+    if not overlap_status or not overlap_doc:
+        return False
+    _prompt_permission_cancel_or_exit(
+        sender, session, deps, overlap_doc, overlap_status
+    )
+    return True
+
+
+def _send_for_buttons(wa_id: str, deps: PermissionDeps) -> None:
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            "Permission for:",
+            [
+                ("PERMISSION_FOR_MYSELF", "For Myself"),
+                ("PERMISSION_FOR_CL", "For CL"),
+            ],
+            callback_data="permission-for",
+        )
+    except Exception:
+        logger.exception("permission for buttons failed")
+        deps.send_to(wa_id, "Permission for:\nChoose For Myself or For CL.")
+
+
+def _send_shift_buttons(wa_id: str, deps: PermissionDeps) -> None:
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            "Shift?",
+            [
+                ("PERMISSION_SHIFT_I", "Shift I"),
+                ("PERMISSION_SHIFT_II", "Shift II"),
+            ],
+            callback_data="permission-shift",
+        )
+    except Exception:
+        logger.exception("permission shift buttons failed")
+        deps.send_to(wa_id, "Shift?\nChoose Shift I or Shift II.")
+
+
+def _send_type_buttons(wa_id: str, deps: PermissionDeps) -> None:
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            "Permission type:",
+            [
+                ("PERMISSION_LATE_IN", "Late IN"),
+                ("PERMISSION_EARLY_OUT", "Early OUT"),
+                ("PERMISSION_OTHER", "Other"),
+            ],
+            callback_data="permission-type",
+        )
+    except Exception:
+        logger.exception("permission type buttons failed")
+        deps.send_to(
+            wa_id,
+            "Permission type:\nChoose Late IN, Early OUT, or Other.",
+        )
 
 
 def _send_overlap_cancel_buttons(wa_id: str, deps: PermissionDeps, body: str) -> None:
@@ -240,7 +440,16 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
-    if _check_permission_overlap(sender, session, deps):
+    permission_for = (session.get("permission_for") or "myself").strip().lower()
+    if permission_for == "cl":
+        cl_name = (session.get("cl_employee_name") or "").strip()
+        if not cl_name:
+            deps.session_ref(sender).delete()
+            deps.send_to(sender, "Employee name missing. Send Hi to start over.")
+            return
+        if _check_cl_overlap(sender, session, deps, cl_name):
+            return
+    elif _check_myself_overlap(sender, session, deps, ud):
         return
 
     employee_id = ud.get("employee_id") or ""
@@ -260,16 +469,16 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         employee_wa=sender,
         firestore_db=deps.db,
     )
-    ref = deps.db.collection("requests").document()
-    request_id = ref.id
-    ref.set({
-        "request_id": request_id,
+    payload = {
+        "request_id": "",
         "requested_datetime": deps.utcnow(),
         "employee": sender,
         "employee_id": employee_id,
         "employee_name": ud.get("name") or session.get("employee_name") or "Employee",
         "department": ud.get("department") or session.get("department") or "",
         "type": "PERMISSION",
+        "permission_for": permission_for,
+        "permission_shift": (session.get("permission_shift") or "").strip(),
         "reason": reason,
         "permission_date": permission_date,
         "permissions_last_month": perms_last_month,
@@ -282,11 +491,30 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         "jmd_status": "PENDING",
         "md_status": "N/A",
         "source": "whatsapp_request",
-    })
+    }
+
+    if permission_for == "cl":
+        payload["cl_employee_name"] = (session.get("cl_employee_name") or "").strip()
+        payload["raised_by_name"] = payload["employee_name"]
+        payload["permission_type"] = "CL"
+        payload["permission_type_code"] = "CL"
+    else:
+        payload["permission_type"] = (
+            session.get("permission_type")
+            or TYPE_LABELS.get(session.get("permission_type_code") or "", "")
+            or "Other"
+        )
+        payload["permission_type_code"] = session.get("permission_type_code") or ""
+
+    ref = deps.db.collection("requests").document()
+    request_id = ref.id
+    payload["request_id"] = request_id
+    ref.set(payload)
     test_note = " (test approver)" if chain.get("permission_test_approver") else ""
     logger.info(
-        "PERMISSION created %s jmd_route=%s date=%s%s",
+        "PERMISSION created %s for=%s jmd_route=%s date=%s%s",
         request_id,
+        permission_for,
         chain["jmd_route"],
         permission_date,
         test_note,
@@ -308,6 +536,52 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
 
 def _normalize_incoming(incoming: str) -> str:
     return (incoming or "").strip().upper().replace(" ", "_")
+
+
+def _normalize_for_choice(incoming: str) -> str:
+    c = _normalize_incoming(incoming)
+    if c in ("PERMISSION_FOR_MYSELF", "FOR_MYSELF", "MYSELF", "1"):
+        return "PERMISSION_FOR_MYSELF"
+    if c in ("PERMISSION_FOR_CL", "FOR_CL", "CL", "2"):
+        return "PERMISSION_FOR_CL"
+    low = (incoming or "").strip().lower()
+    if low in ("for myself", "myself"):
+        return "PERMISSION_FOR_MYSELF"
+    if low in ("for cl", "cl"):
+        return "PERMISSION_FOR_CL"
+    return c
+
+
+def _normalize_shift_choice(incoming: str) -> str:
+    c = _normalize_incoming(incoming)
+    if c in ("PERMISSION_SHIFT_I", "SHIFT_I", "SHI", "1"):
+        return "PERMISSION_SHIFT_I"
+    if c in ("PERMISSION_SHIFT_II", "SHIFT_II", "SHII", "2"):
+        return "PERMISSION_SHIFT_II"
+    low = (incoming or "").strip().lower()
+    if low in ("shift i", "shift 1", "i"):
+        return "PERMISSION_SHIFT_I"
+    if low in ("shift ii", "shift 2", "ii"):
+        return "PERMISSION_SHIFT_II"
+    return c
+
+
+def _normalize_type_choice(incoming: str) -> str:
+    c = _normalize_incoming(incoming)
+    if c in ("PERMISSION_LATE_IN", "LATE_IN", "LATEIN", "1"):
+        return "PERMISSION_LATE_IN"
+    if c in ("PERMISSION_EARLY_OUT", "EARLY_OUT", "EARLYOUT", "2"):
+        return "PERMISSION_EARLY_OUT"
+    if c in ("PERMISSION_OTHER", "OTHER", "3"):
+        return "PERMISSION_OTHER"
+    low = (incoming or "").strip().lower()
+    if low in ("late in", "late"):
+        return "PERMISSION_LATE_IN"
+    if low in ("early out", "early"):
+        return "PERMISSION_EARLY_OUT"
+    if low == "other":
+        return "PERMISSION_OTHER"
+    return c
 
 
 def _normalize_cancel_choice(incoming: str) -> str:
