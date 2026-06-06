@@ -486,23 +486,22 @@ def _approval_message_body(
         test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
         if (rd.get("permission_for") or "").strip().lower() == "cl":
             cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
-            shift = (rd.get("permission_shift") or "").strip()
-            shift_line = f"Shift: {shift}\n" if shift else ""
+            shift = (rd.get("permission_shift") or "").strip() or "—"
             return (
                 f"{test_tag}Permission approval request (CL)\n\n"
-                f"Raised by: {emp}\n"
-                f"Department: {dept}\n"
                 f"CL name: {cl_name}\n"
-                f"{shift_line}"
+                f"Department: {dept}\n"
+                f"Shift: {shift}\n"
                 f"Reason: {reason or '—'}\n"
-                f"Permission in last month: {perms_last}\n"
-                f"Permission in current month: {perms_curr}\n\n"
+                f"Permission type: Early OUT\n\n"
                 "Please approve or deny."
             )
+        shift = (rd.get("permission_shift") or "").strip() or "—"
         return (
             f"{test_tag}Permission approval request\n\n"
             f"Name: {emp}\n"
             f"Department: {dept}\n"
+            f"Shift: {shift}\n"
             f"Permission type: {perm_type}\n"
             f"Reason: {reason or '—'}\n"
             f"Permission in last month: {perms_last}\n"

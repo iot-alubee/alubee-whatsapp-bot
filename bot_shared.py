@@ -536,6 +536,8 @@ def find_overlapping_permission_request(
         d = snap.to_dict() or {}
         if (d.get("permission_date") or "").strip() != target:
             continue
+        if (d.get("permission_for") or "myself").strip().lower() == "cl":
+            continue
         status = _permission_overlap_status_label(d)
         if not status:
             continue
@@ -556,7 +558,7 @@ def find_overlapping_cl_permission_request(
     cl_employee_name: str,
     permission_date: str,
 ) -> tuple[dict | None, str]:
-    """Existing CL permission for same name on same day."""
+    """Existing CL permission for the same name on the same day."""
     target_name = _normalize_cl_name(cl_employee_name)
     target_date = (permission_date or "").strip()
     if not target_name or not target_date:

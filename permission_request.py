@@ -151,6 +151,9 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
         if not cl_name:
             deps.send_to(sender, "Please type the employee name:")
             return
+        session = {**session, "cl_employee_name": cl_name[:200], "permission_for": "cl"}
+        if _check_cl_overlap(sender, session, deps, cl_name):
+            return
         deps.session_merge(
             sender,
             state="WAITING_PERMISSION_SHIFT",
@@ -496,8 +499,8 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
     if permission_for == "cl":
         payload["cl_employee_name"] = (session.get("cl_employee_name") or "").strip()
         payload["raised_by_name"] = payload["employee_name"]
-        payload["permission_type"] = "CL"
-        payload["permission_type_code"] = "CL"
+        payload["permission_type"] = "Early OUT"
+        payload["permission_type_code"] = "PERMISSION_EARLY_OUT"
     else:
         payload["permission_type"] = (
             session.get("permission_type")
