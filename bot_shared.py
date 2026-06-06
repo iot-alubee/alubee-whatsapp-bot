@@ -511,6 +511,14 @@ def _permission_overlap_status_label(d: dict) -> str:
     return ""
 
 
+def permission_work_date(d: dict) -> str:
+    """Shift/work day (DD-MM-YYYY); falls back to permission_date."""
+    w = (d.get("permission_work_date") or "").strip()
+    if w:
+        return w
+    return (d.get("permission_date") or "").strip()
+
+
 def find_overlapping_permission_request(
     firestore_db,
     employee_id: str,
@@ -534,7 +542,7 @@ def find_overlapping_permission_request(
         employee_wa=employee_wa,
     ):
         d = snap.to_dict() or {}
-        if (d.get("permission_date") or "").strip() != target:
+        if permission_work_date(d) != target:
             continue
         if (d.get("permission_for") or "myself").strip().lower() == "cl":
             continue
@@ -586,7 +594,7 @@ def find_overlapping_cl_permission_request(
         d = snap.to_dict() or {}
         if (d.get("permission_for") or "").strip().lower() != "cl":
             continue
-        if (d.get("permission_date") or "").strip() != target_date:
+        if permission_work_date(d) != target_date:
             continue
         if _normalize_cl_name(d.get("cl_employee_name") or "") != target_name:
             continue

@@ -82,6 +82,38 @@ def _today_ddmmy() -> str:
     return _today_ist().strftime("%d-%m-%Y")
 
 
+def _compute_permission_work_date(
+    ud: dict,
+    *,
+    permission_shift: str,
+    permission_type_code: str,
+    permission_for: str = "myself",
+) -> str:
+    """
+    RS: between 00:00–08:00 IST, Shift II + Early OUT → previous calendar day.
+    Otherwise work date = today (IST).
+    """
+    today = _today_ist()
+    calendar = today.strftime("%d-%m-%Y")
+    if not _is_rotational_shift(ud):
+        return calendar
+
+    shift = (permission_shift or "").strip().upper()
+    if permission_for == "cl":
+        type_code = "PERMISSION_EARLY_OUT"
+    else:
+        type_code = (permission_type_code or "").strip().upper()
+
+    now = datetime.now(_ist_tzinfo())
+    if (
+        shift in ("II", "2")
+        and type_code == "PERMISSION_EARLY_OUT"
+        and now.hour < 8
+    ):
+        return (today - timedelta(days=1)).strftime("%d-%m-%Y")
+    return calendar
+
+
 def _is_supervisor(ud: dict | None) -> bool:
     return bool(ud and ud.get("is_supervisor"))
 
@@ -152,8 +184,6 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
             deps.send_to(sender, "Please type the employee name:")
             return
         session = {**session, "cl_employee_name": cl_name[:200], "permission_for": "cl"}
-        if _check_cl_overlap(sender, session, deps, cl_name):
-            return
         deps.session_merge(
             sender,
             state="WAITING_PERMISSION_SHIFT",
@@ -170,6 +200,21 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
         shift_label = "I" if shift_code == "PERMISSION_SHIFT_I" else "II"
         permission_for = (session.get("permission_for") or "myself").strip().lower()
         if permission_for == "cl":
+            exists, ud = get_user_record(sender)
+            ud = ud or {}
+            if _check_cl_overlap(
+                sender,
+                session,
+                deps,
+                (session.get("cl_employee_name") or "").strip(),
+                work_date=_compute_permission_work_date(
+                    ud,
+                    permission_shift=shift_label,
+                    permission_type_code="PERMISSION_EARLY_OUT",
+                    permission_for="cl",
+                ),
+            ):
+                return
             deps.session_merge(
                 sender,
                 state="WAITING_PERMISSION_REASON",
@@ -299,12 +344,17 @@ def _prompt_permission_cancel_or_exit(
 
 
 def _check_myself_overlap(
-    sender: str, session: dict, deps: PermissionDeps, ud: dict
+    sender: str,
+    session: dict,
+    deps: PermissionDeps,
+    ud: dict,
+    *,
+    work_date: str | None = None,
 ) -> bool:
     overlap_doc, overlap_status = find_overlapping_permission_request(
         deps.db,
         ud.get("employee_id") or "",
-        _today_ddmmy(),
+        work_date or _today_ddmmy(),
         employee_wa=sender,
     )
     if not overlap_status or not overlap_doc:
@@ -316,12 +366,17 @@ def _check_myself_overlap(
 
 
 def _check_cl_overlap(
-    sender: str, session: dict, deps: PermissionDeps, cl_name: str
+    sender: str,
+    session: dict,
+    deps: PermissionDeps,
+    cl_name: str,
+    *,
+    work_date: str | None = None,
 ) -> bool:
     overlap_doc, overlap_status = find_overlapping_cl_permission_request(
         deps.db,
         cl_name,
-        _today_ddmmy(),
+        work_date or _today_ddmmy(),
     )
     if not overlap_status or not overlap_doc:
         return False
@@ -444,15 +499,29 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         return
 
     permission_for = (session.get("permission_for") or "myself").strip().lower()
+    shift = (session.get("permission_shift") or "").strip()
+    if permission_for == "myself" and not _is_rotational_shift(ud):
+        shift = "I"
+    type_code = (
+        "PERMISSION_EARLY_OUT"
+        if permission_for == "cl"
+        else (session.get("permission_type_code") or "")
+    )
+    work_date = _compute_permission_work_date(
+        ud,
+        permission_shift=shift,
+        permission_type_code=type_code,
+        permission_for=permission_for,
+    )
     if permission_for == "cl":
         cl_name = (session.get("cl_employee_name") or "").strip()
         if not cl_name:
             deps.session_ref(sender).delete()
             deps.send_to(sender, "Employee name missing. Send Hi to start over.")
             return
-        if _check_cl_overlap(sender, session, deps, cl_name):
+        if _check_cl_overlap(sender, session, deps, cl_name, work_date=work_date):
             return
-    elif _check_myself_overlap(sender, session, deps, ud):
+    elif _check_myself_overlap(sender, session, deps, ud, work_date=work_date):
         return
 
     employee_id = ud.get("employee_id") or ""
@@ -481,9 +550,10 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         "department": ud.get("department") or session.get("department") or "",
         "type": "PERMISSION",
         "permission_for": permission_for,
-        "permission_shift": (session.get("permission_shift") or "").strip(),
+        "permission_shift": shift,
         "reason": reason,
         "permission_date": permission_date,
+        "permission_work_date": work_date,
         "permissions_last_month": perms_last_month,
         "permissions_current_month": perms_current_month,
         "jmd": chain["jmd"],

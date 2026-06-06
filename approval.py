@@ -12,6 +12,7 @@ from typing import Callable
 from bot_shared import (
     get_employee_leave_counts,
     get_employee_permission_counts,
+    get_user_record,
     wa_from_env,
 )
 
@@ -468,6 +469,21 @@ def _approval_message_body(
         )
     if req_type == "PERMISSION":
         rd = request_rd or {}
+
+        def _permission_shift_display() -> str:
+            raw = (rd.get("permission_shift") or "").strip().upper()
+            if raw in ("I", "1"):
+                return "I"
+            if raw in ("II", "2"):
+                return "II"
+            wa = (rd.get("employee") or "").strip()
+            if wa:
+                exists, ud = get_user_record(wa)
+                if exists and ud:
+                    if (ud.get("shift_type") or "GS").strip().upper() == "GS":
+                        return "I"
+            return raw or "—"
+
         perms_last = 0
         perms_curr = 0
         eid = (rd.get("employee_id") or "").strip()
@@ -486,7 +502,9 @@ def _approval_message_body(
         test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
         if (rd.get("permission_for") or "").strip().lower() == "cl":
             cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
-            shift = (rd.get("permission_shift") or "").strip() or "—"
+            shift = _permission_shift_display()
+            if shift == "—":
+                shift = (rd.get("permission_shift") or "").strip() or "—"
             return (
                 f"{test_tag}Permission approval request (CL)\n\n"
                 f"CL name: {cl_name}\n"
@@ -496,7 +514,7 @@ def _approval_message_body(
                 f"Permission type: Early OUT\n\n"
                 "Please approve or deny."
             )
-        shift = (rd.get("permission_shift") or "").strip() or "—"
+        shift = _permission_shift_display()
         return (
             f"{test_tag}Permission approval request\n\n"
             f"Name: {emp}\n"
