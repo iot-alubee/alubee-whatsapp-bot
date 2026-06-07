@@ -9,8 +9,9 @@ Deploy **only** from `Interakt/Production/`. Local dev uses parent `Interakt/` w
 | `main.py` | Webhook, menu, Cloud Run Firebase init |
 | `od_request.py` | OD flow |
 | `visitor_request.py` | Visitor flow + guest OTP |
-| `leave_request.py` | Leave flow (JMD or TEST_MD when testing) |
-| `approval.py` | JMD → MD (OD + visitor); leave final at JMD/TEST_MD |
+| `leave_request.py` | Leave flow (JMD → MD) |
+| `permission_request.py` | Permission flow (JMD → MD or PPC → HR for CL) |
+| `approval.py` | JMD → MD (OD, visitor, leave, employee permission); PPC → HR (CL permission) |
 | `approver_availability.py` | JMD/MD Online/Offline |
 | `interakt_api.py` | Interakt API (text, buttons, templates) |
 | `bot_shared.py` | Shared Firestore helpers |
@@ -65,7 +66,9 @@ Minimum:
 | `JMD_I_WHATSAPP_NUMBER` | Unit I JMD (OD + visitor) |
 | `JMD_II_WHATSAPP_NUMBER` | Unit II JMD (OD + visitor; required for Visiting to = Both) |
 | `MD_WHATSAPP_NUMBER` | Final MD (OD + visitor) |
-| `TEST_MD_WHATSAPP_NUMBER` | **Leave testing** — leave approvals go here directly (no JMD). Online/Offline only for OD/visitor |
+| `TEST_MD_WHATSAPP_NUMBER` | Legacy test leave/permission rows only (optional) |
+| `PPC_WHATSAPP_NUMBER` | CL permission — PPC approver |
+| `HR_WHATSAPP_NUMBER` | CL permission — HR approver |
 | `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |

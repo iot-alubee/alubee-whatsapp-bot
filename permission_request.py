@@ -1,5 +1,5 @@
 """
-Permission request flow — myself / CL (supervisor), shift, type, reason; TEST_MD approval.
+Permission request flow — myself / CL (supervisor), shift, type, reason; JMD/MD or PPC/HR approval.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class PermissionDeps:
     session_ref: Callable[[str], object]
     utcnow: Callable
     chat_name: Callable[[str], str]
-    build_approval_chain: Callable[[dict], dict | None]
+    build_approval_chain: Callable[..., dict | None]
     notify_jmd: Callable[[str, dict, str], bool]
     go_main_menu: Callable[[str], None]
 
@@ -526,13 +526,26 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
 
     employee_id = ud.get("employee_id") or ""
     permission_date = _today_ddmmy()
-    chain = deps.build_approval_chain(ud)
+    chain = deps.build_approval_chain(ud, permission_for=permission_for)
     if not chain or not chain.get("jmd"):
+        deps.session_ref(sender).delete()
+        if permission_for == "cl":
+            deps.send_to(
+                sender,
+                "CL permission approvers not configured.\n"
+                "Set PPC_WHATSAPP_NUMBER and HR_WHATSAPP_NUMBER, or contact admin.",
+            )
+        else:
+            deps.send_to(
+                sender,
+                "Permission approvers not configured.\nPlease contact admin.",
+            )
+        return
+    if not chain.get("md"):
         deps.session_ref(sender).delete()
         deps.send_to(
             sender,
-            "Permission approver not configured.\n"
-            "Set TEST_MD_WHATSAPP_NUMBER for testing, or contact admin.",
+            "Permission approvers not configured.\nPlease contact admin.",
         )
         return
 
@@ -558,11 +571,11 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         "permissions_current_month": perms_current_month,
         "jmd": chain["jmd"],
         "jmd_route": chain["jmd_route"],
-        "md": chain.get("md") or "",
-        "permission_test_approver": bool(chain.get("permission_test_approver")),
+        "md": chain["md"],
+        "permission_cl_chain": bool(chain.get("permission_cl_chain")),
         "manager_status": "N/A",
         "jmd_status": "PENDING",
-        "md_status": "N/A",
+        "md_status": "AWAITING_JMD",
         "source": "whatsapp_request",
     }
 
@@ -583,14 +596,12 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
     request_id = ref.id
     payload["request_id"] = request_id
     ref.set(payload)
-    test_note = " (test approver)" if chain.get("permission_test_approver") else ""
     logger.info(
-        "PERMISSION created %s for=%s jmd_route=%s date=%s%s",
+        "PERMISSION created %s for=%s jmd_route=%s date=%s",
         request_id,
         permission_for,
         chain["jmd_route"],
         permission_date,
-        test_note,
     )
 
     rd = ref.get().to_dict()
@@ -600,8 +611,9 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
     msg = "Your permission request has been submitted for approval."
     if not jmd_ok:
         route = chain["jmd_route"]
+        approver = "PPC" if permission_for == "cl" else f"JMD ({route})"
         msg += (
-            f"\n\nJMD ({route}) could not be notified on WhatsApp. "
+            f"\n\n{approver} could not be notified on WhatsApp. "
             "Ask them to send Hi to this Alubee number once, then contact admin."
         )
     deps.send_to(sender, msg)

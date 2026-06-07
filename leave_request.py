@@ -1,5 +1,5 @@
 """
-Leave request flow — when (today / tomorrow / other), dates, reason; JMD approval only.
+Leave request flow — when (today / tomorrow / other), dates, reason; JMD → MD approval.
 """
 
 from __future__ import annotations
@@ -472,12 +472,11 @@ def _submit(
 
     employee_id = ud.get("employee_id") or ""
     chain = deps.build_approval_chain(ud)
-    if not chain or not chain.get("jmd"):
+    if not chain or not chain.get("jmd") or not chain.get("md"):
         deps.session_ref(sender).delete()
         deps.send_to(
             sender,
-            "Leave approver not configured.\n"
-            "Set TEST_MD_WHATSAPP_NUMBER for testing, or contact admin.",
+            "Leave approvers not configured.\nPlease contact admin.",
         )
         return
 
@@ -508,20 +507,17 @@ def _submit(
         "leaves_current_month": leaves_current_month,
         "jmd": chain["jmd"],
         "jmd_route": chain["jmd_route"],
-        "md": chain.get("md") or "",
-        "leave_test_approver": bool(chain.get("leave_test_approver")),
+        "md": chain["md"],
         "manager_status": "N/A",
         "jmd_status": "PENDING",
-        "md_status": "N/A",
+        "md_status": "AWAITING_JMD",
         "source": "whatsapp_request",
     })
-    test_note = " (test approver)" if chain.get("leave_test_approver") else ""
     logger.info(
-        "LEAVE created %s jmd_route=%s days=%s%s",
+        "LEAVE created %s jmd_route=%s days=%s",
         request_id,
         chain["jmd_route"],
         days,
-        test_note,
     )
 
     rd = ref.get().to_dict()

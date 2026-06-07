@@ -10,8 +10,9 @@ Do **not** bake secrets into the Docker image. The container does not read a `.e
 |--------------|--------------|
 | **OD** (menu option 1) | `JMD_I_WHATSAPP_NUMBER`, `JMD_II_WHATSAPP_NUMBER`, `MD_WHATSAPP_NUMBER` |
 | **Visitor** (menu option 5) | **Same** JMD I / JMD II / MD as OD |
-| **Leave** (menu option 3) | `TEST_MD_WHATSAPP_NUMBER` only (testing, no JMD) |
-| **Permission** (menu option 4) | `TEST_MD_WHATSAPP_NUMBER` only (testing, no JMD) |
+| **Leave** (menu option 3) | JMD → MD (same as OD) |
+| **Permission — employee** (menu option 4, For Myself) | JMD → MD (same as OD) |
+| **Permission — CL** (supervisor, For CL) | `PPC_WHATSAPP_NUMBER` → `HR_WHATSAPP_NUMBER` |
 
 You do **not** need separate `VISITOR_JMD_*` or `VISITOR_MD_*` variables in production. Remove them from Cloud Run if still set (they are ignored).
 
@@ -32,6 +33,8 @@ Optional: `VISITOR_ROUTE_BY_UNIT=true` — Unit II employees (`jmd_route` JMD2) 
 | `JMD_I_WHATSAPP_NUMBER` | Unit I JMD |
 | `JMD_II_WHATSAPP_NUMBER` | Unit II JMD |
 | `MD_WHATSAPP_NUMBER` | Final MD |
+| `PPC_WHATSAPP_NUMBER` | CL permission — first approver (PPC) |
+| `HR_WHATSAPP_NUMBER` | CL permission — final approver (HR) |
 | `VISITOR_OTP_TEMPLATE_NAME` | `visitor_pass_code` |
 | `VISITOR_OTP_TEMPLATE_LANGUAGE_CODE` | `en` |
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
@@ -42,7 +45,9 @@ Optional: `VISITOR_ROUTE_BY_UNIT=true` — Unit II employees (`jmd_route` JMD2) 
 | Name | Default | Purpose |
 |------|---------|---------|
 | `WHATSAPP_SESSION_HOURS` | `24` | Approver must message Alubee within this window for Approve/Deny buttons |
-| `TEST_MD_WHATSAPP_NUMBER` | — | **Required for leave + permission** — approvals go here directly (no JMD). Online/Offline only for OD/visitor |
+| `TEST_MD_WHATSAPP_NUMBER` | — | Legacy only — old leave/permission test rows in Firestore |
+| `PPC_WHATSAPP_NUMBER` | — | **Required for CL permission** (with HR) |
+| `HR_WHATSAPP_NUMBER` | — | **Required for CL permission** (with PPC) |
 | `VISITOR_ROUTE_BY_UNIT` | `false` | `true` = Unit II employees use `JMD_II` for visitor routing |
 | `VISITOR_TEST_*` | — | **Pilot only** — alternate JMD/MD for listed test employees |
 

@@ -84,6 +84,8 @@ class ApprovalDeps:
     visitor_test_jmd_ii: str = ""
     visitor_test_md: str = ""
     visitor_test_employee_wa_ids: frozenset[str] = frozenset()
+    ppc: str = ""
+    hr: str = ""
 
 
 _deps: ApprovalDeps | None = None
@@ -339,43 +341,40 @@ def build_approval_chain(
 
 
 def build_leave_approval_chain(user_data: dict | None = None) -> dict | None:
+    """Leave: same JMD → MD chain as OD."""
+    return build_approval_chain(user_data, request_type="LEAVE")
+
+
+def build_permission_approval_chain(
+    user_data: dict | None = None,
+    *,
+    permission_for: str = "myself",
+) -> dict | None:
     """
-    Leave approval chain — TEST_MD only while testing (no JMD).
-    Requires TEST_MD_WHATSAPP_NUMBER in env.
+    Employee permission (myself): JMD → MD (same as OD).
+    CL permission: PPC → HR (no online/offline for PPC/HR).
     """
     if not user_data:
         return None
-    d = _require()
-    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
-    test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
-    if not test_md:
-        return None
-    return {
-        "jmd": test_md,
-        "jmd_route": jmd_route,
-        "md": "",
-        "leave_test_approver": True,
-    }
-
-
-def build_permission_approval_chain(user_data: dict | None = None) -> dict | None:
-    """
-    Permission approval chain — TEST_MD only while testing (no JMD).
-    Requires TEST_MD_WHATSAPP_NUMBER in env.
-    """
-    if not user_data:
-        return None
-    d = _require()
-    jmd_route = (user_data.get("jmd_route") or "JMD1").strip().upper()
-    test_md = (wa_from_env("TEST_MD_WHATSAPP_NUMBER") or d.test_md or "").strip()
-    if not test_md:
-        return None
-    return {
-        "jmd": test_md,
-        "jmd_route": jmd_route,
-        "md": "",
-        "permission_test_approver": True,
-    }
+    pf = (permission_for or "myself").strip().lower()
+    if pf == "cl":
+        d = _require()
+        ppc = (wa_from_env("PPC_WHATSAPP_NUMBER") or d.ppc or "").strip()
+        hr = (wa_from_env("HR_WHATSAPP_NUMBER") or d.hr or "").strip()
+        if not ppc or not hr:
+            logger.error(
+                "CL permission approvers missing ppc=%r hr=%r",
+                ppc or "(missing)",
+                hr or "(missing)",
+            )
+            return None
+        return {
+            "jmd": ppc,
+            "jmd_route": "PPC",
+            "md": hr,
+            "permission_cl_chain": True,
+        }
+    return build_approval_chain(user_data, request_type="PERMISSION")
 
 
 def _approval_message_body(
@@ -503,8 +502,6 @@ def _approval_message_body(
         if (rd.get("permission_for") or "").strip().lower() == "cl":
             cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
             shift = _permission_shift_display()
-            if shift == "—":
-                shift = (rd.get("permission_shift") or "").strip() or "—"
             return (
                 f"{test_tag}Permission approval request (CL)\n\n"
                 f"CL name: {cl_name}\n"
@@ -752,7 +749,7 @@ def _after_jmd_when_md_offline(
         if _visitor_jmd_fully_approved(rd_fresh):
             d.on_visitor_md_approved(ref, rd_fresh)
     else:
-        d.send_to(employee, "Your OD has been Approved.")
+        d.send_to(employee, _employee_final_approval_message(req_label))
     logger.info(
         "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
         request_id,
@@ -825,6 +822,27 @@ def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
         request_rd=rd,
     ):
         _set_pending_approval(wa_id, request_id)
+
+
+def _employee_final_approval_message(req_label: str) -> str:
+    if req_label == "leave":
+        return "Your leave request has been approved."
+    if req_label == "permission":
+        return "Your permission request has been approved."
+    if req_label == "visitor":
+        return "Your visitor request has been approved."
+    return "Your OD has been Approved."
+
+
+def _uses_legacy_test_single_approver(rd: dict) -> bool:
+    return bool(rd.get("leave_test_approver") or rd.get("permission_test_approver"))
+
+
+def _cl_permission_chain(rd: dict) -> bool:
+    return bool(rd.get("permission_cl_chain")) or (
+        (rd.get("permission_for") or "").strip().lower() == "cl"
+        and (rd.get("jmd_route") or "").strip().upper() == "PPC"
+    )
 
 
 def _request_type_label(rd: dict) -> str:
@@ -928,7 +946,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
 
     elif role == "jmd":
         req_type = (rd.get("type") or "").strip().upper()
-        if req_type in ("LEAVE", "PERMISSION"):
+        if req_type in ("LEAVE", "PERMISSION") and _uses_legacy_test_single_approver(rd):
             label = "leave" if req_type == "LEAVE" else "permission"
             if is_approve:
                 ref.update({
@@ -939,7 +957,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                     "md_status": "N/A",
                     "approved_datetime": d.utcnow(),
                 })
-                d.send_to(employee, f"Your {label} request has been approved.")
+                d.send_to(employee, _employee_final_approval_message(label))
                 logger.info("jmd approved %s (final) request_id=%s", label, request_id)
             else:
                 ref.update({
@@ -951,30 +969,46 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 logger.info("jmd denied %s request_id=%s", label, request_id)
         elif is_approve:
             md_wa = request_md_whatsapp(rd)
-            md_off = _md_is_offline_now(d, md_wa)
-            ref.update({
-                "jmd": request_jmd_whatsapp(rd),
-                "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
-                "md": md_wa,
-                "manager_status": "N/A",
-                "jmd_status": "APPROVED",
-                "md_status": _md_status_after_jmd(md_off),
-                **_md_offline_bypass_fields(d, md_off),
-            })
-            rd = ref.get().to_dict() or rd
-            if md_off:
-                _after_jmd_when_md_offline(
-                    d,
-                    ref,
-                    rd,
-                    md_wa,
-                    employee=employee,
-                    req_label=req_label,
-                    request_id=request_id,
+            if _cl_permission_chain(rd):
+                ref.update({
+                    "jmd": request_jmd_whatsapp(rd),
+                    "jmd_route": (rd.get("jmd_route") or "PPC").strip().upper(),
+                    "md": md_wa,
+                    "manager_status": "N/A",
+                    "jmd_status": "APPROVED",
+                    "md_status": "PENDING",
+                })
+                rd = ref.get().to_dict() or rd
+                notify_approver(md_wa, rd, request_id)
+                logger.info(
+                    "ppc approved CL permission request_id=%s → hr",
+                    request_id,
                 )
             else:
-                notify_approver(md_wa, rd, request_id)
-                logger.info("jmd approved request_id=%s → md", request_id)
+                md_off = _md_is_offline_now(d, md_wa)
+                ref.update({
+                    "jmd": request_jmd_whatsapp(rd),
+                    "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                    "md": md_wa,
+                    "manager_status": "N/A",
+                    "jmd_status": "APPROVED",
+                    "md_status": _md_status_after_jmd(md_off),
+                    **_md_offline_bypass_fields(d, md_off),
+                })
+                rd = ref.get().to_dict() or rd
+                if md_off:
+                    _after_jmd_when_md_offline(
+                        d,
+                        ref,
+                        rd,
+                        md_wa,
+                        employee=employee,
+                        req_label=req_label,
+                        request_id=request_id,
+                    )
+                else:
+                    notify_approver(md_wa, rd, request_id)
+                    logger.info("jmd approved request_id=%s → md", request_id)
         else:
             ref.update({
                 "manager_status": "N/A",
@@ -1001,7 +1035,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 rd_fresh = fresh.to_dict() if fresh.exists else rd
                 d.on_visitor_md_approved(ref, rd_fresh)
             else:
-                d.send_to(employee, "Your OD has been Approved.")
+                d.send_to(employee, _employee_final_approval_message(req_label))
             logger.info("md approved (final) request_id=%s", request_id)
         else:
             ref.update({

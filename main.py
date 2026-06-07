@@ -88,8 +88,10 @@ JMD_II_WHATSAPP_NUMBER = (
 MD_WHATSAPP_NUMBER = (
     os.getenv("MD_WHATSAPP_NUMBER") or _wa_from_mobile("7538866308")
 ).strip()
-# Leave testing → direct approvals; Online/Offline only for OD/visitor.
+# Optional legacy test approver (old leave/permission rows only). Not used for new requests.
 TEST_MD_WHATSAPP_NUMBER = wa_from_env("TEST_MD_WHATSAPP_NUMBER")
+PPC_WHATSAPP_NUMBER = wa_from_env("PPC_WHATSAPP_NUMBER")
+HR_WHATSAPP_NUMBER = wa_from_env("HR_WHATSAPP_NUMBER")
 
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
 
@@ -346,6 +348,8 @@ approval.configure(
         visitor_test_jmd_ii=VISITOR_TEST_JMD_II_WHATSAPP_NUMBER,
         visitor_test_md=VISITOR_TEST_MD_WHATSAPP_NUMBER,
         visitor_test_employee_wa_ids=VISITOR_TEST_EMPLOYEE_WA_IDS,
+        ppc=PPC_WHATSAPP_NUMBER,
+        hr=HR_WHATSAPP_NUMBER,
     )
 )
 logger.info(
@@ -369,6 +373,17 @@ def _build_visitor_approval_chain(
         request_type="VISITOR",
         employee_wa=employee_wa,
         visiting_to=visiting_to,
+    )
+
+
+def _build_permission_approval_chain(
+    user_data: dict | None = None,
+    *,
+    permission_for: str = "myself",
+) -> dict | None:
+    return approval.build_permission_approval_chain(
+        user_data,
+        permission_for=permission_for,
     )
 
 
@@ -417,7 +432,7 @@ PERMISSION_DEPS = permission_request.PermissionDeps(
     session_ref=_session_ref,
     utcnow=_utcnow,
     chat_name=_chat_name,
-    build_approval_chain=approval.build_permission_approval_chain,
+    build_approval_chain=_build_permission_approval_chain,
     notify_jmd=approval.notify_jmd,
     go_main_menu=_go_main_menu_for_employee,
 )
