@@ -4,7 +4,9 @@ OD (out-duty) request flow — reason, company vehicle, submit; JMD → MD appro
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -51,6 +53,39 @@ class OdDeps:
 
 def is_od_state(state: str | None) -> bool:
     return (state or "") in OD_SESSION_STATES
+
+
+def od_form_configured() -> bool:
+    return bool((os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip())
+
+
+def try_start_form(sender: str, deps: OdDeps) -> None:
+    """Send WhatsApp Flow form (menu: OD - Form). Chat OD flow unchanged."""
+    if _find_open_od_for_employee(deps, sender):
+        deps.send_to(sender, deps.already_pending_msg)
+        return
+    if not od_form_configured():
+        deps.send_to(
+            sender,
+            "OD form is not configured yet.\n"
+            "Use OD Request (chat) or contact admin.",
+        )
+        return
+    from bot_shared import get_user_record
+    from interakt_api import send_od_flow_form
+
+    exists, ud = get_user_record(sender)
+    name = "Employee"
+    if exists and ud:
+        name = ud.get("name") or name
+    if send_od_flow_form(wa_id_to_phone(sender), employee_name=name):
+        deps.send_to(sender, "Tap the button above to fill your OD form.")
+        return
+    logger.warning("OD flow template send failed sender=%s", sender)
+    deps.send_to(
+        sender,
+        "Could not open OD form. Try OD Request (chat) or contact admin.",
+    )
 
 
 def try_start(sender: str, deps: OdDeps) -> None:
@@ -647,3 +682,101 @@ def _handle_back(sender: str, session: dict, deps: OdDeps) -> None:
         _go_back_from_confirm(sender, session, deps)
         return
     deps.go_main_menu(sender)
+
+
+def _flow_pick(data: dict, *needles: str) -> str:
+    if not data:
+        return ""
+    for key in needles:
+        if key in data and data[key] not in (None, ""):
+            return str(data[key]).strip()
+    for raw_key, val in data.items():
+        if val in (None, ""):
+            continue
+        lk = str(raw_key).lower()
+        for needle in needles:
+            if needle.lower() in lk:
+                return str(val).strip()
+    return ""
+
+
+def _resolve_od_reason_from_flow(data: dict) -> str:
+    raw = _flow_pick(data, "od_reason", "reason", "visiting_to").lower().replace(" ", "_")
+    if raw in ("unit_i", "unit1", "1"):
+        return "Unit I"
+    if raw in ("unit_ii", "unit2", "2", "unitii"):
+        return "Unit II"
+    other = _flow_pick(data, "other_reason", "custom_reason", "reason_text")
+    if other and raw not in ("unit_i", "unit_ii"):
+        return other
+    if raw == "other":
+        return other or ""
+    return _flow_pick(data, "other_reason") or raw.replace("_", " ").title()
+
+
+def parse_flow_response(response_json: dict | str | None) -> dict | None:
+    """Map WhatsApp Flow submit payload to OD submit kwargs."""
+    if response_json is None:
+        return None
+    if isinstance(response_json, str):
+        try:
+            data = json.loads(response_json)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(response_json, dict):
+        data = response_json
+    else:
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+
+    reason = _resolve_od_reason_from_flow(data)
+    if not reason:
+        return None
+
+    cv_raw = _flow_pick(data, "company_vehicle", "uses_company_vehicle").lower()
+    uses_cv = cv_raw in ("yes", "y", "true", "1")
+
+    vehicle_id = ""
+    if uses_cv:
+        vehicle_id = _flow_pick(data, "vehicle", "company_vehicle_id", "vehicle_id").upper()
+        if not vehicle_id:
+            return None
+
+    return {
+        "reason": reason,
+        "uses_company_vehicle": uses_cv,
+        "company_vehicle_id": vehicle_id,
+    }
+
+
+def handle_flow_submission(
+    sender: str, response_json: dict | str | None, deps: OdDeps
+) -> None:
+    parsed = parse_flow_response(response_json)
+    if not parsed:
+        deps.send_to(sender, "Could not read the OD form. Please try again or contact admin.")
+        return
+
+    uses_cv = bool(parsed.get("uses_company_vehicle"))
+    vehicle_id = (parsed.get("company_vehicle_id") or "").strip().upper()
+    company_vehicle = ""
+    company_vehicle_description = ""
+    if uses_cv and vehicle_id:
+        snap = deps.db.collection("vehicles").document(vehicle_id).get()
+        if not snap.exists:
+            deps.send_to(sender, "Selected vehicle is not available. Send Hi and try again.")
+            return
+        vd = snap.to_dict() or {}
+        company_vehicle = (vd.get("vehicle") or "").strip()
+        company_vehicle_description = (vd.get("description") or "").strip()
+
+    _submit(
+        sender,
+        parsed["reason"],
+        deps,
+        uses_company_vehicle=uses_cv,
+        company_vehicle_id=vehicle_id,
+        company_vehicle=company_vehicle,
+        company_vehicle_description=company_vehicle_description,
+    )

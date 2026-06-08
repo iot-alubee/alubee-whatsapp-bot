@@ -150,6 +150,8 @@ SESSION_APPROVER_AVAILABILITY = "APPROVER_AVAILABILITY"
 
 _ROW_IDS = {
     "od_request": "OD_REQUEST",
+    "od_form": "OD_FORM",
+    "od_-_form": "OD_FORM",
     "vehicle_request": "VEHICLE_REQUEST",
     "leave_request": "LEAVE_REQUEST",
     "permission_request": "PERMISSION_REQUEST",
@@ -460,7 +462,8 @@ def _numbered_request_menu(employee_name: str) -> str:
         "2. Vehicle Request\n"
         "3. Leave Request\n"
         "4. Permission Request\n"
-        "5. Visitor Request"
+        "5. Visitor Request\n"
+        "6. OD - Form"
     )
 
 
@@ -538,6 +541,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("leave_request", "Leave Request"),
         ("permission_request", "Permission Request"),
         ("visitor_request", "Visitor Request"),
+        ("od_form", "OD - Form"),
     )
     try:
         send_list_menu(
@@ -566,6 +570,8 @@ def _normalize_choice(raw: str) -> str:
         return key.upper()
     titles = {
         "od request": "OD_REQUEST",
+        "od - form": "OD_FORM",
+        "od form": "OD_FORM",
         "vehicle request": "VEHICLE_REQUEST",
         "leave request": "LEAVE_REQUEST",
         "permission request": "PERMISSION_REQUEST",
@@ -606,6 +612,59 @@ def _extract_message(message_field) -> str:
         except json.JSONDecodeError:
             pass
     return raw
+
+
+def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
+    """Extract nfm_reply.response_json from Interakt flow submit webhooks."""
+    raw_msg = msg_obj.get("message")
+    if not isinstance(raw_msg, dict):
+        return None
+    if raw_msg.get("type") != "nfm_reply":
+        return None
+    nfm = raw_msg.get("nfm_reply") or {}
+    response = nfm.get("response_json")
+    if response is None:
+        return None
+    if isinstance(response, str):
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return response
+    return response
+
+
+def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
+    """Return (wa_id, response_json, flow_kind) for completed WhatsApp Flow submits."""
+    wtype = (body.get("type") or "").strip().lower()
+    if wtype not in ("message_received", "message_api_flow_response"):
+        return None
+
+    data = body.get("data") or {}
+    customer = data.get("customer") or {}
+    msg_obj = data.get("message") or {}
+
+    phone = str(customer.get("phone_number") or "")
+    if not phone:
+        phone = str(customer.get("channel_phone_number") or "")
+    if not phone:
+        return None
+
+    response = _flow_response_from_message(msg_obj)
+    if response is None and wtype == "message_api_flow_response":
+        response = data.get("response_json") or msg_obj.get("response_json")
+    if response is None:
+        return None
+
+    callback = (
+        (body.get("callbackData") or data.get("callbackData") or "")
+        .strip()
+        .lower()
+    )
+    if not callback and isinstance(response, dict):
+        keys = {str(k).lower() for k in response.keys()}
+        if keys & {"od_reason", "company_vehicle", "vehicle"}:
+            callback = "od-flow"
+    return phone_to_wa_id(phone), response, callback or "flow"
 
 
 def _parse_webhook(body: dict) -> tuple[str, str] | None:
@@ -709,6 +768,13 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
+    if incoming in ("6", "OD_FORM"):
+        if state == SESSION_MENU_IDLE:
+            od_request.try_start_form(sender, OD_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
     if incoming == "3" or incoming == "LEAVE_REQUEST":
         if state == SESSION_MENU_IDLE:
             leave_request.try_start(sender, LEAVE_DEPS)
@@ -767,6 +833,8 @@ def health():
         "visitor_otp_template": (
             (os.getenv("VISITOR_OTP_TEMPLATE_NAME") or "visitor_pass_code").strip()
         ),
+        "od_form_configured": od_request.od_form_configured(),
+        "od_flow_template": (os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip(),
     }
 
 
@@ -775,6 +843,25 @@ def health():
 async def webhook(request: Request):
     body = await request.json()
     logger.info("webhook: %s", json.dumps(body, default=str)[:2500])
+
+    flow_parsed = _parse_flow_webhook(body)
+    if flow_parsed:
+        sender, response_json, flow_kind = flow_parsed
+        if flow_kind in ("od-flow", "od_form", "od", "flow"):
+            try:
+                od_request.handle_flow_submission(sender, response_json, OD_DEPS)
+            except Exception:
+                logger.exception("OD flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your OD form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after OD flow error")
+        else:
+            logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
+        return {"status": "success"}
 
     parsed = _parse_webhook(body)
     if parsed:
