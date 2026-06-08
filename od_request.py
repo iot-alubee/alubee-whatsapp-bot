@@ -88,7 +88,6 @@ def try_start_form(sender: str, deps: OdDeps) -> None:
     if exists and ud:
         name = ud.get("name") or name
     if send_od_flow_form(wa_id_to_phone(sender), employee_name=name):
-        deps.send_to(sender, "Tap the button above to fill your OD form.")
         return
     logger.warning("OD flow template send failed sender=%s", sender)
     deps.send_to(

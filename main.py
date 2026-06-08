@@ -580,8 +580,89 @@ def _normalize_choice(raw: str) -> str:
     return titles.get(s.lower(), s)
 
 
+def _coerce_flow_response(response) -> dict | str | None:
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        return response if response else None
+    if isinstance(response, str):
+        text = response.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else text
+        except json.JSONDecodeError:
+            return text
+    return None
+
+
+def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
+    """Walk Interakt webhook JSON for flow submit payload (shape varies by event)."""
+    if depth > 10:
+        return None
+    if isinstance(obj, dict):
+        if obj.get("type") == "nfm_reply":
+            nfm = obj.get("nfm_reply") or {}
+            found = _coerce_flow_response(
+                nfm.get("response_json") or nfm.get("response") or nfm.get("body")
+            )
+            if found:
+                return found
+        for key in ("response_json", "response", "flow_response", "body"):
+            if key in obj:
+                found = _coerce_flow_response(obj[key])
+                if found:
+                    return found
+        for value in obj.values():
+            found = _deep_find_flow_response(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _deep_find_flow_response(item, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _flow_callback_kind(body: dict) -> str:
+    data = body.get("data") or {}
+    callback = (
+        (body.get("callbackData") or data.get("callbackData") or "")
+        .strip()
+        .lower()
+    )
+    if callback in ("od-flow", "od_form", "od"):
+        return "od-flow"
+    if callback in ("visitor-flow", "visitor_form", "visitor"):
+        return "visitor-flow"
+    return callback
+
+
+def _is_flow_reply_webhook(body: dict) -> bool:
+    wtype = (body.get("type") or "").strip().lower()
+    if wtype == "message_api_flow_response":
+        return True
+    if _flow_callback_kind(body) in ("od-flow", "visitor-flow"):
+        return True
+    data = body.get("data") or {}
+    msg_obj = data.get("message") or {}
+    raw_msg = msg_obj.get("message")
+    if isinstance(raw_msg, dict) and raw_msg.get("type") == "nfm_reply":
+        return True
+    content_type = (msg_obj.get("message_content_type") or "").strip().lower()
+    if content_type in ("interactiveflowreply", "flow", "nfm_reply"):
+        return True
+    if _deep_find_flow_response(body):
+        return True
+    return False
+
+
 def _extract_message(message_field) -> str:
     if isinstance(message_field, dict):
+        if message_field.get("type") == "nfm_reply":
+            return ""
         if message_field.get("type") == "list_reply":
             lr = message_field.get("list_reply") or {}
             if lr.get("id"):
@@ -622,15 +703,9 @@ def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
     if raw_msg.get("type") != "nfm_reply":
         return None
     nfm = raw_msg.get("nfm_reply") or {}
-    response = nfm.get("response_json")
-    if response is None:
-        return None
-    if isinstance(response, str):
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return response
-    return response
+    return _coerce_flow_response(
+        nfm.get("response_json") or nfm.get("response") or nfm.get("payload")
+    )
 
 
 def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
@@ -650,20 +725,26 @@ def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
         return None
 
     response = _flow_response_from_message(msg_obj)
+    if response is None:
+        response = _coerce_flow_response(data.get("response_json"))
+    if response is None:
+        response = _coerce_flow_response(msg_obj.get("response_json"))
     if response is None and wtype == "message_api_flow_response":
-        response = data.get("response_json") or msg_obj.get("response_json")
+        response = _coerce_flow_response(
+            data.get("flow_response") or msg_obj.get("flow_response")
+        )
+    if response is None:
+        response = _deep_find_flow_response(body)
     if response is None:
         return None
 
-    callback = (
-        (body.get("callbackData") or data.get("callbackData") or "")
-        .strip()
-        .lower()
-    )
+    callback = _flow_callback_kind(body)
     if not callback and isinstance(response, dict):
         keys = {str(k).lower() for k in response.keys()}
         if keys & {"od_reason", "company_vehicle", "vehicle"}:
             callback = "od-flow"
+        elif keys & {"coming_on", "coming_from", "purpose", "visitor_name"}:
+            callback = "visitor-flow"
     return phone_to_wa_id(phone), response, callback or "flow"
 
 
@@ -682,6 +763,8 @@ def _parse_webhook(body: dict) -> tuple[str, str] | None:
 
     wa_id = phone_to_wa_id(phone)
     raw_msg = msg_obj.get("message")
+    if isinstance(raw_msg, dict) and raw_msg.get("type") == "nfm_reply":
+        return None
     incoming = _normalize_choice(_extract_message(raw_msg))
     logger.info(
         "parsed incoming=%s content_type=%s",
@@ -800,6 +883,9 @@ def _process(sender: str, incoming: str) -> None:
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
+    if not incoming.strip():
+        return
+
     if session_doc.exists:
         _send_to(sender, "Invalid session state")
         return
@@ -861,6 +947,13 @@ async def webhook(request: Request):
                     logger.exception("could not notify user after OD flow error")
         else:
             logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
+        return {"status": "success"}
+
+    if _is_flow_reply_webhook(body):
+        logger.warning(
+            "flow reply webhook not parsed; skipping chat handler keys=%s",
+            list((body.get("data") or {}).keys()),
+        )
         return {"status": "success"}
 
     parsed = _parse_webhook(body)
