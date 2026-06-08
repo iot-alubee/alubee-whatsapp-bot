@@ -597,9 +597,36 @@ def _coerce_flow_response(response) -> dict | str | None:
     return None
 
 
+def _as_dict_maybe(value) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _flow_response_from_interactive(reply) -> dict | str | None:
+    block = _as_dict_maybe(reply) or {}
+    if not block:
+        return None
+    return _coerce_flow_response(
+        block.get("response_json")
+        or block.get("response")
+        or block.get("payload")
+        or block.get("body")
+    )
+
+
 def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
     """Walk Interakt webhook JSON for flow submit payload (shape varies by event)."""
-    if depth > 10:
+    if depth > 12:
         return None
     if isinstance(obj, dict):
         if obj.get("type") == "nfm_reply":
@@ -609,10 +636,13 @@ def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
             )
             if found:
                 return found
+        found = _flow_response_from_interactive(obj.get("interactive_flow_reply"))
+        if found:
+            return found
         for key in ("response_json", "response", "flow_response", "body"):
             if key in obj:
                 found = _coerce_flow_response(obj[key])
-                if found:
+                if found and _looks_like_flow_payload(found):
                     return found
         for value in obj.values():
             found = _deep_find_flow_response(value, depth + 1)
@@ -623,7 +653,31 @@ def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
             found = _deep_find_flow_response(item, depth + 1)
             if found:
                 return found
+    elif isinstance(obj, str):
+        nested = _as_dict_maybe(obj)
+        if nested:
+            found = _deep_find_flow_response(nested, depth + 1)
+            if found:
+                return found
     return None
+
+
+def _looks_like_flow_payload(payload) -> bool:
+    if not isinstance(payload, dict):
+        return bool(payload)
+    keys = {str(k).lower() for k in payload.keys()}
+    return bool(
+        keys
+        & {
+            "od_reason",
+            "company_vehicle",
+            "vehicle",
+            "coming_on",
+            "coming_from",
+            "purpose",
+            "visitor_name",
+        }
+    )
 
 
 def _flow_callback_kind(body: dict) -> str:
@@ -648,8 +702,10 @@ def _is_flow_reply_webhook(body: dict) -> bool:
         return True
     data = body.get("data") or {}
     msg_obj = data.get("message") or {}
-    raw_msg = msg_obj.get("message")
-    if isinstance(raw_msg, dict) and raw_msg.get("type") == "nfm_reply":
+    raw_msg = _as_dict_maybe(msg_obj.get("message")) or {}
+    if raw_msg.get("type") == "nfm_reply":
+        return True
+    if raw_msg.get("interactive_flow_reply") or msg_obj.get("interactive_flow_reply"):
         return True
     content_type = (msg_obj.get("message_content_type") or "").strip().lower()
     if content_type in ("interactiveflowreply", "flow", "nfm_reply"):
@@ -659,7 +715,19 @@ def _is_flow_reply_webhook(body: dict) -> bool:
     return False
 
 
+def _is_interactive_flow_message(message_field) -> bool:
+    block = _as_dict_maybe(message_field)
+    if not block:
+        return False
+    return bool(block.get("interactive_flow_reply")) or block.get("type") in (
+        "nfm_reply",
+        "interactive",
+    )
+
+
 def _extract_message(message_field) -> str:
+    if _is_interactive_flow_message(message_field):
+        return ""
     if isinstance(message_field, dict):
         if message_field.get("type") == "nfm_reply":
             return ""
@@ -696,16 +764,25 @@ def _extract_message(message_field) -> str:
 
 
 def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
-    """Extract nfm_reply.response_json from Interakt flow submit webhooks."""
-    raw_msg = msg_obj.get("message")
-    if not isinstance(raw_msg, dict):
+    """Extract flow submit payload from Interakt message_received webhooks."""
+    found = _flow_response_from_interactive(msg_obj.get("interactive_flow_reply"))
+    if found:
+        return found
+
+    raw_msg = _as_dict_maybe(msg_obj.get("message"))
+    if not raw_msg:
         return None
-    if raw_msg.get("type") != "nfm_reply":
-        return None
-    nfm = raw_msg.get("nfm_reply") or {}
-    return _coerce_flow_response(
-        nfm.get("response_json") or nfm.get("response") or nfm.get("payload")
-    )
+
+    found = _flow_response_from_interactive(raw_msg.get("interactive_flow_reply"))
+    if found:
+        return found
+
+    if raw_msg.get("type") == "nfm_reply":
+        nfm = raw_msg.get("nfm_reply") or {}
+        return _coerce_flow_response(
+            nfm.get("response_json") or nfm.get("response") or nfm.get("payload")
+        )
+    return None
 
 
 def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
@@ -763,7 +840,7 @@ def _parse_webhook(body: dict) -> tuple[str, str] | None:
 
     wa_id = phone_to_wa_id(phone)
     raw_msg = msg_obj.get("message")
-    if isinstance(raw_msg, dict) and raw_msg.get("type") == "nfm_reply":
+    if _is_interactive_flow_message(raw_msg):
         return None
     incoming = _normalize_choice(_extract_message(raw_msg))
     logger.info(
@@ -933,6 +1010,12 @@ async def webhook(request: Request):
     flow_parsed = _parse_flow_webhook(body)
     if flow_parsed:
         sender, response_json, flow_kind = flow_parsed
+        logger.info(
+            "flow submit parsed sender=%s kind=%s keys=%s",
+            sender,
+            flow_kind,
+            list(response_json.keys()) if isinstance(response_json, dict) else type(response_json).__name__,
+        )
         if flow_kind in ("od-flow", "od_form", "od", "flow"):
             try:
                 od_request.handle_flow_submission(sender, response_json, OD_DEPS)
