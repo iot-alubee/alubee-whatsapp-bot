@@ -834,7 +834,7 @@ def health():
             (os.getenv("VISITOR_OTP_TEMPLATE_NAME") or "visitor_pass_code").strip()
         ),
         "od_form_configured": od_request.od_form_configured(),
-        "od_flow_template": (os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip(),
+        "od_flow_template": od_request.od_flow_template_name(),
     }
 
 

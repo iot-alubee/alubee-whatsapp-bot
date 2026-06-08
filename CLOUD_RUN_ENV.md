@@ -40,6 +40,16 @@ Optional: `VISITOR_ROUTE_BY_UNIT=true` — Unit II employees (`jmd_route` JMD2) 
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
 | `VISITOR_OTP_TEMPLATE_AUTH_BUTTON` | `true` |
 
+## Optional — OD WhatsApp Form (menu option 6, test)
+
+Chat **OD Request** (option 1) does not use these. Defaults work without setting env:
+
+| Name | Default | Purpose |
+|------|---------|---------|
+| `OD_FLOW_TEMPLATE_NAME` | `od_request` | **Interakt template name** (not Meta Flow ID) |
+| `OD_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` | Template language |
+| `OD_FLOW_TEMPLATE_BODY_FIELDS` | *(empty)* | Only if template body has `{{1}}` etc. |
+
 ## Optional
 
 | Name | Default | Purpose |

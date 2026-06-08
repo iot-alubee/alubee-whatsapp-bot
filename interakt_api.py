@@ -478,17 +478,24 @@ def send_od_flow_form(
     employee_name: str = "",
     body_values: list[str] | None = None,
 ) -> bool:
-    """Send OD WhatsApp Form template (env OD_FLOW_TEMPLATE_NAME)."""
-    template_name = (os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip()
+    """Send OD WhatsApp Form template (env OD_FLOW_TEMPLATE_NAME, default od_request)."""
+    template_name = (
+        os.getenv("OD_FLOW_TEMPLATE_NAME")
+        or os.getenv("OD_FLOW_TEMPLATE_DEFAULT")
+        or "od_request"
+    ).strip()
     if not template_name:
-        logger.warning("OD_FLOW_TEMPLATE_NAME not set — cannot send OD form")
+        logger.warning("OD flow template name empty — cannot send OD form")
         return False
     lang = (os.getenv("OD_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
     if body_values is None:
-        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
-        keys = [k.strip() for k in spec.split(",") if k.strip()]
-        vals = {"name": (employee_name or "Employee")[:50]}
-        body_values = [str(vals.get(k, ""))[:1024] for k in keys]
+        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "").strip()
+        if spec:
+            keys = [k.strip() for k in spec.split(",") if k.strip()]
+            vals = {"name": (employee_name or "Employee")[:50]}
+            body_values = [str(vals.get(k, ""))[:1024] for k in keys]
+        else:
+            body_values = None
     try:
         send_flow_template(
             phone,

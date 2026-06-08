@@ -21,6 +21,7 @@ from interakt_api import send_list_menu, send_reply_buttons, wa_id_to_phone
 logger = logging.getLogger(__name__)
 
 OD_ALREADY_PENDING_MSG = "Your OD request is already pending."
+OD_FLOW_TEMPLATE_DEFAULT = "od_request"
 
 OD_SESSION_STATES = frozenset({
     "WAITING_OD_REASON_PICK",
@@ -55,8 +56,16 @@ def is_od_state(state: str | None) -> bool:
     return (state or "") in OD_SESSION_STATES
 
 
+def od_flow_template_name() -> str:
+    return (
+        os.getenv("OD_FLOW_TEMPLATE_NAME")
+        or os.getenv("OD_FLOW_TEMPLATE_DEFAULT")  # Cloud Run typo alias
+        or OD_FLOW_TEMPLATE_DEFAULT
+    ).strip()
+
+
 def od_form_configured() -> bool:
-    return bool((os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip())
+    return bool(od_flow_template_name())
 
 
 def try_start_form(sender: str, deps: OdDeps) -> None:
