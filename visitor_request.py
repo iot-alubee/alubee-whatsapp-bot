@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 from datetime import date, datetime
 from dataclasses import dataclass
@@ -208,8 +209,40 @@ def send_otps_after_md_approve(ref, rd: dict, send_to: Callable[[str, str], None
     return otp
 
 
+def visitor_flow_template_name() -> str:
+    return (os.getenv("VISITOR_FLOW_TEMPLATE_NAME") or "").strip()
+
+
 def visitor_flow_enabled() -> bool:
-    return False
+    return bool(visitor_flow_template_name())
+
+
+def try_start_form(sender: str, deps: VisitorDeps) -> None:
+    """Send WhatsApp Flow form (menu: Visitor - Form). Chat visitor flow unchanged."""
+    if find_open_request(sender, "VISITOR"):
+        deps.send_to(sender, deps.already_pending_msg)
+        return
+    if not visitor_flow_enabled():
+        deps.send_to(
+            sender,
+            "Visitor form is not configured yet.\n"
+            "Use Visitor Request (chat) or contact admin.",
+        )
+        return
+    from bot_shared import get_user_record
+    from interakt_api import send_visitor_flow_form
+
+    exists, ud = get_user_record(sender)
+    name = "Employee"
+    if exists and ud:
+        name = ud.get("name") or name
+    if send_visitor_flow_form(wa_id_to_phone(sender), employee_name=name):
+        return
+    logger.warning("visitor flow template send failed sender=%s", sender)
+    deps.send_to(
+        sender,
+        "Could not open visitor form. Try Visitor Request (chat) or contact admin.",
+    )
 
 
 def try_start(sender: str, deps: VisitorDeps) -> None:
@@ -713,32 +746,34 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     )
     coming_from = _flow_pick(data, "coming_from", "comingfrom")
     purpose_raw = _flow_pick(data, "purpose", "purpose_of_visit", "visit_purpose").lower()
+    if not purpose_raw:
+        return None
     other_purpose = _flow_pick(
         data, "other_purpose", "enter_purpose", "purpose_other", "fill_purpose", "other"
     )
 
-    if "customer" in purpose_raw or purpose_raw in ("customer_visit", "customer"):
+    if purpose_raw in ("customer_visit", "customer") or "customer" in purpose_raw:
         purpose = PURPOSE_CUSTOMER
         purpose_label = PURPOSE_LABELS[PURPOSE_CUSTOMER]
         purpose_detail = ""
-    elif "other" in purpose_raw or other_purpose:
+    elif purpose_raw == "other" or "other" in purpose_raw:
+        if not other_purpose:
+            return None
         purpose = PURPOSE_OTHER
-        purpose_label = other_purpose or PURPOSE_LABELS[PURPOSE_OTHER]
+        purpose_label = other_purpose
         purpose_detail = other_purpose
     else:
-        purpose = PURPOSE_CUSTOMER
-        purpose_label = PURPOSE_LABELS[PURPOSE_CUSTOMER]
-        purpose_detail = ""
+        return None
 
     count_raw = _flow_pick(data, "no_of_people", "people_count", "number_of_people")
-    if count_raw:
-        try:
-            count = int(digits(count_raw) or count_raw)
-        except (TypeError, ValueError):
-            count = VISITOR_MIN_PEOPLE
-    else:
-        count = VISITOR_MIN_PEOPLE  # form may omit "No of people" (defaults to 1)
-    count = max(VISITOR_MIN_PEOPLE, min(VISITOR_MAX_PEOPLE, count))
+    if not count_raw:
+        return None
+    try:
+        count = int(digits(count_raw) or count_raw)
+    except (TypeError, ValueError):
+        return None
+    if not (VISITOR_MIN_PEOPLE <= count <= VISITOR_MAX_PEOPLE):
+        return None
 
     name_raw = _flow_pick(
         data, "visitor_name", "name_of_visitor", "visitor_names", "name"
@@ -757,6 +792,18 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     if not coming_on or not coming_from:
         return None
 
+    visiting_to_raw = _flow_pick(data, "visiting_to", "visit_unit").lower().replace(" ", "_")
+    visiting_map = {
+        "unit_i": VISITING_UNIT_I,
+        "unit_ii": VISITING_UNIT_II,
+        "both": VISITING_BOTH,
+        "unit1": VISITING_UNIT_I,
+        "unit2": VISITING_UNIT_II,
+    }
+    visiting_to = visiting_map.get(visiting_to_raw, "")
+    if not visiting_to:
+        return None
+
     return {
         "coming_on_date": coming_on,
         "coming_from": coming_from,
@@ -768,6 +815,8 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         "people_count": count,
         "visitor_names": names,
         "guest_phone": guest_phone,
+        "visiting_to": visiting_to,
+        "visiting_to_label": _visiting_to_label(visiting_to),
     }
 
 
@@ -776,7 +825,7 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
     if not parsed:
         deps.send_to(sender, "Could not read the form. Please submit again or contact admin.")
         return
-    _submit_payload(sender, parsed, deps)
+    _submit_payload(sender, parsed, deps, submission_source="whatsapp_flow")
 
 
 def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
@@ -803,7 +852,9 @@ def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
     _submit_payload(sender, payload, deps)
 
 
-def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
+def _submit_payload(
+    sender: str, data: dict, deps: VisitorDeps, *, submission_source: str = "chat"
+) -> None:
     if find_open_request(sender, "VISITOR"):
         deps.clear_session(sender)
         deps.send_to(sender, deps.already_pending_msg)
@@ -891,7 +942,7 @@ def _submit_payload(sender: str, data: dict, deps: VisitorDeps) -> None:
         "organization": coming_from,
         "guest_phone": guest_phone,
         "guest_whatsapp": guest_wa,
-        "submission_source": "chat",
+        "submission_source": submission_source,
         "visiting_to": visiting_to,
         "visiting_to_label": visiting_to_label,
         "employee_jmd_route": chain.get("employee_jmd_route")

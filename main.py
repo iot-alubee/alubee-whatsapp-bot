@@ -156,6 +156,8 @@ _ROW_IDS = {
     "leave_request": "LEAVE_REQUEST",
     "permission_request": "PERMISSION_REQUEST",
     "visitor_request": "VISITOR_REQUEST",
+    "visitor_form": "VISITOR_FORM",
+    "visitor_-_form": "VISITOR_FORM",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -463,7 +465,8 @@ def _numbered_request_menu(employee_name: str) -> str:
         "3. Leave Request\n"
         "4. Permission Request\n"
         "5. Visitor Request\n"
-        "6. OD - Form"
+        "6. OD - Form\n"
+        "7. Visitor - Form"
     )
 
 
@@ -542,6 +545,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("permission_request", "Permission Request"),
         ("visitor_request", "Visitor Request"),
         ("od_form", "OD - Form"),
+        ("visitor_form", "Visitor - Form"),
     )
     try:
         send_list_menu(
@@ -576,6 +580,8 @@ def _normalize_choice(raw: str) -> str:
         "leave request": "LEAVE_REQUEST",
         "permission request": "PERMISSION_REQUEST",
         "visitor request": "VISITOR_REQUEST",
+        "visitor - form": "VISITOR_FORM",
+        "visitor form": "VISITOR_FORM",
     }
     return titles.get(s.lower(), s)
 
@@ -935,6 +941,13 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
+    if incoming in ("7", "VISITOR_FORM"):
+        if state == SESSION_MENU_IDLE:
+            visitor_request.try_start_form(sender, VISITOR_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
     if incoming == "3" or incoming == "LEAVE_REQUEST":
         if state == SESSION_MENU_IDLE:
             leave_request.try_start(sender, LEAVE_DEPS)
@@ -998,6 +1011,8 @@ def health():
         ),
         "od_form_configured": od_request.od_form_configured(),
         "od_flow_template": od_request.od_flow_template_name(),
+        "visitor_form_configured": visitor_request.visitor_flow_enabled(),
+        "visitor_flow_template": visitor_request.visitor_flow_template_name(),
     }
 
 
@@ -1016,7 +1031,7 @@ async def webhook(request: Request):
             flow_kind,
             list(response_json.keys()) if isinstance(response_json, dict) else type(response_json).__name__,
         )
-        if flow_kind in ("od-flow", "od_form", "od", "flow"):
+        if flow_kind in ("od-flow", "od_form", "od"):
             try:
                 od_request.handle_flow_submission(sender, response_json, OD_DEPS)
             except Exception:
@@ -1028,6 +1043,32 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("could not notify user after OD flow error")
+        elif flow_kind in ("visitor-flow", "visitor_form", "visitor"):
+            try:
+                visitor_request.handle_flow_submission(sender, response_json, VISITOR_DEPS)
+            except Exception:
+                logger.exception("visitor flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your visitor form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after visitor flow error")
+        elif flow_kind == "flow" and isinstance(response_json, dict):
+            keys = {str(k).lower() for k in response_json.keys()}
+            if keys & {"od_reason", "company_vehicle", "vehicle"}:
+                try:
+                    od_request.handle_flow_submission(sender, response_json, OD_DEPS)
+                except Exception:
+                    logger.exception("OD flow submit failed sender=%s", sender)
+            elif keys & {"coming_on", "coming_from", "visitor_name", "visitor_mobile"}:
+                try:
+                    visitor_request.handle_flow_submission(sender, response_json, VISITOR_DEPS)
+                except Exception:
+                    logger.exception("visitor flow submit failed sender=%s", sender)
+            else:
+                logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
         else:
             logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
         return {"status": "success"}
