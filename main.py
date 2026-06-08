@@ -464,15 +464,10 @@ def _numbered_request_menu(employee_name: str) -> str:
     return (
         f"Welcome {name} 👋\n\n"
         "Select an option (reply with the number):\n"
-        "1. OD Request\n"
-        "2. Vehicle Request\n"
-        "3. Leave Request\n"
-        "4. Permission Request\n"
-        "5. Visitor Request\n"
-        "6. OD - Form\n"
-        "7. Visitor - Form\n"
-        "8. Leave - Form\n"
-        "9. Permission - Form"
+        "1. OD - Form\n"
+        "2. Visitor - Form\n"
+        "3. Leave - Form\n"
+        "4. Permission Request"
     )
 
 
@@ -545,15 +540,10 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
     name = _chat_name(employee_name)
     welcome = f"Welcome {name} 👋\n\nPlease choose an option:"
     rows = _list_rows(
-        ("od_request", "OD Request"),
-        ("vehicle_request", "Vehicle Request"),
-        ("leave_request", "Leave Request"),
-        ("permission_request", "Permission Request"),
-        ("visitor_request", "Visitor Request"),
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
-        ("permission_form", "Permission - Form"),
+        ("permission_request", "Permission Request"),
     )
     try:
         send_list_menu(
@@ -568,7 +558,10 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
             _send_to(wa_id, _numbered_request_menu(employee_name))
         except Exception:
             logger.exception("numbered menu text failed to=%s", wa_id)
-            _send_to(wa_id, f"{welcome}\n\nReply with 1 for OD, 3 for Leave, 5 for Visitor.")
+            _send_to(
+                wa_id,
+                f"{welcome}\n\nReply 1 OD Form, 2 Visitor Form, 3 Leave Form, 4 Permission.",
+            )
 
 
 def _normalize_choice(raw: str) -> str:
@@ -956,30 +949,52 @@ def _process(sender: str, incoming: str) -> None:
         permission_request.handle(sender, incoming, session or {}, PERMISSION_DEPS)
         return
 
-    if incoming == "1" or incoming == "OD_REQUEST":
-        if state == SESSION_MENU_IDLE:
-            od_request.try_start(sender, OD_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("6", "OD_FORM"):
+    if incoming in ("1", "OD_FORM", "6"):
         if state == SESSION_MENU_IDLE:
             od_request.try_start_form(sender, OD_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("7", "VISITOR_FORM"):
+    if incoming in ("2", "VISITOR_FORM", "7"):
         if state == SESSION_MENU_IDLE:
             visitor_request.try_start_form(sender, VISITOR_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("8", "LEAVE_FORM"):
+    if incoming in ("3", "LEAVE_FORM", "8"):
         if state == SESSION_MENU_IDLE:
             leave_request.try_start_form(sender, LEAVE_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("4", "PERMISSION_REQUEST"):
+        if state == SESSION_MENU_IDLE:
+            permission_request.try_start(sender, PERMISSION_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    # Chat / test flows — not shown in main menu
+    if incoming == "OD_REQUEST":
+        if state == SESSION_MENU_IDLE:
+            od_request.try_start(sender, OD_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming == "LEAVE_REQUEST":
+        if state == SESSION_MENU_IDLE:
+            leave_request.try_start(sender, LEAVE_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("5", "VISITOR_REQUEST"):
+        if state == SESSION_MENU_IDLE:
+            visitor_request.try_start(sender, VISITOR_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
@@ -991,28 +1006,7 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming == "3" or incoming == "LEAVE_REQUEST":
-        if state == SESSION_MENU_IDLE:
-            leave_request.try_start(sender, LEAVE_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming == "4" or incoming == "PERMISSION_REQUEST":
-        if state == SESSION_MENU_IDLE:
-            permission_request.try_start(sender, PERMISSION_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming == "5" or incoming == "VISITOR_REQUEST":
-        if state == SESSION_MENU_IDLE:
-            visitor_request.try_start(sender, VISITOR_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming == "2" or incoming in _UNSUPPORTED_REQUEST_IDS:
+    if incoming in _UNSUPPORTED_REQUEST_IDS:
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
