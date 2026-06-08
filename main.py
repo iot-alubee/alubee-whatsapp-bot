@@ -158,6 +158,10 @@ _ROW_IDS = {
     "visitor_request": "VISITOR_REQUEST",
     "visitor_form": "VISITOR_FORM",
     "visitor_-_form": "VISITOR_FORM",
+    "leave_form": "LEAVE_FORM",
+    "leave_-_form": "LEAVE_FORM",
+    "permission_form": "PERMISSION_FORM",
+    "permission_-_form": "PERMISSION_FORM",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -466,7 +470,9 @@ def _numbered_request_menu(employee_name: str) -> str:
         "4. Permission Request\n"
         "5. Visitor Request\n"
         "6. OD - Form\n"
-        "7. Visitor - Form"
+        "7. Visitor - Form\n"
+        "8. Leave - Form\n"
+        "9. Permission - Form"
     )
 
 
@@ -546,6 +552,8 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("visitor_request", "Visitor Request"),
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
+        ("leave_form", "Leave - Form"),
+        ("permission_form", "Permission - Form"),
     )
     try:
         send_list_menu(
@@ -582,6 +590,10 @@ def _normalize_choice(raw: str) -> str:
         "visitor request": "VISITOR_REQUEST",
         "visitor - form": "VISITOR_FORM",
         "visitor form": "VISITOR_FORM",
+        "leave - form": "LEAVE_FORM",
+        "leave form": "LEAVE_FORM",
+        "permission - form": "PERMISSION_FORM",
+        "permission form": "PERMISSION_FORM",
     }
     return titles.get(s.lower(), s)
 
@@ -682,6 +694,10 @@ def _looks_like_flow_payload(payload) -> bool:
             "coming_from",
             "purpose",
             "visitor_name",
+            "leave_when",
+            "leave_reason",
+            "permission_for",
+            "permission_type",
         }
     )
 
@@ -697,6 +713,10 @@ def _flow_callback_kind(body: dict) -> str:
         return "od-flow"
     if callback in ("visitor-flow", "visitor_form", "visitor"):
         return "visitor-flow"
+    if callback in ("leave-flow", "leave_form", "leave"):
+        return "leave-flow"
+    if callback in ("permission-flow", "permission_form", "permission"):
+        return "permission-flow"
     return callback
 
 
@@ -704,7 +724,12 @@ def _is_flow_reply_webhook(body: dict) -> bool:
     wtype = (body.get("type") or "").strip().lower()
     if wtype == "message_api_flow_response":
         return True
-    if _flow_callback_kind(body) in ("od-flow", "visitor-flow"):
+    if _flow_callback_kind(body) in (
+        "od-flow",
+        "visitor-flow",
+        "leave-flow",
+        "permission-flow",
+    ):
         return True
     data = body.get("data") or {}
     msg_obj = data.get("message") or {}
@@ -828,6 +853,10 @@ def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
             callback = "od-flow"
         elif keys & {"coming_on", "coming_from", "purpose", "visitor_name"}:
             callback = "visitor-flow"
+        elif keys & {"leave_when", "leave_reason", "from_date"}:
+            callback = "leave-flow"
+        elif keys & {"permission_for", "permission_type", "permission_shift"}:
+            callback = "permission-flow"
     return phone_to_wa_id(phone), response, callback or "flow"
 
 
@@ -948,6 +977,20 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
+    if incoming in ("8", "LEAVE_FORM"):
+        if state == SESSION_MENU_IDLE:
+            leave_request.try_start_form(sender, LEAVE_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("9", "PERMISSION_FORM"):
+        if state == SESSION_MENU_IDLE:
+            permission_request.try_start_form(sender, PERMISSION_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
     if incoming == "3" or incoming == "LEAVE_REQUEST":
         if state == SESSION_MENU_IDLE:
             leave_request.try_start(sender, LEAVE_DEPS)
@@ -1013,6 +1056,10 @@ def health():
         "od_flow_template": od_request.od_flow_template_name(),
         "visitor_form_configured": visitor_request.visitor_flow_enabled(),
         "visitor_flow_template": visitor_request.visitor_flow_template_name(),
+        "leave_form_configured": leave_request.leave_flow_enabled(),
+        "leave_flow_template": leave_request.leave_flow_template_name(),
+        "permission_form_configured": permission_request.permission_flow_enabled(),
+        "permission_flow_template": permission_request.permission_flow_template_name(),
     }
 
 
@@ -1055,6 +1102,30 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("could not notify user after visitor flow error")
+        elif flow_kind in ("leave-flow", "leave_form", "leave"):
+            try:
+                leave_request.handle_flow_submission(sender, response_json, LEAVE_DEPS)
+            except Exception:
+                logger.exception("leave flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your leave form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after leave flow error")
+        elif flow_kind in ("permission-flow", "permission_form", "permission"):
+            try:
+                permission_request.handle_flow_submission(sender, response_json, PERMISSION_DEPS)
+            except Exception:
+                logger.exception("permission flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your permission form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after permission flow error")
         elif flow_kind == "flow" and isinstance(response_json, dict):
             keys = {str(k).lower() for k in response_json.keys()}
             if keys & {"od_reason", "company_vehicle", "vehicle"}:
@@ -1067,6 +1138,16 @@ async def webhook(request: Request):
                     visitor_request.handle_flow_submission(sender, response_json, VISITOR_DEPS)
                 except Exception:
                     logger.exception("visitor flow submit failed sender=%s", sender)
+            elif keys & {"leave_when", "leave_reason"}:
+                try:
+                    leave_request.handle_flow_submission(sender, response_json, LEAVE_DEPS)
+                except Exception:
+                    logger.exception("leave flow submit failed sender=%s", sender)
+            elif keys & {"permission_for", "reason"}:
+                try:
+                    permission_request.handle_flow_submission(sender, response_json, PERMISSION_DEPS)
+                except Exception:
+                    logger.exception("permission flow submit failed sender=%s", sender)
             else:
                 logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
         else:

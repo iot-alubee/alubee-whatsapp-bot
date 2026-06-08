@@ -4,7 +4,9 @@ Leave request flow — when (today / tomorrow / other), dates, reason; JMD → M
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
@@ -59,6 +61,39 @@ class LeaveDeps:
 
 def is_leave_state(state: str | None) -> bool:
     return (state or "") in LEAVE_SESSION_STATES
+
+
+def leave_flow_template_name() -> str:
+    return (os.getenv("LEAVE_FLOW_TEMPLATE_NAME") or "").strip()
+
+
+def leave_flow_enabled() -> bool:
+    return bool(leave_flow_template_name())
+
+
+def try_start_form(sender: str, deps: LeaveDeps) -> None:
+    """Send WhatsApp Flow form (menu: Leave - Form). Chat leave flow unchanged."""
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
+        deps.send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+    if not leave_flow_enabled():
+        deps.send_to(
+            sender,
+            "Leave form is not configured yet.\n"
+            "Use Leave Request (chat) or contact admin.",
+        )
+        return
+    from interakt_api import send_leave_flow_form
+
+    name = ud.get("name") or "Employee"
+    if send_leave_flow_form(wa_id_to_phone(sender), employee_name=name):
+        return
+    logger.warning("leave flow template send failed sender=%s", sender)
+    deps.send_to(
+        sender,
+        "Could not open leave form. Try Leave Request (chat) or contact admin.",
+    )
 
 
 def try_start(sender: str, deps: LeaveDeps) -> None:
@@ -568,6 +603,103 @@ def _normalize_cancel_choice(incoming: str) -> str:
     if low == "exit":
         return "LEAVE_EXIT"
     return c
+
+
+def _flow_pick(data: dict, *needles: str) -> str:
+    if not data:
+        return ""
+    for key in needles:
+        if key in data and data[key] not in (None, ""):
+            return str(data[key]).strip()
+    for raw_key, val in data.items():
+        if val in (None, ""):
+            continue
+        lk = str(raw_key).lower()
+        for needle in needles:
+            if needle.lower() in lk:
+                return str(val).strip()
+    return ""
+
+
+def _normalize_flow_date(raw: str) -> str:
+    parsed, _ = _parse_leave_date(raw)
+    return parsed or ""
+
+
+def parse_flow_response(response_json: dict | str | None) -> dict | None:
+    """Map WhatsApp Flow submit payload to leave submit kwargs."""
+    if response_json is None:
+        return None
+    if isinstance(response_json, str):
+        try:
+            data = json.loads(response_json)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(response_json, dict):
+        data = response_json
+    else:
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+
+    when_raw = _flow_pick(data, "leave_when", "when").lower().replace(" ", "_")
+    if when_raw in ("today", "leave_today", "1"):
+        when = "TODAY"
+    elif when_raw in ("tomorrow", "leave_tomorrow", "2"):
+        when = "TOMORROW"
+    elif when_raw in ("other", "leave_other", "3"):
+        when = "OTHER"
+    else:
+        return None
+
+    if when == "OTHER":
+        from_d = _normalize_flow_date(_flow_pick(data, "from_date", "leave_from_date"))
+        to_d = _normalize_flow_date(_flow_pick(data, "to_date", "leave_to_date"))
+        if not from_d or not to_d:
+            return None
+        if _parse_ddmmy(from_d) and _parse_ddmmy(to_d) and _parse_ddmmy(to_d) < _parse_ddmmy(from_d):
+            return None
+    else:
+        from_d, to_d = _dates_for_when(when)
+
+    reason_raw = _flow_pick(data, "leave_reason", "reason").lower().replace(" ", "_")
+    other_reason = _flow_pick(data, "other_reason", "reason_text")
+    if reason_raw in ("sick_leave", "sick"):
+        reason_code = "SICK_LEAVE"
+        reason = REASON_LABELS[reason_code]
+    elif reason_raw in ("casual_leave", "casual"):
+        reason_code = "CASUAL_LEAVE"
+        reason = REASON_LABELS[reason_code]
+    elif reason_raw == "other":
+        if not other_reason:
+            return None
+        reason_code = "OTHER"
+        reason = other_reason[:500]
+    else:
+        return None
+
+    return {
+        "leave_from_date": from_d,
+        "leave_to_date": to_d,
+        "leave_reason_code": reason_code,
+        "leave_reason": reason,
+    }
+
+
+def handle_flow_submission(
+    sender: str, response_json: dict | str | None, deps: LeaveDeps
+) -> None:
+    parsed = parse_flow_response(response_json)
+    if not parsed:
+        deps.send_to(sender, "Could not read the leave form. Please try again or contact admin.")
+        return
+    exists, ud = get_user_record(sender)
+    session = {
+        "employee_name": (ud or {}).get("name") or "Employee",
+        "department": (ud or {}).get("department") or "",
+        **parsed,
+    }
+    _submit_from_session(sender, session, deps)
 
 
 def _normalize_reason_choice(incoming: str) -> str:

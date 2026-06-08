@@ -4,7 +4,9 @@ Permission request flow — myself / CL (supervisor), shift, type, reason; JMD/M
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
@@ -66,6 +68,39 @@ class PermissionDeps:
 
 def is_permission_state(state: str | None) -> bool:
     return (state or "") in PERMISSION_SESSION_STATES
+
+
+def permission_flow_template_name() -> str:
+    return (os.getenv("PERMISSION_FLOW_TEMPLATE_NAME") or "").strip()
+
+
+def permission_flow_enabled() -> bool:
+    return bool(permission_flow_template_name())
+
+
+def try_start_form(sender: str, deps: PermissionDeps) -> None:
+    """Send WhatsApp Flow form (menu: Permission - Form). Chat flow unchanged."""
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
+        deps.send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+    if not permission_flow_enabled():
+        deps.send_to(
+            sender,
+            "Permission form is not configured yet.\n"
+            "Use Permission Request (chat) or contact admin.",
+        )
+        return
+    from interakt_api import send_permission_flow_form
+
+    name = ud.get("name") or "Employee"
+    if send_permission_flow_form(wa_id_to_phone(sender), employee_name=name):
+        return
+    logger.warning("permission flow template send failed sender=%s", sender)
+    deps.send_to(
+        sender,
+        "Could not open permission form. Try Permission Request (chat) or contact admin.",
+    )
 
 
 def _ist_tzinfo():
@@ -617,6 +652,122 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
             "Ask them to send Hi to this Alubee number once, then contact admin."
         )
     deps.send_to(sender, msg)
+
+
+def _flow_pick(data: dict, *needles: str) -> str:
+    if not data:
+        return ""
+    for key in needles:
+        if key in data and data[key] not in (None, ""):
+            return str(data[key]).strip()
+    for raw_key, val in data.items():
+        if val in (None, ""):
+            continue
+        lk = str(raw_key).lower()
+        for needle in needles:
+            if needle.lower() in lk:
+                return str(val).strip()
+    return ""
+
+
+def parse_flow_response(response_json: dict | str | None) -> dict | None:
+    """Map WhatsApp Flow submit payload to permission session kwargs."""
+    if response_json is None:
+        return None
+    if isinstance(response_json, str):
+        try:
+            data = json.loads(response_json)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(response_json, dict):
+        data = response_json
+    else:
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+
+    for_raw = _flow_pick(data, "permission_for", "for").lower().replace(" ", "_")
+    if for_raw in ("cl", "for_cl", "permission_for_cl"):
+        permission_for = "cl"
+    elif for_raw in ("myself", "for_myself", "permission_for_myself"):
+        permission_for = "myself"
+    else:
+        return None
+
+    reason = _flow_pick(data, "reason", "permission_reason")
+    if not reason:
+        return None
+
+    shift_raw = _flow_pick(data, "permission_shift", "shift").lower().replace(" ", "_")
+    if shift_raw in ("shift_i", "shift1", "i", "1"):
+        shift = "I"
+    elif shift_raw in ("shift_ii", "shift2", "ii", "2"):
+        shift = "II"
+    else:
+        shift = ""
+
+    session: dict = {
+        "permission_for": permission_for,
+        "permission_date": _today_ddmmy(),
+        "form_type": "PERMISSION_REQUEST",
+    }
+
+    if permission_for == "cl":
+        cl_name = _flow_pick(data, "cl_employee_name", "employee_name", "cl_name")
+        if not cl_name:
+            return None
+        if not shift:
+            return None
+        session["cl_employee_name"] = cl_name[:200]
+        session["permission_shift"] = shift
+        return {**session, "reason": reason[:500]}
+
+    type_raw = _flow_pick(data, "permission_type", "type").lower().replace(" ", "_")
+    if type_raw in ("late_in", "latein", "late"):
+        type_code = "PERMISSION_LATE_IN"
+    elif type_raw in ("early_out", "earlyout", "early"):
+        type_code = "PERMISSION_EARLY_OUT"
+    elif type_raw == "other":
+        type_code = "PERMISSION_OTHER"
+    else:
+        return None
+
+    session["permission_type_code"] = type_code
+    session["permission_type"] = TYPE_LABELS[type_code]
+    if shift:
+        session["permission_shift"] = shift
+    return {**session, "reason": reason[:500]}
+
+
+def handle_flow_submission(
+    sender: str, response_json: dict | str | None, deps: PermissionDeps
+) -> None:
+    parsed = parse_flow_response(response_json)
+    if not parsed:
+        deps.send_to(
+            sender,
+            "Could not read the permission form. Please try again or contact admin.",
+        )
+        return
+    exists, ud = get_user_record(sender)
+    if not exists or not ud:
+        deps.send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+    permission_for = (parsed.get("permission_for") or "myself").strip().lower()
+    if permission_for == "cl" and not _is_supervisor(ud):
+        deps.send_to(sender, "For CL permission is only for supervisors. Use For Myself.")
+        return
+    if permission_for == "myself" and _is_rotational_shift(ud):
+        if not (parsed.get("permission_shift") or "").strip():
+            deps.send_to(sender, "Please select Shift and submit again.")
+            return
+    reason = parsed.pop("reason", "")
+    session = {
+        "employee_name": ud.get("name") or "Employee",
+        "department": ud.get("department") or "",
+        **parsed,
+    }
+    _submit(sender, session, deps, reason=reason)
 
 
 def _normalize_incoming(incoming: str) -> str:

@@ -50,6 +50,20 @@ Chat **OD Request** (option 1) does not use these. Defaults work without setting
 | `OD_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` | Template language |
 | `OD_FLOW_TEMPLATE_BODY_FIELDS` | *(empty)* | Only if template body has `{{1}}` etc. |
 
+## Optional — Visitor / Leave / Permission WhatsApp Forms (menu 7–9, test)
+
+Chat options 3–5 unchanged. Set template name when form is approved in Interakt:
+
+| Name | Purpose |
+|------|---------|
+| `VISITOR_FLOW_TEMPLATE_NAME` | Visitor - Form |
+| `LEAVE_FLOW_TEMPLATE_NAME` | Leave - Form |
+| `PERMISSION_FLOW_TEMPLATE_NAME` | Permission - Form |
+| `*_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` |
+| `*_FLOW_TEMPLATE_BODY_FIELDS` | `name` if template body has one variable |
+
+All forms use the **same** flow endpoint URL (`alubee-whatsapp-flow-endpoint` → `/flow`).
+
 ## Optional
 
 | Name | Default | Purpose |

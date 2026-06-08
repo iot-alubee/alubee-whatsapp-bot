@@ -513,6 +513,78 @@ def send_od_flow_form(
         return False
 
 
+def send_leave_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send leave WhatsApp Form template (env LEAVE_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("LEAVE_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("LEAVE_FLOW_TEMPLATE_NAME not set — cannot send leave form")
+        return False
+    lang = (os.getenv("LEAVE_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("LEAVE_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="leave-flow",
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info("leave flow template sent phone=%s template=%s", phone_to_10(phone), template_name)
+        return True
+    except Exception:
+        logger.exception("leave flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
+def send_permission_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send permission WhatsApp Form template (env PERMISSION_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("PERMISSION_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("PERMISSION_FLOW_TEMPLATE_NAME not set — cannot send permission form")
+        return False
+    lang = (os.getenv("PERMISSION_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("PERMISSION_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="permission-flow",
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info(
+            "permission flow template sent phone=%s template=%s",
+            phone_to_10(phone),
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception("permission flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
 def send_visitor_flow_form(
     phone: str,
     *,
