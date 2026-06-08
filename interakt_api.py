@@ -552,6 +552,7 @@ def send_permission_flow_form(
     *,
     employee_name: str = "",
     body_values: list[str] | None = None,
+    is_supervisor: bool = False,
 ) -> bool:
     """Send permission WhatsApp Form template (env PERMISSION_FLOW_TEMPLATE_NAME)."""
     template_name = (os.getenv("PERMISSION_FLOW_TEMPLATE_NAME") or "").strip()
@@ -571,13 +572,15 @@ def send_permission_flow_form(
             language_code=lang,
             body_values=body_values,
             callback_data="permission-flow",
+            flow_action_data={"is_supervisor": bool(is_supervisor)},
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )
         logger.info(
-            "permission flow template sent phone=%s template=%s",
+            "permission flow template sent phone=%s template=%s supervisor=%s",
             phone_to_10(phone),
             template_name,
+            is_supervisor,
         )
         return True
     except Exception:

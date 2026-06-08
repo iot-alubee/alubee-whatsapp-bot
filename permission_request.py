@@ -94,7 +94,11 @@ def try_start_form(sender: str, deps: PermissionDeps) -> None:
     from interakt_api import send_permission_flow_form
 
     name = ud.get("name") or "Employee"
-    if send_permission_flow_form(wa_id_to_phone(sender), employee_name=name):
+    if send_permission_flow_form(
+        wa_id_to_phone(sender),
+        employee_name=name,
+        is_supervisor=_is_supervisor(ud),
+    ):
         return
     logger.warning("permission flow template send failed sender=%s", sender)
     deps.send_to(
@@ -200,6 +204,10 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
                 permission_for="myself",
                 **{k: session.get(k) for k in ("employee_name", "department", "permission_date", "form_type")},
             )
+            _start_myself_flow(sender, session, deps, ud)
+            return
+        if not _is_supervisor(ud):
+            deps.session_ref(sender).delete()
             _start_myself_flow(sender, session, deps, ud)
             return
         deps.session_merge(
@@ -689,7 +697,7 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     for_raw = _flow_pick(data, "permission_for", "for").lower().replace(" ", "_")
     if for_raw in ("cl", "for_cl", "permission_for_cl"):
         permission_for = "cl"
-    elif for_raw in ("myself", "for_myself", "permission_for_myself"):
+    elif for_raw in ("myself", "for_myself", "permission_for_myself") or not for_raw:
         permission_for = "myself"
     else:
         return None
