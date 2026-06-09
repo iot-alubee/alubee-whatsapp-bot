@@ -566,6 +566,7 @@ def send_permission_flow_form(
         keys = [k.strip() for k in spec.split(",") if k.strip()]
         vals = {"name": (employee_name or "Employee")[:50]}
         body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
     try:
         send_flow_template(
             phone,
@@ -573,7 +574,11 @@ def send_permission_flow_form(
             language_code=lang,
             body_values=body_values,
             callback_data="permission-flow",
-            flow_action_data={"is_supervisor": bool(is_supervisor)},
+            flow_token=f"perm_{phone_10}"[:256],
+            flow_action_data={
+                "phone": phone_10,
+                "is_supervisor": "1" if is_supervisor else "0",
+            },
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )

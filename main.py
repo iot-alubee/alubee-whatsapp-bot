@@ -467,7 +467,8 @@ def _numbered_request_menu(employee_name: str) -> str:
         "1. OD - Form\n"
         "2. Visitor - Form\n"
         "3. Leave - Form\n"
-        "4. Permission Request"
+        "4. Permission Request\n"
+        "5. Permission - Form"
     )
 
 
@@ -544,6 +545,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
         ("permission_request", "Permission Request"),
+        ("permission_form", "Permission - Form"),
     )
     try:
         send_list_menu(
@@ -560,7 +562,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
             logger.exception("numbered menu text failed to=%s", wa_id)
             _send_to(
                 wa_id,
-                f"{welcome}\n\nReply 1 OD Form, 2 Visitor Form, 3 Leave Form, 4 Permission.",
+                f"{welcome}\n\nReply 1–5: OD / Visitor / Leave Form, 4 Permission chat, 5 Permission Form.",
             )
 
 
@@ -977,6 +979,13 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
+    if incoming in ("5", "PERMISSION_FORM", "9"):
+        if state == SESSION_MENU_IDLE:
+            permission_request.try_start_form(sender, PERMISSION_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
     # Chat / test flows — not shown in main menu
     if incoming == "OD_REQUEST":
         if state == SESSION_MENU_IDLE:
@@ -992,16 +1001,9 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("5", "VISITOR_REQUEST"):
+    if incoming == "VISITOR_REQUEST":
         if state == SESSION_MENU_IDLE:
             visitor_request.try_start(sender, VISITOR_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("9", "PERMISSION_FORM"):
-        if state == SESSION_MENU_IDLE:
-            permission_request.try_start_form(sender, PERMISSION_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
