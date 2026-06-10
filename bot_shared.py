@@ -228,6 +228,21 @@ def leave_dates_from_doc(d: dict) -> set[str]:
     )
 
 
+def _leave_fully_approved(d: dict) -> bool:
+    """True when leave has finished approval (MD required; legacy offline bypass still counts)."""
+    jmd = (d.get("jmd_status") or "").strip().upper()
+    if jmd != "APPROVED":
+        return False
+    if d.get("md_offline_bypass"):
+        return True
+    md = (d.get("md_status") or "").strip().upper()
+    if md == "APPROVED":
+        return True
+    if md == "OFFLINE":
+        return True
+    return False
+
+
 def _leave_overlap_status_label(d: dict) -> str:
     """User-facing status for duplicate-date check: pending, approved, or skip."""
     jmd = (d.get("jmd_status") or "").strip().upper()
@@ -236,7 +251,7 @@ def _leave_overlap_status_label(d: dict) -> str:
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
         return "pending"
     if jmd == "APPROVED":
-        return "approved"
+        return "approved" if _leave_fully_approved(d) else "pending"
     return ""
 
 
@@ -387,8 +402,7 @@ def count_leave_days_in_month_from_dates(
 
 def _leave_days_in_month(d: dict, year: int, month: int) -> int:
     """Approved leave days in month. Pending and denied are not counted."""
-    jmd_st = (d.get("jmd_status") or "").strip().upper()
-    if jmd_st != "APPROVED":
+    if not _leave_fully_approved(d):
         return 0
     return _count_leave_days_in_month_from_doc(d, year, month)
 

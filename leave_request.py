@@ -1,5 +1,5 @@
 """
-Leave request flow — when (today / tomorrow / other), dates, reason; JMD → MD approval.
+Leave request flow — when (today / tomorrow / other), dates, reason; JMD → MD approval (MD required even if offline).
 """
 
 from __future__ import annotations

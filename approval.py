@@ -824,6 +824,37 @@ def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
         _set_pending_approval(wa_id, request_id)
 
 
+def notify_pending_leave_md_approvals(sender: str, *, limit: int = 10) -> int:
+    """When MD goes online, prompt for leave rows awaiting MD (jmd approved, md pending)."""
+    d = _require()
+    if not sender:
+        return 0
+    notified = 0
+    try:
+        for snap in d.db.collection("requests").where("type", "==", "LEAVE").stream():
+            rd = snap.to_dict() or {}
+            if (rd.get("jmd_status") or "").strip().upper() != "APPROVED":
+                continue
+            if (rd.get("md_status") or "").strip().upper() != "PENDING":
+                continue
+            md_wa = request_md_whatsapp(rd)
+            if not d.same_whatsapp(sender, md_wa):
+                continue
+            rid = (rd.get("request_id") or snap.id or "").strip()
+            if not rid:
+                continue
+            notify_approver(md_wa, rd, rid)
+            notified += 1
+            if notified >= limit:
+                break
+    except Exception:
+        logger.exception("pending leave MD notify failed sender=%s", sender)
+        return notified
+    if notified:
+        logger.info("notified MD of %s pending leave(s) sender=%s", notified, sender)
+    return notified
+
+
 def _employee_final_approval_message(req_label: str) -> str:
     if req_label == "leave":
         return "Your leave request has been approved."
@@ -986,29 +1017,52 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 )
             else:
                 md_off = _md_is_offline_now(d, md_wa)
-                ref.update({
-                    "jmd": request_jmd_whatsapp(rd),
-                    "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
-                    "md": md_wa,
-                    "manager_status": "N/A",
-                    "jmd_status": "APPROVED",
-                    "md_status": _md_status_after_jmd(md_off),
-                    **_md_offline_bypass_fields(d, md_off),
-                })
-                rd = ref.get().to_dict() or rd
-                if md_off:
-                    _after_jmd_when_md_offline(
-                        d,
-                        ref,
-                        rd,
-                        md_wa,
-                        employee=employee,
-                        req_label=req_label,
-                        request_id=request_id,
-                    )
+                if req_type == "LEAVE":
+                    ref.update({
+                        "jmd": request_jmd_whatsapp(rd),
+                        "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                        "md": md_wa,
+                        "manager_status": "N/A",
+                        "jmd_status": "APPROVED",
+                        "md_status": "PENDING",
+                    })
+                    rd = ref.get().to_dict() or rd
+                    if md_off:
+                        d.send_to(
+                            employee,
+                            "Your leave request was approved by JMD and is pending MD approval.",
+                        )
+                        logger.info(
+                            "jmd approved leave request_id=%s → md pending (md offline)",
+                            request_id,
+                        )
+                    else:
+                        notify_approver(md_wa, rd, request_id)
+                        logger.info("jmd approved leave request_id=%s → md", request_id)
                 else:
-                    notify_approver(md_wa, rd, request_id)
-                    logger.info("jmd approved request_id=%s → md", request_id)
+                    ref.update({
+                        "jmd": request_jmd_whatsapp(rd),
+                        "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                        "md": md_wa,
+                        "manager_status": "N/A",
+                        "jmd_status": "APPROVED",
+                        "md_status": _md_status_after_jmd(md_off),
+                        **_md_offline_bypass_fields(d, md_off),
+                    })
+                    rd = ref.get().to_dict() or rd
+                    if md_off:
+                        _after_jmd_when_md_offline(
+                            d,
+                            ref,
+                            rd,
+                            md_wa,
+                            employee=employee,
+                            req_label=req_label,
+                            request_id=request_id,
+                        )
+                    else:
+                        notify_approver(md_wa, rd, request_id)
+                        logger.info("jmd approved request_id=%s → md", request_id)
         else:
             ref.update({
                 "manager_status": "N/A",

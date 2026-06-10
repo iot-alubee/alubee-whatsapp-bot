@@ -525,6 +525,8 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
     approver_availability.set_availability(
         db, sender, availability, role=role or "approver"
     )
+    if availability == "online" and role == "md":
+        approval.notify_pending_leave_md_approvals(sender)
     _send_to(sender, f"You are now {availability.title()}.")
     exists, ud = bot_shared.get_user_record(sender)
     if exists and ud:
