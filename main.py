@@ -924,6 +924,9 @@ def _process(sender: str, incoming: str) -> None:
     if _try_handle_approver_availability(sender, incoming):
         return
 
+    if approval.handle_leave_modify_gate(sender, incoming):
+        return
+
     if approval.handle_approval_gate(sender, incoming):
         return
 

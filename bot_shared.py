@@ -215,6 +215,49 @@ def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
     return out
 
 
+def leave_days_requested_from_doc(d: dict) -> int:
+    """Original requested leave length (for approver modify-days ceiling)."""
+    raw = d.get("leave_days_requested")
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(d.get("leave_days") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def shrink_leave_to_day_count(rd: dict, new_days: int) -> dict | None:
+    """
+    Build Firestore patch keeping the first ``new_days`` from the original span.
+    Returns None if inputs are invalid.
+    """
+    from_d = (rd.get("leave_from_date") or "").strip()
+    if not from_d:
+        return None
+    requested = leave_days_requested_from_doc(rd)
+    try:
+        n = int(new_days)
+    except (TypeError, ValueError):
+        return None
+    if n < 1 or n > requested:
+        return None
+    span_end = (
+        (rd.get("leave_to_date_requested") or rd.get("leave_to_date") or from_d).strip()
+    )
+    full_dates = expand_leave_date_range(from_d, span_end)
+    if not full_dates:
+        return None
+    picked = full_dates[:n]
+    return {
+        "leave_days": n,
+        "leave_to_date": picked[-1],
+        "leave_dates": picked,
+    }
+
+
 def leave_dates_from_doc(d: dict) -> set[str]:
     """Calendar days covered by one LEAVE request document."""
     dates = d.get("leave_dates") or []

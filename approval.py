@@ -13,6 +13,8 @@ from bot_shared import (
     get_employee_leave_counts,
     get_employee_permission_counts,
     get_user_record,
+    leave_days_requested_from_doc,
+    shrink_leave_to_day_count,
     wa_from_env,
 )
 
@@ -21,6 +23,8 @@ import approver_availability
 from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
+
+WAITING_LEAVE_DAYS_MODIFY = "WAITING_LEAVE_DAYS_MODIFY"
 
 VISITING_UNIT_I = "UNIT_I"
 VISITING_UNIT_II = "UNIT_II"
@@ -464,7 +468,7 @@ def _approval_message_body(
             f"Reason: {reason or '—'}\n"
             f"Leaves in Last month: {leaves_last}\n"
             f"Leaves in current month: {leaves_curr}\n\n"
-            "Please approve or deny."
+            "Please approve, deny, or modify days."
         )
     if req_type == "PERMISSION":
         rd = request_rd or {}
@@ -532,6 +536,23 @@ def _approval_message_body(
     )
 
 
+def _leave_modify_days_allowed(rd: dict | None) -> bool:
+    if (rd or {}).get("type", "").strip().upper() != "LEAVE":
+        return False
+    return leave_days_requested_from_doc(rd or {}) > 1
+
+
+def _leave_approval_button_rows(request_id: str, request_rd: dict | None) -> list[tuple[str, str]]:
+    rid = (request_id or "").strip()
+    rows = [
+        (f"APPROVE_{rid}"[:256], "Approve"),
+        (f"DENY_{rid}"[:256], "Deny"),
+    ]
+    if _leave_modify_days_allowed(request_rd):
+        rows.append((f"MODIFY_DAYS_{rid}"[:256], "Modify Days"))
+    return rows
+
+
 def send_approval_buttons(
     wa_id: str,
     *,
@@ -552,19 +573,18 @@ def send_approval_buttons(
         return False
 
     rid = (request_id or "").strip()
-    approve_id = f"APPROVE_{rid}"[:256]
-    deny_id = f"DENY_{rid}"[:256]
     body = _approval_message_body(
         employee_name=employee_name,
         department=department,
         reason=reason,
         request_rd=request_rd,
     )
+    buttons = _leave_approval_button_rows(rid, request_rd)
     try:
         send_reply_buttons(
             wa_id_to_phone(wa_id),
             body,
-            [(approve_id, "Approve"), (deny_id, "Deny")],
+            buttons,
             callback_data=request_id,
             ensure_contact=True,
             contact_name=d.chat_name(employee_name),
@@ -577,13 +597,171 @@ def send_approval_buttons(
             send_reply_buttons(
                 wa_id_to_phone(wa_id),
                 body,
-                [(approve_id, "Approve"), (deny_id, "Deny")],
+                buttons,
                 callback_data=request_id,
             )
             return True
         except Exception:
             logger.exception("approval retry failed to=%s", wa_id)
         return False
+
+
+def _leave_approver_can_modify(role: str | None, rd: dict) -> bool:
+    if role not in ("jmd", "md"):
+        return False
+    if (rd.get("type") or "").strip().upper() != "LEAVE":
+        return False
+    jmd = (rd.get("jmd_status") or "").strip().upper()
+    md = (rd.get("md_status") or "").strip().upper()
+    if role == "jmd":
+        return jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD")
+    return jmd == "APPROVED" and md == "PENDING"
+
+
+def _leave_days_modify_prompt(rd: dict) -> str:
+    max_days = leave_days_requested_from_doc(rd)
+    current = int(rd.get("leave_days") or max_days)
+    return (
+        f"Employee requested: {max_days} day(s)\n"
+        f"JMD set to: {current} day(s)\n"
+        f"Reply with a number from 1 to {max_days}."
+    )
+
+
+def _send_leave_day_picker(sender: str, rd: dict, request_id: str) -> None:
+    d = _require()
+    d.send_to(sender, _leave_days_modify_prompt(rd))
+
+
+def _resend_leave_approval_prompt(sender: str, rd: dict, request_id: str) -> None:
+    d = _require()
+    d.session_merge(
+        sender,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=request_id,
+    )
+    send_approval_buttons(
+        sender,
+        employee_name=rd.get("employee_name") or "Employee",
+        department=rd.get("department") or "",
+        reason=rd.get("reason") or "",
+        request_id=request_id,
+        request_rd=rd,
+    )
+
+
+def _apply_leave_day_count(sender: str, request_id: str, day_count: int) -> bool:
+    d = _require()
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.send_to(sender, "This leave request is no longer available.")
+        return True
+    rd = snap.to_dict() or {}
+    role = _approval_role(sender, rd)
+    if not _leave_approver_can_modify(role, rd):
+        d.send_to(sender, "You cannot modify days for this leave request.")
+        return True
+    patch = shrink_leave_to_day_count(rd, day_count)
+    if not patch:
+        max_days = leave_days_requested_from_doc(rd)
+        d.send_to(
+            sender,
+            f"Invalid number of days. Enter a whole number from 1 to {max_days}.",
+        )
+        _resend_leave_approval_prompt(sender, rd, request_id)
+        return True
+    ref.update(patch)
+    rd = ref.get().to_dict() or rd
+    d.send_to(
+        sender,
+        f"Leave days updated to {patch['leave_days']}.\nYou can approve, deny, or modify again.",
+    )
+    _resend_leave_approval_prompt(sender, rd, request_id)
+    logger.info(
+        "leave days modified request_id=%s by=%s role=%s days=%s",
+        request_id,
+        sender,
+        role,
+        patch["leave_days"],
+    )
+    return True
+
+
+def handle_leave_modify_gate(sender: str, incoming: str) -> bool:
+    """Modify-days flow for leave (JMD / MD). Returns True if handled."""
+    d = _require()
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+
+    if upper.startswith("MODIFY_DAYS_"):
+        request_id = raw[len("MODIFY_DAYS_") :].strip()
+        if not request_id:
+            return False
+        ref = d.db.collection("requests").document(request_id)
+        snap = ref.get()
+        if not snap.exists:
+            d.send_to(sender, "This leave request is no longer available.")
+            return True
+        rd = snap.to_dict() or {}
+        role = _approval_role(sender, rd)
+        if not _leave_approver_can_modify(role, rd):
+            d.send_to(sender, "You cannot modify days for this leave request.")
+            return True
+        if not _leave_modify_days_allowed(rd):
+            d.send_to(sender, "This leave is only 1 day — modification is not available.")
+            _resend_leave_approval_prompt(sender, rd, request_id)
+            return True
+        d.session_merge(
+            sender,
+            state=WAITING_LEAVE_DAYS_MODIFY,
+            approval_request_id=request_id,
+        )
+        _send_leave_day_picker(sender, rd, request_id)
+        return True
+
+    if upper.startswith("LEAVE_DAYS_"):
+        tail = upper[len("LEAVE_DAYS_") :]
+        if not tail.isdigit():
+            return False
+        day_count = int(tail)
+        snap = d.session_ref(sender).get()
+        if not snap.exists:
+            return False
+        data = snap.to_dict() or {}
+        if data.get("state") != WAITING_LEAVE_DAYS_MODIFY:
+            return False
+        request_id = (data.get("approval_request_id") or "").strip()
+        if not request_id:
+            return False
+        return _apply_leave_day_count(sender, request_id, day_count)
+
+    snap = d.session_ref(sender).get()
+    if not snap.exists:
+        return False
+    data = snap.to_dict() or {}
+    if data.get("state") != WAITING_LEAVE_DAYS_MODIFY:
+        return False
+    request_id = (data.get("approval_request_id") or "").strip()
+    if not request_id:
+        return False
+    if upper in ("APPROVE", "DENY") or upper.startswith("APPROVE_") or upper.startswith("DENY_"):
+        d.session_merge(sender, state="WAITING_APPROVAL_ACTION", approval_request_id=request_id)
+        return False
+    if upper.startswith("MODIFY_DAYS_"):
+        return False
+    try:
+        day_count = int(raw)
+    except ValueError:
+        rd = d.db.collection("requests").document(request_id).get().to_dict() or {}
+        max_days = leave_days_requested_from_doc(rd)
+        d.send_to(
+            sender,
+            f"Invalid number of days. Enter a whole number from 1 to {max_days}.",
+        )
+        _resend_leave_approval_prompt(sender, rd, request_id)
+        return True
+    return _apply_leave_day_count(sender, request_id, day_count)
 
 
 def _set_pending_approval(recipient: str, request_id: str) -> None:
@@ -749,7 +927,7 @@ def _after_jmd_when_md_offline(
         if _visitor_jmd_fully_approved(rd_fresh):
             d.on_visitor_md_approved(ref, rd_fresh)
     else:
-        d.send_to(employee, _employee_final_approval_message(req_label))
+        d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
     logger.info(
         "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
         request_id,
@@ -855,9 +1033,23 @@ def notify_pending_leave_md_approvals(sender: str, *, limit: int = 10) -> int:
     return notified
 
 
-def _employee_final_approval_message(req_label: str) -> str:
+def _employee_final_approval_message(req_label: str, rd: dict | None = None) -> str:
     if req_label == "leave":
-        return "Your leave request has been approved."
+        data = rd or {}
+        try:
+            days = max(1, int(data.get("leave_days") or 1))
+        except (TypeError, ValueError):
+            days = 1
+        from_d = (data.get("leave_from_date") or "").strip()
+        to_d = (data.get("leave_to_date") or from_d).strip()
+        day_word = "day" if days == 1 else "days"
+        msg = f"Your leave request has been approved for {days} {day_word}."
+        if days <= 1 or (from_d and to_d and from_d == to_d):
+            if from_d:
+                msg += f"\nDate: {from_d}"
+        elif from_d:
+            msg += f"\nFrom: {from_d}\nTo: {to_d}"
+        return msg
     if req_label == "permission":
         return "Your permission request has been approved."
     if req_label == "visitor":
@@ -988,7 +1180,8 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                     "md_status": "N/A",
                     "approved_datetime": d.utcnow(),
                 })
-                d.send_to(employee, _employee_final_approval_message(label))
+                rd_fresh = ref.get().to_dict() or rd
+                d.send_to(employee, _employee_final_approval_message(label, rd_fresh))
                 logger.info("jmd approved %s (final) request_id=%s", label, request_id)
             else:
                 ref.update({
@@ -1089,7 +1282,11 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 rd_fresh = fresh.to_dict() if fresh.exists else rd
                 d.on_visitor_md_approved(ref, rd_fresh)
             else:
-                d.send_to(employee, _employee_final_approval_message(req_label))
+                fresh = ref.get()
+                rd_fresh = fresh.to_dict() if fresh.exists else rd
+                d.send_to(
+                    employee, _employee_final_approval_message(req_label, rd_fresh)
+                )
             logger.info("md approved (final) request_id=%s", request_id)
         else:
             ref.update({
@@ -1102,7 +1299,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
     snap = d.session_ref(sender).get()
     if snap.exists:
         data = snap.to_dict() or {}
-        if data.get("state") == "WAITING_APPROVAL_ACTION":
+        if data.get("state") in ("WAITING_APPROVAL_ACTION", WAITING_LEAVE_DAYS_MODIFY):
             if d.db.collection("users").document(sender).get().exists:
                 d.session_merge(sender, state=d.menu_idle_state)
             else:
