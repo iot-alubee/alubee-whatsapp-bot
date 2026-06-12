@@ -26,6 +26,8 @@ from interakt_api import send_reply_buttons, wa_id_to_phone
 from permission_times import (
     compute_expected_permission_hours,
     normalize_permission_time_label,
+    permission_type_allowed,
+    validate_expected_permission_times,
 )
 
 logger = logging.getLogger(__name__)
@@ -864,6 +866,32 @@ def handle_flow_submission(
         if not (parsed.get("permission_shift") or "").strip():
             deps.send_to(sender, "Please select Shift and submit again.")
             return
+    shift = (parsed.get("permission_shift") or "").strip() or "I"
+    if permission_for == "myself" and not _is_rotational_shift(ud):
+        shift = "I"
+    type_code = (
+        "PERMISSION_EARLY_OUT"
+        if permission_for == "cl"
+        else (parsed.get("permission_type_code") or "")
+    )
+    if permission_for == "myself" and not permission_type_allowed(ud, shift, type_code):
+        deps.send_to(
+            sender,
+            "Shift II allows Late IN permission only. Please open the form again.",
+        )
+        return
+    if not validate_expected_permission_times(
+        ud,
+        permission_shift=shift,
+        permission_type_code=type_code,
+        expected_in=parsed.get("permission_expected_in") or "",
+        expected_out=parsed.get("permission_expected_out") or "",
+    ):
+        deps.send_to(
+            sender,
+            "Selected time is not allowed. Please open the form again and pick a valid time.",
+        )
+        return
     reason = parsed.pop("reason", "")
     session = {
         "employee_name": ud.get("name") or "Employee",

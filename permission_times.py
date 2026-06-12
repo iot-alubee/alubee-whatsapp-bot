@@ -8,6 +8,9 @@ _TYPE_LATE_IN = "PERMISSION_LATE_IN"
 _TYPE_EARLY_OUT = "PERMISSION_EARLY_OUT"
 _TYPE_OTHER = "PERMISSION_OTHER"
 
+MAX_PERMISSION_MINUTES = 4 * 60
+SLOT_STEP = 30
+
 
 def _format_12h(hour24: int, minute: int) -> str:
     period = "AM" if hour24 < 12 else "PM"
@@ -15,16 +18,6 @@ def _format_12h(hour24: int, minute: int) -> str:
     if hour12 == 0:
         hour12 = 12
     return f"{hour12}:{minute:02d} {period}"
-
-
-def permission_time_slot_options() -> list[dict[str, str]]:
-    """WhatsApp Flow dropdown: 12:00 AM – 11:30 PM every 30 minutes."""
-    rows: list[dict[str, str]] = []
-    for hour24 in range(24):
-        for minute in (0, 30):
-            label = _format_12h(hour24, minute)
-            rows.append({"id": label, "title": label})
-    return rows
 
 
 def normalize_permission_time_label(raw: str) -> str:
@@ -102,6 +95,116 @@ def resolve_shift_login_logout(
     if not login or not logout:
         return None
     return str(login).strip(), str(logout).strip()
+
+
+def permission_type_allowed(
+    ud: dict | None, permission_shift: str, permission_type_code: str
+) -> bool:
+    """RS Shift II: Late IN only."""
+    if not ud:
+        return True
+    st = (ud.get("shift_type") or "GS").strip().upper()
+    shift = (permission_shift or "I").strip().upper()
+    code = (permission_type_code or "").strip().upper()
+    if st == "RS" and shift in ("II", "2"):
+        return code == _TYPE_LATE_IN
+    return True
+
+
+def _slot_rows(minutes_start: int, minutes_end: int) -> list[str]:
+    if minutes_end < minutes_start:
+        return []
+    labels: list[str] = []
+    m = minutes_start
+    while m <= minutes_end:
+        hour24, minute = divmod(m, 60)
+        if hour24 > 23:
+            break
+        labels.append(_format_12h(hour24, minute))
+        m += SLOT_STEP
+    return labels
+
+
+def _late_in_labels(login_hhmm: str) -> list[str]:
+    login = _parse_hhmm(login_hhmm)
+    if not login:
+        return []
+    login_m = _minutes_of_day(login[0], login[1])
+    return _slot_rows(login_m + SLOT_STEP, login_m + MAX_PERMISSION_MINUTES)
+
+
+def _early_out_labels(logout_hhmm: str) -> list[str]:
+    logout = _parse_hhmm(logout_hhmm)
+    if not logout:
+        return []
+    logout_m = _minutes_of_day(logout[0], logout[1])
+    return _slot_rows(
+        logout_m - MAX_PERMISSION_MINUTES + SLOT_STEP, logout_m - SLOT_STEP
+    )
+
+
+def _other_out_labels(login_hhmm: str, logout_hhmm: str) -> list[str]:
+    login = _parse_hhmm(login_hhmm)
+    logout = _parse_hhmm(logout_hhmm)
+    if not login or not logout:
+        return []
+    login_m = _minutes_of_day(login[0], login[1])
+    logout_m = _minutes_of_day(logout[0], logout[1])
+    start_m = (
+        login_m
+        if login_m % SLOT_STEP == 0
+        else ((login_m // SLOT_STEP) + 1) * SLOT_STEP
+    )
+    return _slot_rows(start_m, logout_m - SLOT_STEP)
+
+
+def _other_in_labels(expected_out: str, logout_hhmm: str) -> list[str]:
+    out_t = _parse_12h(normalize_permission_time_label(expected_out))
+    logout = _parse_hhmm(logout_hhmm)
+    if not out_t or not logout:
+        return []
+    out_m = _minutes_of_day(out_t[0], out_t[1])
+    logout_m = _minutes_of_day(logout[0], logout[1])
+    return _slot_rows(out_m + SLOT_STEP, min(out_m + MAX_PERMISSION_MINUTES, logout_m))
+
+
+def _flow_type_key(permission_type_code: str) -> str:
+    code = (permission_type_code or "").strip().upper()
+    if code == _TYPE_LATE_IN:
+        return "late_in"
+    if code == _TYPE_EARLY_OUT:
+        return "early_out"
+    if code == _TYPE_OTHER:
+        return "other"
+    return ""
+
+
+def validate_expected_permission_times(
+    ud: dict | None,
+    *,
+    permission_shift: str,
+    permission_type_code: str,
+    expected_in: str = "",
+    expected_out: str = "",
+) -> bool:
+    if not permission_type_allowed(ud, permission_shift, permission_type_code):
+        return False
+    bounds = resolve_shift_login_logout(ud, permission_shift)
+    if not bounds:
+        return False
+    login_hhmm, logout_hhmm = bounds
+    pt = _flow_type_key(permission_type_code)
+    exp_in = normalize_permission_time_label(expected_in)
+    exp_out = normalize_permission_time_label(expected_out)
+    if pt == "late_in":
+        return bool(exp_in) and exp_in in set(_late_in_labels(login_hhmm))
+    if pt == "early_out":
+        return bool(exp_out) and exp_out in set(_early_out_labels(logout_hhmm))
+    if pt == "other":
+        if not exp_out or exp_out not in set(_other_out_labels(login_hhmm, logout_hhmm)):
+            return False
+        return bool(exp_in) and exp_in in set(_other_in_labels(exp_out, logout_hhmm))
+    return False
 
 
 def compute_expected_permission_hours(
