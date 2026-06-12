@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from bot_shared import (
+    format_leave_days_label,
     get_employee_leave_counts,
     get_employee_permission_counts,
     get_user_record,
     leave_days_requested_from_doc,
+    leave_days_value_from_doc,
     shrink_leave_to_day_count,
     wa_from_env,
 )
@@ -439,8 +441,9 @@ def _approval_message_body(
         rd = request_rd or {}
         from_d = (rd.get("leave_from_date") or "").strip()
         to_d = (rd.get("leave_to_date") or from_d).strip()
-        days = int(rd.get("leave_days") or 1)
-        if days <= 1 or (from_d and to_d and from_d == to_d):
+        days_label = format_leave_days_label(rd)
+        days_val = leave_days_value_from_doc(rd)
+        if days_val <= 1 or (from_d and to_d and from_d == to_d):
             date_lines = f"Date: {from_d or '—'}\n"
         else:
             date_lines = f"From Date: {from_d or '—'}\nTo Date: {to_d or '—'}\n"
@@ -463,7 +466,7 @@ def _approval_message_body(
             f"{test_tag}Leave approval request\n\n"
             f"Name: {emp}\n"
             f"Department: {dept}\n"
-            f"No. of days leave: {days}\n"
+            f"No. of days leave: {days_label}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
             f"Leaves in Last month: {leaves_last}\n"
@@ -620,11 +623,16 @@ def _leave_approver_can_modify(role: str | None, rd: dict) -> bool:
 
 def _leave_days_modify_prompt(rd: dict) -> str:
     max_days = leave_days_requested_from_doc(rd)
-    current = int(rd.get("leave_days") or max_days)
+    current_label = format_leave_days_label(rd)
+    max_label = format_leave_days_label({
+        **rd,
+        "leave_days": max_days,
+        "leave_duration": "full" if max_days > 0.5 else "half",
+    })
     return (
-        f"Employee requested: {max_days} day(s)\n"
-        f"JMD set to: {current} day(s)\n"
-        f"Reply with a number from 1 to {max_days}."
+        f"Employee requested: {max_label}\n"
+        f"JMD set to: {current_label}\n"
+        f"Reply with a number from 1 to {int(max_days)}."
     )
 
 
@@ -1036,15 +1044,12 @@ def notify_pending_leave_md_approvals(sender: str, *, limit: int = 10) -> int:
 def _employee_final_approval_message(req_label: str, rd: dict | None = None) -> str:
     if req_label == "leave":
         data = rd or {}
-        try:
-            days = max(1, int(data.get("leave_days") or 1))
-        except (TypeError, ValueError):
-            days = 1
+        days_label = format_leave_days_label(data)
+        days_val = leave_days_value_from_doc(data)
         from_d = (data.get("leave_from_date") or "").strip()
         to_d = (data.get("leave_to_date") or from_d).strip()
-        day_word = "day" if days == 1 else "days"
-        msg = f"Your leave request has been approved for {days} {day_word}."
-        if days <= 1 or (from_d and to_d and from_d == to_d):
+        msg = f"Your leave request has been approved for {days_label}."
+        if days_val <= 1 or (from_d and to_d and from_d == to_d):
             if from_d:
                 msg += f"\nDate: {from_d}"
         elif from_d:

@@ -215,18 +215,45 @@ def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
     return out
 
 
-def leave_days_requested_from_doc(d: dict) -> int:
+def leave_days_value_from_doc(d: dict) -> float:
+    """Approved or requested leave length in days (0.5 = half day)."""
+    raw = d.get("leave_days")
+    if raw is not None:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    if (d.get("leave_duration") or "").strip().lower() == "half":
+        return 0.5
+    return 1.0
+
+
+def format_leave_days_label(d: dict) -> str:
+    """Display label for approval UI and employee messages."""
+    if (d.get("leave_duration") or "").strip().lower() == "half":
+        return "Half Day (0.5)"
+    days = leave_days_value_from_doc(d)
+    if days == 0.5:
+        return "Half Day (0.5)"
+    if days == int(days):
+        n = int(days)
+        return str(n)
+    return str(days)
+
+
+def leave_days_requested_from_doc(d: dict) -> float:
     """Original requested leave length (for approver modify-days ceiling)."""
     raw = d.get("leave_days_requested")
     if raw is not None:
         try:
-            return max(1, int(raw))
+            v = float(raw)
+            if v > 0:
+                return v
         except (TypeError, ValueError):
             pass
-    try:
-        return max(1, int(d.get("leave_days") or 1))
-    except (TypeError, ValueError):
-        return 1
+    return leave_days_value_from_doc(d)
 
 
 def shrink_leave_to_day_count(rd: dict, new_days: int) -> dict | None:
@@ -399,13 +426,22 @@ def query_leave_requests_for_employee_id(
     return out
 
 
-def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> int:
+def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> float:
     """Day count from leave_dates / from-to on one request document."""
     month_key = f"{year}-{month:02d}"
     if (d.get("source") or "").strip().lower() == "imported_history":
         hist = (d.get("history_month") or "").strip()
         if hist == month_key:
-            return int(d.get("leave_days") or len(d.get("leave_dates") or []) or 0)
+            try:
+                return float(d.get("leave_days") or len(d.get("leave_dates") or []) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    days_val = leave_days_value_from_doc(d)
+    if days_val == 0.5:
+        from_d = _parse_ddmmy(d.get("leave_from_date"))
+        if from_d and from_d.year == year and from_d.month == month:
+            return 0.5
+        return 0.0
     dates = d.get("leave_dates") or []
     if dates:
         n = 0
@@ -413,11 +449,11 @@ def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> int:
             parsed = _parse_ddmmy(str(ds))
             if parsed and parsed.year == year and parsed.month == month:
                 n += 1
-        return n
+        return float(n)
     from_d = _parse_ddmmy(d.get("leave_from_date"))
     to_d = _parse_ddmmy(d.get("leave_to_date") or d.get("leave_from_date"))
     if not from_d:
-        return 0
+        return 0.0
     if not to_d:
         to_d = from_d
     n = 0
@@ -426,7 +462,7 @@ def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> int:
         if cur.year == year and cur.month == month:
             n += 1
         cur += timedelta(days=1)
-    return n
+    return float(n)
 
 
 def count_leave_days_in_month_from_dates(
@@ -443,10 +479,10 @@ def count_leave_days_in_month_from_dates(
     return n
 
 
-def _leave_days_in_month(d: dict, year: int, month: int) -> int:
+def _leave_days_in_month(d: dict, year: int, month: int) -> float:
     """Approved leave days in month. Pending and denied are not counted."""
     if not _leave_fully_approved(d):
-        return 0
+        return 0.0
     return _count_leave_days_in_month_from_doc(d, year, month)
 
 
@@ -457,7 +493,7 @@ def _leave_month_days_count(
     month: int,
     *,
     employee_wa: str = "",
-) -> int:
+) -> float:
     eid = (employee_id or "").strip().upper()
     seen: set[str] = set()
     total = 0
@@ -482,7 +518,7 @@ def get_employee_leave_counts(
     employee_wa: str = "",
     firestore_db=None,
     reference: datetime | None = None,
-) -> tuple[int, int]:
+) -> tuple[float, float]:
     """
     Approved leave days in last and current calendar month (IST) from `requests`.
 

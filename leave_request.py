@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 LEAVE_SESSION_STATES = frozenset({
     "WAITING_LEAVE_WHEN",
+    "WAITING_LEAVE_DURATION",
     "WAITING_LEAVE_FROM_DATE",
     "WAITING_LEAVE_TO_DATE",
     "WAITING_LEAVE_REASON_PICK",
@@ -38,6 +39,7 @@ LEAVE_SESSION_STATES = frozenset({
 CANCEL_CHOICES = frozenset({"LEAVE_CANCEL", "LEAVE_EXIT"})
 
 WHEN_CHOICES = frozenset({"TODAY", "TOMORROW", "OTHER"})
+DURATION_CHOICES = frozenset({"FULL_DAY", "HALF_DAY"})
 REASON_CHOICES = frozenset({"SICK_LEAVE", "CASUAL_LEAVE", "LEAVE_REASON_OTHER"})
 
 REASON_LABELS = {
@@ -125,7 +127,32 @@ def handle(sender: str, incoming: str, session: dict, deps: LeaveDeps) -> None:
             deps.send_to(sender, "From date (DD-MM-YYYY):")
             return
         from_d, to_d = _dates_for_when(when)
-        _go_to_reason_pick(sender, session, deps, from_d, to_d)
+        _go_to_duration_pick(sender, session, deps, from_d, to_d)
+        return
+
+    if state == "WAITING_LEAVE_DURATION":
+        duration = _normalize_duration_choice(incoming)
+        if duration not in DURATION_CHOICES:
+            deps.send_to(sender, "Choose Full Day or Half Day.")
+            return
+        from_d = (session.get("leave_from_date") or "").strip()
+        to_d = (session.get("leave_to_date") or from_d).strip()
+        days, leave_duration = _resolve_leave_days_and_duration(
+            from_d, to_d, "half_day" if duration == "HALF_DAY" else "full_day"
+        )
+        if _check_leave_overlap(sender, session, deps, from_d, to_d):
+            return
+        deps.session_merge(
+            sender,
+            state="WAITING_LEAVE_REASON_PICK",
+            leave_from_date=from_d,
+            leave_to_date=to_d,
+            leave_days=days,
+            leave_duration=leave_duration,
+            employee_name=session.get("employee_name"),
+            department=session.get("department"),
+        )
+        _send_reason_buttons(sender, deps)
         return
 
     if state == "WAITING_LEAVE_FROM_DATE":
@@ -299,6 +326,19 @@ def _leave_days(from_s: str, to_s: str) -> int:
     return max(1, (t - f).days + 1)
 
 
+def _is_half_day_duration(raw: str) -> bool:
+    slug = (raw or "").strip().lower().replace(" ", "_")
+    return slug in ("half_day", "half", "halfday", "leave_half_day")
+
+
+def _resolve_leave_days_and_duration(
+    from_d: str, to_d: str, duration_raw: str = ""
+) -> tuple[float, str]:
+    if _is_half_day_duration(duration_raw) and from_d == to_d:
+        return 0.5, "half"
+    return float(_leave_days(from_d, to_d)), "full"
+
+
 def _overlap_cancel_body(overlap_status: str) -> str:
     if overlap_status == "approved":
         status_line = (
@@ -361,7 +401,7 @@ def _check_leave_overlap(
     return True
 
 
-def _go_to_reason_pick(
+def _go_to_duration_pick(
     sender: str,
     session: dict,
     deps: LeaveDeps,
@@ -372,14 +412,53 @@ def _go_to_reason_pick(
         return
     deps.session_merge(
         sender,
+        state="WAITING_LEAVE_DURATION",
+        leave_from_date=from_d,
+        leave_to_date=to_d,
+        employee_name=session.get("employee_name"),
+        department=session.get("department"),
+    )
+    _send_duration_buttons(sender, deps)
+
+
+def _go_to_reason_pick(
+    sender: str,
+    session: dict,
+    deps: LeaveDeps,
+    from_d: str,
+    to_d: str,
+) -> None:
+    if _check_leave_overlap(sender, session, deps, from_d, to_d):
+        return
+    days, leave_duration = _resolve_leave_days_and_duration(from_d, to_d, "full_day")
+    deps.session_merge(
+        sender,
         state="WAITING_LEAVE_REASON_PICK",
         leave_from_date=from_d,
         leave_to_date=to_d,
-        leave_days=_leave_days(from_d, to_d),
+        leave_days=days,
+        leave_duration=leave_duration,
         employee_name=session.get("employee_name"),
         department=session.get("department"),
     )
     _send_reason_buttons(sender, deps)
+
+
+def _send_duration_buttons(wa_id: str, deps: LeaveDeps) -> None:
+    body = "Full day or half day?\n(Default: Full Day)"
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            body,
+            [
+                ("LEAVE_FULL_DAY", "Full Day"),
+                ("LEAVE_HALF_DAY", "Half Day"),
+            ],
+            callback_data="leave-duration",
+        )
+    except Exception:
+        logger.exception("leave duration buttons failed")
+        deps.send_to(wa_id, f"{body}\nReply: Full Day or Half Day.")
 
 
 def _send_when_buttons(wa_id: str, deps: LeaveDeps) -> None:
@@ -515,7 +594,17 @@ def _submit(
         )
         return
 
-    days = _leave_days(from_d, to_d)
+    if session.get("leave_days") is not None:
+        try:
+            days = float(session["leave_days"])
+        except (TypeError, ValueError):
+            days, leave_duration = _resolve_leave_days_and_duration(from_d, to_d)
+        else:
+            leave_duration = (session.get("leave_duration") or "").strip().lower()
+            if not leave_duration:
+                leave_duration = "half" if days == 0.5 else "full"
+    else:
+        days, leave_duration = _resolve_leave_days_and_duration(from_d, to_d, "full_day")
     leave_dates = expand_leave_date_range(from_d, to_d)
     leaves_last_month, leaves_current_month = get_employee_leave_counts(
         employee_id,
@@ -539,6 +628,7 @@ def _submit(
         "leave_to_date_requested": to_d,
         "leave_days": days,
         "leave_days_requested": days,
+        "leave_duration": leave_duration,
         "leave_dates": leave_dates,
         "leaves_last_month": leaves_last_month,
         "leaves_current_month": leaves_current_month,
@@ -573,6 +663,20 @@ def _submit(
 
 def _normalize_incoming(incoming: str) -> str:
     return (incoming or "").strip().upper().replace(" ", "_")
+
+
+def _normalize_duration_choice(incoming: str) -> str:
+    c = _normalize_incoming(incoming)
+    if c in ("LEAVE_HALF_DAY", "HALF_DAY", "HALF", "2"):
+        return "HALF_DAY"
+    if c in ("LEAVE_FULL_DAY", "FULL_DAY", "FULL", "1"):
+        return "FULL_DAY"
+    low = (incoming or "").strip().lower()
+    if low in ("half day", "half"):
+        return "HALF_DAY"
+    if low in ("full day", "full"):
+        return "FULL_DAY"
+    return c
 
 
 def _normalize_when_choice(incoming: str) -> str:
@@ -664,6 +768,15 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     else:
         from_d, to_d = _dates_for_when(when)
 
+    duration_raw = _flow_pick(data, "leave_duration", "duration")
+    if when == "OTHER":
+        duration_raw = "full_day"
+    elif not duration_raw:
+        duration_raw = "full_day"
+    days, leave_duration = _resolve_leave_days_and_duration(
+        from_d, to_d, duration_raw
+    )
+
     reason_raw = _flow_pick(data, "leave_reason", "reason").lower().replace(" ", "_")
     other_reason = _flow_pick(data, "other_reason", "reason_text")
     if reason_raw in ("sick_leave", "sick"):
@@ -683,6 +796,8 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     return {
         "leave_from_date": from_d,
         "leave_to_date": to_d,
+        "leave_days": days,
+        "leave_duration": leave_duration,
         "leave_reason_code": reason_code,
         "leave_reason": reason,
     }
