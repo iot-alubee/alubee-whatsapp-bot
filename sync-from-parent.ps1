@@ -32,6 +32,8 @@ $modules = @(
 
     "permission_request.py",
 
+    "permission_times.py",
+
     "requirements.txt",
 
     ".env.example"

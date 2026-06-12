@@ -173,6 +173,59 @@ def find_open_request(employee: str, request_type: str) -> dict | None:
     return None
 
 
+def _guest_phone10_from_request(d: dict) -> str:
+    for key in ("guest_phone", "guest_mobile"):
+        phone = digits(str(d.get(key) or ""))
+        if len(phone) >= 10:
+            return phone[-10:]
+    for key in ("guest_whatsapp", "guest_wa", "visitor_mobile"):
+        phone = digits(str(d.get(key) or ""))
+        if len(phone) >= 10:
+            return phone[-10:]
+    return ""
+
+
+def visitor_request_is_closed(d: dict) -> bool:
+    """Closed when denied or security has recorded OUT (visit finished)."""
+    for key in (
+        "manager_status",
+        "jmd_status",
+        "md_status",
+        "jmd_i_status",
+        "jmd_ii_status",
+    ):
+        if (d.get(key) or "").strip().upper() == "DENIED":
+            return True
+    vt = (d.get("visiting_to") or "").strip().upper()
+    dual = vt == "BOTH" or bool(d.get("visitor_dual_jmd"))
+    if dual:
+        out_i = d.get("security_out_at_unit_i")
+        out_ii = d.get("security_out_at_unit_ii")
+        if out_i is None and d.get("security_out_at") is not None:
+            out_i = d.get("security_out_at")
+        return out_i is not None and out_ii is not None
+    if d.get("security_out_at") is not None:
+        return True
+    uk = "unit_ii" if vt == "UNIT_II" else "unit_i"
+    return d.get(f"security_out_at_{uk}") is not None
+
+
+def find_open_visitor_for_guest_phone(guest_phone10: str) -> dict | None:
+    """Open VISITOR request for the same guest mobile (any employee)."""
+    _db = _require("db", db)
+    target = digits(guest_phone10)
+    if len(target) < 10:
+        return None
+    target = target[-10:]
+    for snap in query_requests_by_type(_db, "VISITOR"):
+        d = snap.to_dict() or {}
+        if visitor_request_is_closed(d):
+            continue
+        if _guest_phone10_from_request(d) == target:
+            return d
+    return None
+
+
 def _ist_now() -> datetime:
     if ZoneInfo:
         return datetime.now(ZoneInfo("Asia/Kolkata"))

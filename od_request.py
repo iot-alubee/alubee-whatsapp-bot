@@ -20,7 +20,10 @@ from interakt_api import send_list_menu, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
 
-OD_ALREADY_PENDING_MSG = "Your OD request is already pending."
+OD_ALREADY_PENDING_MSG = (
+    "You already have an open OD request for today. "
+    "Close it at security (IN) or wait until it is denied before starting another."
+)
 OD_FLOW_TEMPLATE_DEFAULT = "od_request"
 
 OD_SESSION_STATES = frozenset({
@@ -283,7 +286,7 @@ def _od_approval_still_pending(d: dict) -> bool:
 
 
 def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
-    """Block a new OD only when today's request is still awaiting approval."""
+    """Block a new OD while today's request is not closed (denied or security IN)."""
     from bot_shared import query_requests_for_employee
 
     today = _ist_today()
@@ -291,7 +294,7 @@ def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
         d = snap.to_dict() or {}
         if _requested_datetime_ist_date(d) != today:
             continue
-        if not _od_approval_still_pending(d):
+        if _od_request_is_closed(d):
             continue
         return d
     return None
