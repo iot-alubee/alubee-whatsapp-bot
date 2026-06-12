@@ -92,6 +92,8 @@ class ApprovalDeps:
     visitor_test_md: str = ""
     visitor_test_employee_wa_ids: frozenset[str] = frozenset()
     ppc: str = ""
+    ppc1: str = ""
+    ppc2: str = ""
     hr: str = ""
 
 
@@ -352,32 +354,60 @@ def build_leave_approval_chain(user_data: dict | None = None) -> dict | None:
     return build_approval_chain(user_data, request_type="LEAVE")
 
 
+def _cl_ppc_for_shift(permission_shift: str) -> tuple[str, str]:
+    """Unit I Shift I → PPC1; Unit II Shift II → PPC2. Returns (wa_id, route label)."""
+    d = _require()
+    shift = (permission_shift or "I").strip().upper()
+    if shift in ("II", "2"):
+        ppc = (
+            wa_from_env("PPC2_WHATSAPP_NUMBER")
+            or d.ppc2
+            or ""
+        ).strip()
+        return ppc, "PPC2"
+    ppc = (
+        wa_from_env("PPC1_WHATSAPP_NUMBER")
+        or d.ppc1
+        or wa_from_env("PPC_WHATSAPP_NUMBER")
+        or d.ppc
+        or ""
+    ).strip()
+    return ppc, "PPC1"
+
+
 def build_permission_approval_chain(
     user_data: dict | None = None,
     *,
     permission_for: str = "myself",
+    permission_shift: str = "",
 ) -> dict | None:
     """
     Employee permission (myself): JMD → MD (same as OD).
-    CL permission: PPC → HR (no online/offline for PPC/HR).
+    CL permission: Shift I → PPC1 → HR (Meena); Shift II → PPC2 → HR.
     """
     if not user_data:
         return None
     pf = (permission_for or "myself").strip().lower()
     if pf == "cl":
+        shift = (permission_shift or "I").strip().upper()
+        if shift in ("II", "2"):
+            logger.error("CL permission not allowed for Shift II")
+            return None
         d = _require()
-        ppc = (wa_from_env("PPC_WHATSAPP_NUMBER") or d.ppc or "").strip()
+        ppc, route = _cl_ppc_for_shift(permission_shift)
         hr = (wa_from_env("HR_WHATSAPP_NUMBER") or d.hr or "").strip()
         if not ppc or not hr:
             logger.error(
-                "CL permission approvers missing ppc=%r hr=%r",
+                "CL permission approvers missing route=%s ppc=%r hr=%r shift=%s",
+                route,
                 ppc or "(missing)",
                 hr or "(missing)",
+                permission_shift,
             )
             return None
         return {
             "jmd": ppc,
-            "jmd_route": "PPC",
+            "jmd_route": route,
             "md": hr,
             "permission_cl_chain": True,
         }
@@ -1071,9 +1101,10 @@ def _uses_legacy_test_single_approver(rd: dict) -> bool:
 
 
 def _cl_permission_chain(rd: dict) -> bool:
+    route = (rd.get("jmd_route") or "").strip().upper()
     return bool(rd.get("permission_cl_chain")) or (
         (rd.get("permission_for") or "").strip().lower() == "cl"
-        and (rd.get("jmd_route") or "").strip().upper() == "PPC"
+        and route in ("PPC", "PPC1", "PPC2")
     )
 
 
@@ -1214,7 +1245,8 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 rd = ref.get().to_dict() or rd
                 notify_approver(md_wa, rd, request_id)
                 logger.info(
-                    "ppc approved CL permission request_id=%s → hr",
+                    "%s approved CL permission request_id=%s → hr",
+                    (rd.get("jmd_route") or "PPC").strip().upper(),
                     request_id,
                 )
             else:

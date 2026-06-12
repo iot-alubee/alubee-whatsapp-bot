@@ -235,10 +235,11 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
         session = {**session, "cl_employee_name": cl_name[:200], "permission_for": "cl"}
         deps.session_merge(
             sender,
-            state="WAITING_PERMISSION_SHIFT",
+            state="WAITING_PERMISSION_REASON",
             cl_employee_name=cl_name[:200],
+            permission_shift="I",
         )
-        _send_shift_buttons(sender, deps)
+        deps.send_to(sender, "Please type your permission reason:")
         return
 
     if state == "WAITING_PERMISSION_SHIFT":
@@ -249,6 +250,12 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
         shift_label = "I" if shift_code == "PERMISSION_SHIFT_I" else "II"
         permission_for = (session.get("permission_for") or "myself").strip().lower()
         if permission_for == "cl":
+            if shift_label == "II":
+                deps.send_to(
+                    sender,
+                    "CL permission is not allowed for Shift II. Only Shift I (Unit I) is supported.",
+                )
+                return
             exists, ud = get_user_record(sender)
             ud = ud or {}
             if _check_cl_overlap(
@@ -258,7 +265,7 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
                 (session.get("cl_employee_name") or "").strip(),
                 work_date=_compute_permission_work_date(
                     ud,
-                    permission_shift=shift_label,
+                    permission_shift="I",
                     permission_type_code="PERMISSION_EARLY_OUT",
                     permission_for="cl",
                 ),
@@ -267,7 +274,7 @@ def handle(sender: str, incoming: str, session: dict, deps: PermissionDeps) -> N
             deps.session_merge(
                 sender,
                 state="WAITING_PERMISSION_REASON",
-                permission_shift=shift_label,
+                permission_shift="I",
             )
             deps.send_to(sender, "Please type your permission reason:")
             return
@@ -549,6 +556,15 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
 
     permission_for = (session.get("permission_for") or "myself").strip().lower()
     shift = (session.get("permission_shift") or "").strip()
+    if permission_for == "cl":
+        if shift in ("II", "2"):
+            deps.session_ref(sender).delete()
+            deps.send_to(
+                sender,
+                "CL permission is not allowed for Shift II. Only Shift I (Unit I) is supported.",
+            )
+            return
+        shift = "I"
     if permission_for == "myself" and not _is_rotational_shift(ud):
         shift = "I"
     type_code = (
@@ -575,14 +591,20 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
 
     employee_id = ud.get("employee_id") or ""
     permission_date = _today_ddmmy()
-    chain = deps.build_approval_chain(ud, permission_for=permission_for)
+    chain = deps.build_approval_chain(
+        ud,
+        permission_for=permission_for,
+        permission_shift=shift,
+    )
     if not chain or not chain.get("jmd"):
         deps.session_ref(sender).delete()
         if permission_for == "cl":
+            unit = "Unit II" if shift in ("II", "2") else "Unit I"
+            ppc_env = "PPC2_WHATSAPP_NUMBER" if shift in ("II", "2") else "PPC1_WHATSAPP_NUMBER"
             deps.send_to(
                 sender,
-                "CL permission approvers not configured.\n"
-                "Set PPC_WHATSAPP_NUMBER and HR_WHATSAPP_NUMBER, or contact admin.",
+                f"CL permission approvers not configured for {unit}.\n"
+                f"Set {ppc_env} and HR_WHATSAPP_NUMBER, or contact admin.",
             )
         else:
             deps.send_to(
@@ -674,7 +696,7 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
     msg = "Your permission request has been submitted for approval."
     if not jmd_ok:
         route = chain["jmd_route"]
-        approver = "PPC" if permission_for == "cl" else f"JMD ({route})"
+        approver = route if permission_for == "cl" else f"JMD ({route})"
         msg += (
             f"\n\n{approver} could not be notified on WhatsApp. "
             "Ask them to send Hi to this Alubee number once, then contact admin."
@@ -811,8 +833,9 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         cl_name = _flow_pick(data, "cl_employee_name", "employee_name", "cl_name")
         if not cl_name:
             return None
-        if not shift:
+        if shift in ("II", "2"):
             return None
+        shift = "I"
         expected = _parse_expected_permission_times(
             data, permission_for="cl", type_code="PERMISSION_EARLY_OUT"
         )
@@ -862,6 +885,17 @@ def handle_flow_submission(
     if permission_for == "cl" and not _is_supervisor(ud):
         deps.send_to(sender, "For CL permission is only for supervisors. Use For Myself.")
         return
+    if permission_for == "cl" and (parsed.get("permission_shift") or "").strip() in (
+        "II",
+        "2",
+    ):
+        deps.send_to(
+            sender,
+            "CL permission is not allowed for Shift II. Only Shift I (Unit I) is supported.",
+        )
+        return
+    if permission_for == "cl":
+        parsed["permission_shift"] = "I"
     if permission_for == "myself" and _is_rotational_shift(ud):
         if not (parsed.get("permission_shift") or "").strip():
             deps.send_to(sender, "Please select Shift and submit again.")
