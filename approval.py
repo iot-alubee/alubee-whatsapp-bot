@@ -23,6 +23,7 @@ from bot_shared import (
 import approver_availability
 
 from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
+from permission_times import permission_time_lines_for_approval
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +507,7 @@ def _approval_message_body(
                 perms_curr = rd.get("permissions_current_month", 0)
         perm_type = (rd.get("permission_type") or "").strip() or "—"
         test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
+        time_lines = permission_time_lines_for_approval(rd)
         if (rd.get("permission_for") or "").strip().lower() == "cl":
             cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
             shift = _permission_shift_display()
@@ -515,7 +517,8 @@ def _approval_message_body(
                 f"Department: {dept}\n"
                 f"Shift: {shift}\n"
                 f"Reason: {reason or '—'}\n"
-                f"Permission type: Early OUT\n\n"
+                f"Permission type: Early OUT\n"
+                f"{time_lines}\n"
                 "Please approve or deny."
             )
         shift = _permission_shift_display()
@@ -526,6 +529,7 @@ def _approval_message_body(
             f"Shift: {shift}\n"
             f"Permission type: {perm_type}\n"
             f"Reason: {reason or '—'}\n"
+            f"{time_lines}"
             f"Permission in last month: {perms_last}\n"
             f"Permission in current month: {perms_curr}\n\n"
             "Please approve or deny."

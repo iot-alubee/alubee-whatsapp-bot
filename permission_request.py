@@ -23,6 +23,11 @@ from bot_shared import (
     get_user_record,
 )
 from interakt_api import send_reply_buttons, wa_id_to_phone
+from permission_times import (
+    combine_permission_time_parts,
+    compute_expected_permission_hours,
+    normalize_permission_time_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -635,6 +640,20 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
         )
         payload["permission_type_code"] = session.get("permission_type_code") or ""
 
+    expected_fields = {
+        k: session.get(k) or ""
+        for k in ("permission_expected_in", "permission_expected_out")
+        if session.get(k)
+    }
+    if expected_fields:
+        _attach_expected_permission_hours(
+            payload,
+            ud,
+            permission_shift=shift,
+            permission_type_code=type_code,
+            expected_fields=expected_fields,
+        )
+
     ref = deps.db.collection("requests").document()
     request_id = ref.id
     payload["request_id"] = request_id
@@ -660,6 +679,80 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
             "Ask them to send Hi to this Alubee number once, then contact admin."
         )
     deps.send_to(sender, msg)
+
+
+def _expected_time_from_flow(data: dict, kind: str) -> str:
+    prefix = f"expected_{kind}"
+    combined = combine_permission_time_parts(
+        _flow_pick(data, f"{prefix}_hour"),
+        _flow_pick(data, f"{prefix}_minute"),
+        _flow_pick(data, f"{prefix}_ampm"),
+    )
+    if combined:
+        return combined
+    return normalize_permission_time_label(
+        _flow_pick(
+            data,
+            f"{prefix}_time",
+            prefix,
+            f"permission_expected_{kind}",
+        )
+    )
+
+
+def _parse_expected_permission_times(
+    data: dict, *, permission_for: str, type_code: str
+) -> dict | None:
+    """Extract expected IN/OUT from flow submit; None if required time missing."""
+    exp_in = _expected_time_from_flow(data, "in")
+    exp_out = _expected_time_from_flow(data, "out")
+    if permission_for == "cl":
+        if not exp_out:
+            return None
+        return {"permission_expected_out": exp_out}
+    code = (type_code or "").strip().upper()
+    if code == "PERMISSION_LATE_IN":
+        if not exp_in:
+            return None
+        return {"permission_expected_in": exp_in}
+    if code == "PERMISSION_EARLY_OUT":
+        if not exp_out:
+            return None
+        return {"permission_expected_out": exp_out}
+    if code == "PERMISSION_OTHER":
+        if not exp_in or not exp_out:
+            return None
+        return {
+            "permission_expected_in": exp_in,
+            "permission_expected_out": exp_out,
+        }
+    return None
+
+
+def _attach_expected_permission_hours(
+    payload: dict,
+    ud: dict,
+    *,
+    permission_shift: str,
+    permission_type_code: str,
+    expected_fields: dict,
+) -> None:
+    exp_in = expected_fields.get("permission_expected_in") or ""
+    exp_out = expected_fields.get("permission_expected_out") or ""
+    if exp_in:
+        payload["permission_expected_in"] = exp_in
+    if exp_out:
+        payload["permission_expected_out"] = exp_out
+    mins, hours_label = compute_expected_permission_hours(
+        ud,
+        permission_shift=permission_shift,
+        permission_type_code=permission_type_code,
+        expected_in=exp_in,
+        expected_out=exp_out,
+    )
+    if hours_label and hours_label != "—":
+        payload["permission_hours_required"] = hours_label
+        payload["permission_hours_required_minutes"] = mins
 
 
 def _flow_pick(data: dict, *needles: str) -> str:
@@ -726,9 +819,14 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
             return None
         if not shift:
             return None
+        expected = _parse_expected_permission_times(
+            data, permission_for="cl", type_code="PERMISSION_EARLY_OUT"
+        )
+        if not expected:
+            return None
         session["cl_employee_name"] = cl_name[:200]
         session["permission_shift"] = shift
-        return {**session, "reason": reason[:500]}
+        return {**session, **expected, "reason": reason[:500]}
 
     type_raw = _flow_pick(data, "permission_type", "type").lower().replace(" ", "_")
     if type_raw in ("late_in", "latein", "late"):
@@ -744,7 +842,12 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     session["permission_type"] = TYPE_LABELS[type_code]
     if shift:
         session["permission_shift"] = shift
-    return {**session, "reason": reason[:500]}
+    expected = _parse_expected_permission_times(
+        data, permission_for="myself", type_code=type_code
+    )
+    if not expected:
+        return None
+    return {**session, **expected, "reason": reason[:500]}
 
 
 def handle_flow_submission(
