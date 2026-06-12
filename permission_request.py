@@ -24,7 +24,6 @@ from bot_shared import (
 )
 from interakt_api import send_reply_buttons, wa_id_to_phone
 from permission_times import (
-    combine_permission_time_parts,
     compute_expected_permission_hours,
     normalize_permission_time_label,
 )
@@ -683,13 +682,6 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
 
 def _expected_time_from_flow(data: dict, kind: str) -> str:
     prefix = f"expected_{kind}"
-    combined = combine_permission_time_parts(
-        _flow_pick(data, f"{prefix}_hour"),
-        _flow_pick(data, f"{prefix}_minute"),
-        _flow_pick(data, f"{prefix}_ampm"),
-    )
-    if combined:
-        return combined
     return normalize_permission_time_label(
         _flow_pick(
             data,

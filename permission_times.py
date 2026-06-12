@@ -17,52 +17,14 @@ def _format_12h(hour24: int, minute: int) -> str:
     return f"{hour12}:{minute:02d} {period}"
 
 
-def combine_permission_time_parts(hour: str, minute: str, ampm: str) -> str:
-    """Build canonical time e.g. '10:00 AM' from flow dropdown parts."""
-    h = _normalize_hour_part(hour)
-    m = _normalize_minute_part(minute)
-    p = _normalize_ampm_part(ampm)
-    if not h or not m or not p:
-        return ""
-    return f"{h}:{m} {p}"
-
-
-def _normalize_hour_part(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    try:
-        n = int(s)
-    except ValueError:
-        return ""
-    if 1 <= n <= 12:
-        return str(n)
-    return ""
-
-
-def _normalize_minute_part(raw: str) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    try:
-        n = int(s)
-    except ValueError:
-        return ""
-    if 0 <= n <= 59:
-        return f"{n:02d}"
-    return ""
-
-
-def _normalize_ampm_part(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    if s in ("am", "a"):
-        return "AM"
-    if s in ("pm", "p"):
-        return "PM"
-    upper = (raw or "").strip().upper()
-    if upper in ("AM", "PM"):
-        return upper
-    return ""
+def permission_time_slot_options() -> list[dict[str, str]]:
+    """WhatsApp Flow dropdown: 12:00 AM – 11:30 PM every 30 minutes."""
+    rows: list[dict[str, str]] = []
+    for hour24 in range(24):
+        for minute in (0, 30):
+            label = _format_12h(hour24, minute)
+            rows.append({"id": label, "title": label})
+    return rows
 
 
 def normalize_permission_time_label(raw: str) -> str:
