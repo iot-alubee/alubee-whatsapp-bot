@@ -369,7 +369,8 @@ def _leave_fully_approved(d: dict) -> bool:
 def _leave_overlap_status_label(d: dict) -> str:
     """User-facing status for duplicate-date check: pending, approved, or skip."""
     jmd = (d.get("jmd_status") or "").strip().upper()
-    if jmd in ("DENIED", "CANCELLED") or d.get("cancelled_by_employee"):
+    md = (d.get("md_status") or "").strip().upper()
+    if jmd in ("DENIED", "CANCELLED") or md == "DENIED" or d.get("cancelled_by_employee"):
         return ""
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
         return "pending"
