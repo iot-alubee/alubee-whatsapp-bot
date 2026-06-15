@@ -1,5 +1,5 @@
 """
-Interakt Public API — Text, InteractiveList (menu / vehicles), InteractiveButton (quick reply).
+Interakts Public API — Text, InteractiveList (menu / vehicles), InteractiveButton (quick reply).
 """
 
 from __future__ import annotations
