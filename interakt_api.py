@@ -457,12 +457,16 @@ def send_flow_template(
 
     token = (flow_token or "").strip()
     action = flow_action_data if isinstance(flow_action_data, dict) else {}
-    if token or action:
+    if token and action:
         template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
-        button_values: dict[str, Any] = {"0": [token[:256]] if token else [""]}
-        # Interakt expects a JSON object in the array, not a JSON string.
-        button_values["1"] = [action] if action else [{}]
-        template["buttonValues"] = button_values
+        template["buttonValues"] = {"0": [token[:256]], "1": [action]}
+    elif token:
+        # Most Interakt flow templates only accept flow_token (not flow_action_data).
+        template["buttonPayload"] = {"0": ["flow_token"]}
+        template["buttonValues"] = {"0": [token[:256]]}
+    elif action:
+        template["buttonPayload"] = {"0": ["flow_action_data"]}
+        template["buttonValues"] = {"0": [action]}
 
     payload: dict[str, Any] = {
         "countryCode": "+91",
@@ -577,10 +581,6 @@ def send_permission_flow_form(
             body_values=body_values,
             callback_data="permission-flow",
             flow_token=f"perm_{phone_10}"[:256],
-            flow_action_data={
-                "phone": phone_10,
-                "is_supervisor": "1" if is_supervisor else "0",
-            },
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )
