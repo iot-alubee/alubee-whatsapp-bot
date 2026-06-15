@@ -646,15 +646,29 @@ def query_permission_requests_for_employee_id(
     return out
 
 
+def _permission_fully_approved(d: dict) -> bool:
+    """True when permission finished approval (MD/HR step complete or offline bypass)."""
+    jmd = (d.get("jmd_status") or "").strip().upper()
+    if jmd != "APPROVED":
+        return False
+    if d.get("md_offline_bypass"):
+        return True
+    md = (d.get("md_status") or "").strip().upper()
+    if md in ("APPROVED", "OFFLINE"):
+        return True
+    return False
+
+
 def _permission_overlap_status_label(d: dict) -> str:
     """User-facing status for duplicate-date check: pending, approved, or skip."""
     jmd = (d.get("jmd_status") or "").strip().upper()
-    if jmd in ("DENIED", "CANCELLED") or d.get("cancelled_by_employee"):
+    md = (d.get("md_status") or "").strip().upper()
+    if jmd in ("DENIED", "CANCELLED") or md == "DENIED" or d.get("cancelled_by_employee"):
         return ""
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
         return "pending"
     if jmd == "APPROVED":
-        return "approved"
+        return "approved" if _permission_fully_approved(d) else "pending"
     return ""
 
 
