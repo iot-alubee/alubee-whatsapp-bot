@@ -147,7 +147,12 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     if resp.status_code >= 400:
         logger.error("Interakt %s: %s", resp.status_code, data)
         raise RuntimeError(f"Interakt API {resp.status_code}: {data}")
-    logger.info("Interakt sent type=%s status=%s", payload.get("type"), resp.status_code)
+    logger.info(
+        "Interakt sent type=%s status=%s response=%s",
+        payload.get("type"),
+        resp.status_code,
+        data,
+    )
     return data
 
 
@@ -454,13 +459,10 @@ def send_flow_template(
     action = flow_action_data if isinstance(flow_action_data, dict) else {}
     if token or action:
         template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
-        template["buttonValues"] = {
-            "0": [token[:256]],
-            "1": [json.dumps(action, ensure_ascii=True)[:4096]],
-        }
-    else:
-        template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
-        template["buttonValues"] = {"0": [""], "1": [""]}
+        button_values: dict[str, Any] = {"0": [token[:256]] if token else [""]}
+        # Interakt expects a JSON object in the array, not a JSON string.
+        button_values["1"] = [action] if action else [{}]
+        template["buttonValues"] = button_values
 
     payload: dict[str, Any] = {
         "countryCode": "+91",
