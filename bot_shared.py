@@ -173,59 +173,6 @@ def find_open_request(employee: str, request_type: str) -> dict | None:
     return None
 
 
-def _guest_phone10_from_request(d: dict) -> str:
-    for key in ("guest_phone", "guest_mobile"):
-        phone = digits(str(d.get(key) or ""))
-        if len(phone) >= 10:
-            return phone[-10:]
-    for key in ("guest_whatsapp", "guest_wa", "visitor_mobile"):
-        phone = digits(str(d.get(key) or ""))
-        if len(phone) >= 10:
-            return phone[-10:]
-    return ""
-
-
-def visitor_request_is_closed(d: dict) -> bool:
-    """Closed when denied or security has recorded OUT (visit finished)."""
-    for key in (
-        "manager_status",
-        "jmd_status",
-        "md_status",
-        "jmd_i_status",
-        "jmd_ii_status",
-    ):
-        if (d.get(key) or "").strip().upper() == "DENIED":
-            return True
-    vt = (d.get("visiting_to") or "").strip().upper()
-    dual = vt == "BOTH" or bool(d.get("visitor_dual_jmd"))
-    if dual:
-        out_i = d.get("security_out_at_unit_i")
-        out_ii = d.get("security_out_at_unit_ii")
-        if out_i is None and d.get("security_out_at") is not None:
-            out_i = d.get("security_out_at")
-        return out_i is not None and out_ii is not None
-    if d.get("security_out_at") is not None:
-        return True
-    uk = "unit_ii" if vt == "UNIT_II" else "unit_i"
-    return d.get(f"security_out_at_{uk}") is not None
-
-
-def find_open_visitor_for_guest_phone(guest_phone10: str) -> dict | None:
-    """Open VISITOR request for the same guest mobile (any employee)."""
-    _db = _require("db", db)
-    target = digits(guest_phone10)
-    if len(target) < 10:
-        return None
-    target = target[-10:]
-    for snap in query_requests_by_type(_db, "VISITOR"):
-        d = snap.to_dict() or {}
-        if visitor_request_is_closed(d):
-            continue
-        if _guest_phone10_from_request(d) == target:
-            return d
-    return None
-
-
 def _ist_now() -> datetime:
     if ZoneInfo:
         return datetime.now(ZoneInfo("Asia/Kolkata"))
@@ -268,76 +215,6 @@ def expand_leave_date_range(from_s: str, to_s: str) -> list[str]:
     return out
 
 
-def leave_days_value_from_doc(d: dict) -> float:
-    """Approved or requested leave length in days (0.5 = half day)."""
-    raw = d.get("leave_days")
-    if raw is not None:
-        try:
-            v = float(raw)
-            if v > 0:
-                return v
-        except (TypeError, ValueError):
-            pass
-    if (d.get("leave_duration") or "").strip().lower() == "half":
-        return 0.5
-    return 1.0
-
-
-def format_leave_days_label(d: dict) -> str:
-    """Display label for approval UI and employee messages."""
-    if (d.get("leave_duration") or "").strip().lower() == "half":
-        return "Half Day (0.5)"
-    days = leave_days_value_from_doc(d)
-    if days == 0.5:
-        return "Half Day (0.5)"
-    if days == int(days):
-        n = int(days)
-        return str(n)
-    return str(days)
-
-
-def leave_days_requested_from_doc(d: dict) -> float:
-    """Original requested leave length (for approver modify-days ceiling)."""
-    raw = d.get("leave_days_requested")
-    if raw is not None:
-        try:
-            v = float(raw)
-            if v > 0:
-                return v
-        except (TypeError, ValueError):
-            pass
-    return leave_days_value_from_doc(d)
-
-
-def shrink_leave_to_day_count(rd: dict, new_days: int) -> dict | None:
-    """
-    Build Firestore patch keeping the first ``new_days`` from the original span.
-    Returns None if inputs are invalid.
-    """
-    from_d = (rd.get("leave_from_date") or "").strip()
-    if not from_d:
-        return None
-    requested = leave_days_requested_from_doc(rd)
-    try:
-        n = int(new_days)
-    except (TypeError, ValueError):
-        return None
-    if n < 1 or n > requested:
-        return None
-    span_end = (
-        (rd.get("leave_to_date_requested") or rd.get("leave_to_date") or from_d).strip()
-    )
-    full_dates = expand_leave_date_range(from_d, span_end)
-    if not full_dates:
-        return None
-    picked = full_dates[:n]
-    return {
-        "leave_days": n,
-        "leave_to_date": picked[-1],
-        "leave_dates": picked,
-    }
-
-
 def leave_dates_from_doc(d: dict) -> set[str]:
     """Calendar days covered by one LEAVE request document."""
     dates = d.get("leave_dates") or []
@@ -351,31 +228,15 @@ def leave_dates_from_doc(d: dict) -> set[str]:
     )
 
 
-def _leave_fully_approved(d: dict) -> bool:
-    """True when leave has finished approval (MD required; legacy offline bypass still counts)."""
-    jmd = (d.get("jmd_status") or "").strip().upper()
-    if jmd != "APPROVED":
-        return False
-    if d.get("md_offline_bypass"):
-        return True
-    md = (d.get("md_status") or "").strip().upper()
-    if md == "APPROVED":
-        return True
-    if md == "OFFLINE":
-        return True
-    return False
-
-
 def _leave_overlap_status_label(d: dict) -> str:
     """User-facing status for duplicate-date check: pending, approved, or skip."""
     jmd = (d.get("jmd_status") or "").strip().upper()
-    md = (d.get("md_status") or "").strip().upper()
-    if jmd in ("DENIED", "CANCELLED") or md == "DENIED" or d.get("cancelled_by_employee"):
+    if jmd in ("DENIED", "CANCELLED") or d.get("cancelled_by_employee"):
         return ""
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
         return "pending"
     if jmd == "APPROVED":
-        return "approved" if _leave_fully_approved(d) else "pending"
+        return "approved"
     return ""
 
 
@@ -480,22 +341,13 @@ def query_leave_requests_for_employee_id(
     return out
 
 
-def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> float:
+def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> int:
     """Day count from leave_dates / from-to on one request document."""
     month_key = f"{year}-{month:02d}"
     if (d.get("source") or "").strip().lower() == "imported_history":
         hist = (d.get("history_month") or "").strip()
         if hist == month_key:
-            try:
-                return float(d.get("leave_days") or len(d.get("leave_dates") or []) or 0)
-            except (TypeError, ValueError):
-                return 0.0
-    days_val = leave_days_value_from_doc(d)
-    if days_val == 0.5:
-        from_d = _parse_ddmmy(d.get("leave_from_date"))
-        if from_d and from_d.year == year and from_d.month == month:
-            return 0.5
-        return 0.0
+            return int(d.get("leave_days") or len(d.get("leave_dates") or []) or 0)
     dates = d.get("leave_dates") or []
     if dates:
         n = 0
@@ -503,11 +355,11 @@ def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> float
             parsed = _parse_ddmmy(str(ds))
             if parsed and parsed.year == year and parsed.month == month:
                 n += 1
-        return float(n)
+        return n
     from_d = _parse_ddmmy(d.get("leave_from_date"))
     to_d = _parse_ddmmy(d.get("leave_to_date") or d.get("leave_from_date"))
     if not from_d:
-        return 0.0
+        return 0
     if not to_d:
         to_d = from_d
     n = 0
@@ -516,7 +368,7 @@ def _count_leave_days_in_month_from_doc(d: dict, year: int, month: int) -> float
         if cur.year == year and cur.month == month:
             n += 1
         cur += timedelta(days=1)
-    return float(n)
+    return n
 
 
 def count_leave_days_in_month_from_dates(
@@ -533,10 +385,11 @@ def count_leave_days_in_month_from_dates(
     return n
 
 
-def _leave_days_in_month(d: dict, year: int, month: int) -> float:
+def _leave_days_in_month(d: dict, year: int, month: int) -> int:
     """Approved leave days in month. Pending and denied are not counted."""
-    if not _leave_fully_approved(d):
-        return 0.0
+    jmd_st = (d.get("jmd_status") or "").strip().upper()
+    if jmd_st != "APPROVED":
+        return 0
     return _count_leave_days_in_month_from_doc(d, year, month)
 
 
@@ -547,7 +400,7 @@ def _leave_month_days_count(
     month: int,
     *,
     employee_wa: str = "",
-) -> float:
+) -> int:
     eid = (employee_id or "").strip().upper()
     seen: set[str] = set()
     total = 0
@@ -572,7 +425,7 @@ def get_employee_leave_counts(
     employee_wa: str = "",
     firestore_db=None,
     reference: datetime | None = None,
-) -> tuple[float, float]:
+) -> tuple[int, int]:
     """
     Approved leave days in last and current calendar month (IST) from `requests`.
 
@@ -646,29 +499,15 @@ def query_permission_requests_for_employee_id(
     return out
 
 
-def _permission_fully_approved(d: dict) -> bool:
-    """True when permission finished approval (MD/HR step complete or offline bypass)."""
-    jmd = (d.get("jmd_status") or "").strip().upper()
-    if jmd != "APPROVED":
-        return False
-    if d.get("md_offline_bypass"):
-        return True
-    md = (d.get("md_status") or "").strip().upper()
-    if md in ("APPROVED", "OFFLINE"):
-        return True
-    return False
-
-
 def _permission_overlap_status_label(d: dict) -> str:
     """User-facing status for duplicate-date check: pending, approved, or skip."""
     jmd = (d.get("jmd_status") or "").strip().upper()
-    md = (d.get("md_status") or "").strip().upper()
-    if jmd in ("DENIED", "CANCELLED") or md == "DENIED" or d.get("cancelled_by_employee"):
+    if jmd in ("DENIED", "CANCELLED") or d.get("cancelled_by_employee"):
         return ""
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):
         return "pending"
     if jmd == "APPROVED":
-        return "approved" if _permission_fully_approved(d) else "pending"
+        return "approved"
     return ""
 
 

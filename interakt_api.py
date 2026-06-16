@@ -147,12 +147,7 @@ def _post(payload: dict[str, Any]) -> dict[str, Any]:
     if resp.status_code >= 400:
         logger.error("Interakt %s: %s", resp.status_code, data)
         raise RuntimeError(f"Interakt API {resp.status_code}: {data}")
-    logger.info(
-        "Interakt sent type=%s status=%s response=%s",
-        payload.get("type"),
-        resp.status_code,
-        data,
-    )
+    logger.info("Interakt sent type=%s status=%s", payload.get("type"), resp.status_code)
     return data
 
 
@@ -461,7 +456,6 @@ def send_flow_template(
         template["buttonPayload"] = {"0": ["flow_token"], "1": ["flow_action_data"]}
         template["buttonValues"] = {"0": [token[:256]], "1": [action]}
     elif token:
-        # Most Interakt flow templates only accept flow_token (not flow_action_data).
         template["buttonPayload"] = {"0": ["flow_token"]}
         template["buttonValues"] = {"0": [token[:256]]}
     elif action:
@@ -496,13 +490,10 @@ def send_od_flow_form(
         return False
     lang = (os.getenv("OD_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
     if body_values is None:
-        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "").strip()
-        if spec:
-            keys = [k.strip() for k in spec.split(",") if k.strip()]
-            vals = {"name": (employee_name or "Employee")[:50]}
-            body_values = [str(vals.get(k, ""))[:1024] for k in keys]
-        else:
-            body_values = None
+        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
     try:
         send_flow_template(
             phone,

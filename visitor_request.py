@@ -33,14 +33,9 @@ from approval import (
     visitor_chain_failure_message,
 )
 
-from bot_shared import digits, find_open_visitor_for_guest_phone, wa_from_10
+from bot_shared import digits, find_open_request, wa_from_10
 
 logger = logging.getLogger(__name__)
-
-VISITOR_GUEST_OPEN_MSG = (
-    "A visitor request for this guest mobile number is already open. "
-    "Wait until that visit is closed at security or denied before creating another."
-)
 
 VISITOR_MIN_PEOPLE = 1
 VISITOR_MAX_PEOPLE = 50
@@ -224,6 +219,9 @@ def visitor_flow_enabled() -> bool:
 
 def try_start_form(sender: str, deps: VisitorDeps) -> None:
     """Send WhatsApp Flow form (menu: Visitor - Form). Chat visitor flow unchanged."""
+    if find_open_request(sender, "VISITOR"):
+        deps.send_to(sender, deps.already_pending_msg)
+        return
     if not visitor_flow_enabled():
         deps.send_to(
             sender,
@@ -253,6 +251,9 @@ def try_start(sender: str, deps: VisitorDeps) -> None:
 
 
 def _try_start_chat(sender: str, deps: VisitorDeps) -> None:
+    if find_open_request(sender, "VISITOR"):
+        deps.send_to(sender, deps.already_pending_msg)
+        return
     deps.session_merge(
         sender,
         state=VISITOR_COMING_ON,
@@ -631,9 +632,6 @@ def _handle_guest_phone(sender: str, incoming: str, session: dict, deps: Visitor
         return
 
     phone10 = d[-10:]
-    if find_open_visitor_for_guest_phone(phone10):
-        deps.send_to(sender, VISITOR_GUEST_OPEN_MSG)
-        return
     deps.session_merge(sender, state=VISITOR_CONFIRM, guest_phone=phone10)
     _show_confirm(sender, session, deps, guest_phone=phone10)
 
@@ -857,6 +855,11 @@ def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
 def _submit_payload(
     sender: str, data: dict, deps: VisitorDeps, *, submission_source: str = "chat"
 ) -> None:
+    if find_open_request(sender, "VISITOR"):
+        deps.clear_session(sender)
+        deps.send_to(sender, deps.already_pending_msg)
+        return
+
     from bot_shared import get_user_record
 
     exists, ud = get_user_record(sender)
@@ -892,19 +895,7 @@ def _submit_payload(
 
     names = list(data.get("visitor_names") or [])
     count = int(data.get("people_count") or len(names) or 1)
-    guest_phone = digits((data.get("guest_phone") or "").strip())
-    if len(guest_phone) >= 10:
-        guest_phone = guest_phone[-10:]
-    else:
-        guest_phone = ""
-    if not guest_phone:
-        deps.clear_session(sender)
-        deps.send_to(sender, "Enter a valid 10-digit visitor mobile number.")
-        return
-    if find_open_visitor_for_guest_phone(guest_phone):
-        deps.clear_session(sender)
-        deps.send_to(sender, VISITOR_GUEST_OPEN_MSG)
-        return
+    guest_phone = (data.get("guest_phone") or "").strip()
     coming_on = (data.get("coming_on_date") or "").strip()
     coming_from = (data.get("coming_from") or "").strip()
     purpose = (data.get("purpose") or data.get("coming_for") or "").strip()

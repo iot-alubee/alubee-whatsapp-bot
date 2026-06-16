@@ -91,8 +91,6 @@ MD_WHATSAPP_NUMBER = (
 # Optional legacy test approver (old leave/permission rows only). Not used for new requests.
 TEST_MD_WHATSAPP_NUMBER = wa_from_env("TEST_MD_WHATSAPP_NUMBER")
 PPC_WHATSAPP_NUMBER = wa_from_env("PPC_WHATSAPP_NUMBER")
-PPC1_WHATSAPP_NUMBER = wa_from_env("PPC1_WHATSAPP_NUMBER")
-PPC2_WHATSAPP_NUMBER = wa_from_env("PPC2_WHATSAPP_NUMBER")
 HR_WHATSAPP_NUMBER = wa_from_env("HR_WHATSAPP_NUMBER")
 
 WHATSAPP_SESSION_HOURS = int(os.getenv("WHATSAPP_SESSION_HOURS", "24"))
@@ -359,8 +357,6 @@ approval.configure(
         visitor_test_md=VISITOR_TEST_MD_WHATSAPP_NUMBER,
         visitor_test_employee_wa_ids=VISITOR_TEST_EMPLOYEE_WA_IDS,
         ppc=PPC_WHATSAPP_NUMBER,
-        ppc1=PPC1_WHATSAPP_NUMBER or PPC_WHATSAPP_NUMBER,
-        ppc2=PPC2_WHATSAPP_NUMBER,
         hr=HR_WHATSAPP_NUMBER,
     )
 )
@@ -392,12 +388,10 @@ def _build_permission_approval_chain(
     user_data: dict | None = None,
     *,
     permission_for: str = "myself",
-    permission_shift: str = "",
 ) -> dict | None:
     return approval.build_permission_approval_chain(
         user_data,
         permission_for=permission_for,
-        permission_shift=permission_shift,
     )
 
 
@@ -531,8 +525,6 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
     approver_availability.set_availability(
         db, sender, availability, role=role or "approver"
     )
-    if availability == "online" and role == "md":
-        approval.notify_pending_leave_md_approvals(sender)
     _send_to(sender, f"You are now {availability.title()}.")
     exists, ud = bot_shared.get_user_record(sender)
     if exists and ud:
@@ -928,9 +920,6 @@ def _process(sender: str, incoming: str) -> None:
     _touch_whatsapp_inbound(sender)
 
     if _try_handle_approver_availability(sender, incoming):
-        return
-
-    if approval.handle_leave_modify_gate(sender, incoming):
         return
 
     if approval.handle_approval_gate(sender, incoming):

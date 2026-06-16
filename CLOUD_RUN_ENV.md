@@ -40,29 +40,40 @@ Optional: `VISITOR_ROUTE_BY_UNIT=true` — Unit II employees (`jmd_route` JMD2) 
 | `VISITOR_OTP_TEMPLATE_BODY_FIELDS` | `otp` |
 | `VISITOR_OTP_TEMPLATE_AUTH_BUTTON` | `true` |
 
-## Optional — OD WhatsApp Form (menu option 6, test)
+## WhatsApp Flow utility templates (menu Form options)
 
-Chat **OD Request** (option 1) does not use these. Defaults work without setting env:
+Set these after Meta approves each **Utility** template in Interakt. Body must include `{{1}}` (employee name).
 
-| Name | Default | Purpose |
-|------|---------|---------|
-| `OD_FLOW_TEMPLATE_NAME` | `od_request` | **Interakt template name** (not Meta Flow ID) |
-| `OD_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` | Template language |
-| `OD_FLOW_TEMPLATE_BODY_FIELDS` | *(empty)* | Only if template body has `{{1}}` etc. |
-
-## Optional — Visitor / Leave / Permission WhatsApp Forms (menu 7–9, test)
-
-Chat options 3–5 unchanged. Set template name when form is approved in Interakt:
-
-| Name | Purpose |
-|------|---------|
-| `VISITOR_FLOW_TEMPLATE_NAME` | Visitor - Form |
-| `LEAVE_FLOW_TEMPLATE_NAME` | Leave - Form |
-| `PERMISSION_FLOW_TEMPLATE_NAME` | Permission - Form |
+| Name | Approved template |
+|------|-------------------|
+| `OD_FLOW_TEMPLATE_NAME` | `od_request_v02` |
+| `VISITOR_FLOW_TEMPLATE_NAME` | `visitor_request_v02` |
+| `LEAVE_FLOW_TEMPLATE_NAME` | `leave_request_v02` |
+| `PERMISSION_FLOW_TEMPLATE_NAME` | `permission_request_02` |
 | `*_FLOW_TEMPLATE_LANGUAGE_CODE` | `en` |
-| `*_FLOW_TEMPLATE_BODY_FIELDS` | `name` if template body has one variable |
+| `*_FLOW_TEMPLATE_BODY_FIELDS` | `name` |
 
-All forms use the **same** flow endpoint URL (`alubee-whatsapp-flow-endpoint` → `/flow`).
+**Permission only:** bot sends `flow_token=perm_{phone}` (no `flow_action_data`).  
+**OD / Leave / Visitor:** template + body only (no flow button parameters).
+
+All forms use flow endpoint `https://alubee-whatsapp-flow-….run.app/flow` (Data Exchange).
+
+### Copy-paste block for Cloud Run
+
+```
+OD_FLOW_TEMPLATE_NAME=od_request_v02
+OD_FLOW_TEMPLATE_LANGUAGE_CODE=en
+OD_FLOW_TEMPLATE_BODY_FIELDS=name
+VISITOR_FLOW_TEMPLATE_NAME=visitor_request_v02
+VISITOR_FLOW_TEMPLATE_LANGUAGE_CODE=en
+VISITOR_FLOW_TEMPLATE_BODY_FIELDS=name
+LEAVE_FLOW_TEMPLATE_NAME=leave_request_v02
+LEAVE_FLOW_TEMPLATE_LANGUAGE_CODE=en
+LEAVE_FLOW_TEMPLATE_BODY_FIELDS=name
+PERMISSION_FLOW_TEMPLATE_NAME=permission_request_02
+PERMISSION_FLOW_TEMPLATE_LANGUAGE_CODE=en
+PERMISSION_FLOW_TEMPLATE_BODY_FIELDS=name
+```
 
 ## Optional
 

@@ -10,24 +10,17 @@ from dataclasses import dataclass
 from typing import Callable
 
 from bot_shared import (
-    format_leave_days_label,
     get_employee_leave_counts,
     get_employee_permission_counts,
     get_user_record,
-    leave_days_requested_from_doc,
-    leave_days_value_from_doc,
-    shrink_leave_to_day_count,
     wa_from_env,
 )
 
 import approver_availability
 
 from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
-from permission_times import permission_time_lines_for_approval
 
 logger = logging.getLogger(__name__)
-
-WAITING_LEAVE_DAYS_MODIFY = "WAITING_LEAVE_DAYS_MODIFY"
 
 VISITING_UNIT_I = "UNIT_I"
 VISITING_UNIT_II = "UNIT_II"
@@ -92,8 +85,6 @@ class ApprovalDeps:
     visitor_test_md: str = ""
     visitor_test_employee_wa_ids: frozenset[str] = frozenset()
     ppc: str = ""
-    ppc1: str = ""
-    ppc2: str = ""
     hr: str = ""
 
 
@@ -354,60 +345,32 @@ def build_leave_approval_chain(user_data: dict | None = None) -> dict | None:
     return build_approval_chain(user_data, request_type="LEAVE")
 
 
-def _cl_ppc_for_shift(permission_shift: str) -> tuple[str, str]:
-    """Unit I Shift I → PPC1; Unit II Shift II → PPC2. Returns (wa_id, route label)."""
-    d = _require()
-    shift = (permission_shift or "I").strip().upper()
-    if shift in ("II", "2"):
-        ppc = (
-            wa_from_env("PPC2_WHATSAPP_NUMBER")
-            or d.ppc2
-            or ""
-        ).strip()
-        return ppc, "PPC2"
-    ppc = (
-        wa_from_env("PPC1_WHATSAPP_NUMBER")
-        or d.ppc1
-        or wa_from_env("PPC_WHATSAPP_NUMBER")
-        or d.ppc
-        or ""
-    ).strip()
-    return ppc, "PPC1"
-
-
 def build_permission_approval_chain(
     user_data: dict | None = None,
     *,
     permission_for: str = "myself",
-    permission_shift: str = "",
 ) -> dict | None:
     """
     Employee permission (myself): JMD → MD (same as OD).
-    CL permission: Shift I → PPC1 → HR (Meena); Shift II → PPC2 → HR.
+    CL permission: PPC → HR (no online/offline for PPC/HR).
     """
     if not user_data:
         return None
     pf = (permission_for or "myself").strip().lower()
     if pf == "cl":
-        shift = (permission_shift or "I").strip().upper()
-        if shift in ("II", "2"):
-            logger.error("CL permission not allowed for Shift II")
-            return None
         d = _require()
-        ppc, route = _cl_ppc_for_shift(permission_shift)
+        ppc = (wa_from_env("PPC_WHATSAPP_NUMBER") or d.ppc or "").strip()
         hr = (wa_from_env("HR_WHATSAPP_NUMBER") or d.hr or "").strip()
         if not ppc or not hr:
             logger.error(
-                "CL permission approvers missing route=%s ppc=%r hr=%r shift=%s",
-                route,
+                "CL permission approvers missing ppc=%r hr=%r",
                 ppc or "(missing)",
                 hr or "(missing)",
-                permission_shift,
             )
             return None
         return {
             "jmd": ppc,
-            "jmd_route": route,
+            "jmd_route": "PPC",
             "md": hr,
             "permission_cl_chain": True,
         }
@@ -472,9 +435,8 @@ def _approval_message_body(
         rd = request_rd or {}
         from_d = (rd.get("leave_from_date") or "").strip()
         to_d = (rd.get("leave_to_date") or from_d).strip()
-        days_label = format_leave_days_label(rd)
-        days_val = leave_days_value_from_doc(rd)
-        if days_val <= 1 or (from_d and to_d and from_d == to_d):
+        days = int(rd.get("leave_days") or 1)
+        if days <= 1 or (from_d and to_d and from_d == to_d):
             date_lines = f"Date: {from_d or '—'}\n"
         else:
             date_lines = f"From Date: {from_d or '—'}\nTo Date: {to_d or '—'}\n"
@@ -497,12 +459,12 @@ def _approval_message_body(
             f"{test_tag}Leave approval request\n\n"
             f"Name: {emp}\n"
             f"Department: {dept}\n"
-            f"No. of days leave: {days_label}\n"
+            f"No. of days leave: {days}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
             f"Leaves in Last month: {leaves_last}\n"
             f"Leaves in current month: {leaves_curr}\n\n"
-            "Please approve, deny, or modify days."
+            "Please approve or deny."
         )
     if req_type == "PERMISSION":
         rd = request_rd or {}
@@ -537,7 +499,6 @@ def _approval_message_body(
                 perms_curr = rd.get("permissions_current_month", 0)
         perm_type = (rd.get("permission_type") or "").strip() or "—"
         test_tag = "[TEST] " if rd.get("permission_test_approver") else ""
-        time_lines = permission_time_lines_for_approval(rd)
         if (rd.get("permission_for") or "").strip().lower() == "cl":
             cl_name = (rd.get("cl_employee_name") or "").strip() or "—"
             shift = _permission_shift_display()
@@ -547,8 +508,7 @@ def _approval_message_body(
                 f"Department: {dept}\n"
                 f"Shift: {shift}\n"
                 f"Reason: {reason or '—'}\n"
-                f"Permission type: Early OUT\n"
-                f"{time_lines}\n"
+                f"Permission type: Early OUT\n\n"
                 "Please approve or deny."
             )
         shift = _permission_shift_display()
@@ -559,7 +519,6 @@ def _approval_message_body(
             f"Shift: {shift}\n"
             f"Permission type: {perm_type}\n"
             f"Reason: {reason or '—'}\n"
-            f"{time_lines}"
             f"Permission in last month: {perms_last}\n"
             f"Permission in current month: {perms_curr}\n\n"
             "Please approve or deny."
@@ -571,23 +530,6 @@ def _approval_message_body(
         f"Reason: {reason or '—'}\n\n"
         "Please approve or deny."
     )
-
-
-def _leave_modify_days_allowed(rd: dict | None) -> bool:
-    if (rd or {}).get("type", "").strip().upper() != "LEAVE":
-        return False
-    return leave_days_requested_from_doc(rd or {}) > 1
-
-
-def _leave_approval_button_rows(request_id: str, request_rd: dict | None) -> list[tuple[str, str]]:
-    rid = (request_id or "").strip()
-    rows = [
-        (f"APPROVE_{rid}"[:256], "Approve"),
-        (f"DENY_{rid}"[:256], "Deny"),
-    ]
-    if _leave_modify_days_allowed(request_rd):
-        rows.append((f"MODIFY_DAYS_{rid}"[:256], "Modify Days"))
-    return rows
 
 
 def send_approval_buttons(
@@ -610,18 +552,19 @@ def send_approval_buttons(
         return False
 
     rid = (request_id or "").strip()
+    approve_id = f"APPROVE_{rid}"[:256]
+    deny_id = f"DENY_{rid}"[:256]
     body = _approval_message_body(
         employee_name=employee_name,
         department=department,
         reason=reason,
         request_rd=request_rd,
     )
-    buttons = _leave_approval_button_rows(rid, request_rd)
     try:
         send_reply_buttons(
             wa_id_to_phone(wa_id),
             body,
-            buttons,
+            [(approve_id, "Approve"), (deny_id, "Deny")],
             callback_data=request_id,
             ensure_contact=True,
             contact_name=d.chat_name(employee_name),
@@ -634,176 +577,13 @@ def send_approval_buttons(
             send_reply_buttons(
                 wa_id_to_phone(wa_id),
                 body,
-                buttons,
+                [(approve_id, "Approve"), (deny_id, "Deny")],
                 callback_data=request_id,
             )
             return True
         except Exception:
             logger.exception("approval retry failed to=%s", wa_id)
         return False
-
-
-def _leave_approver_can_modify(role: str | None, rd: dict) -> bool:
-    if role not in ("jmd", "md"):
-        return False
-    if (rd.get("type") or "").strip().upper() != "LEAVE":
-        return False
-    jmd = (rd.get("jmd_status") or "").strip().upper()
-    md = (rd.get("md_status") or "").strip().upper()
-    if role == "jmd":
-        return jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD")
-    return jmd == "APPROVED" and md == "PENDING"
-
-
-def _leave_days_modify_prompt(rd: dict) -> str:
-    max_days = leave_days_requested_from_doc(rd)
-    current_label = format_leave_days_label(rd)
-    max_label = format_leave_days_label({
-        **rd,
-        "leave_days": max_days,
-        "leave_duration": "full" if max_days > 0.5 else "half",
-    })
-    return (
-        f"Employee requested: {max_label}\n"
-        f"JMD set to: {current_label}\n"
-        f"Reply with a number from 1 to {int(max_days)}."
-    )
-
-
-def _send_leave_day_picker(sender: str, rd: dict, request_id: str) -> None:
-    d = _require()
-    d.send_to(sender, _leave_days_modify_prompt(rd))
-
-
-def _resend_leave_approval_prompt(sender: str, rd: dict, request_id: str) -> None:
-    d = _require()
-    d.session_merge(
-        sender,
-        state="WAITING_APPROVAL_ACTION",
-        approval_request_id=request_id,
-    )
-    send_approval_buttons(
-        sender,
-        employee_name=rd.get("employee_name") or "Employee",
-        department=rd.get("department") or "",
-        reason=rd.get("reason") or "",
-        request_id=request_id,
-        request_rd=rd,
-    )
-
-
-def _apply_leave_day_count(sender: str, request_id: str, day_count: int) -> bool:
-    d = _require()
-    ref = d.db.collection("requests").document(request_id)
-    snap = ref.get()
-    if not snap.exists:
-        d.send_to(sender, "This leave request is no longer available.")
-        return True
-    rd = snap.to_dict() or {}
-    role = _approval_role(sender, rd)
-    if not _leave_approver_can_modify(role, rd):
-        d.send_to(sender, "You cannot modify days for this leave request.")
-        return True
-    patch = shrink_leave_to_day_count(rd, day_count)
-    if not patch:
-        max_days = leave_days_requested_from_doc(rd)
-        d.send_to(
-            sender,
-            f"Invalid number of days. Enter a whole number from 1 to {max_days}.",
-        )
-        _resend_leave_approval_prompt(sender, rd, request_id)
-        return True
-    ref.update(patch)
-    rd = ref.get().to_dict() or rd
-    d.send_to(
-        sender,
-        f"Leave days updated to {patch['leave_days']}.\nYou can approve, deny, or modify again.",
-    )
-    _resend_leave_approval_prompt(sender, rd, request_id)
-    logger.info(
-        "leave days modified request_id=%s by=%s role=%s days=%s",
-        request_id,
-        sender,
-        role,
-        patch["leave_days"],
-    )
-    return True
-
-
-def handle_leave_modify_gate(sender: str, incoming: str) -> bool:
-    """Modify-days flow for leave (JMD / MD). Returns True if handled."""
-    d = _require()
-    raw = (incoming or "").strip()
-    upper = raw.upper()
-
-    if upper.startswith("MODIFY_DAYS_"):
-        request_id = raw[len("MODIFY_DAYS_") :].strip()
-        if not request_id:
-            return False
-        ref = d.db.collection("requests").document(request_id)
-        snap = ref.get()
-        if not snap.exists:
-            d.send_to(sender, "This leave request is no longer available.")
-            return True
-        rd = snap.to_dict() or {}
-        role = _approval_role(sender, rd)
-        if not _leave_approver_can_modify(role, rd):
-            d.send_to(sender, "You cannot modify days for this leave request.")
-            return True
-        if not _leave_modify_days_allowed(rd):
-            d.send_to(sender, "This leave is only 1 day — modification is not available.")
-            _resend_leave_approval_prompt(sender, rd, request_id)
-            return True
-        d.session_merge(
-            sender,
-            state=WAITING_LEAVE_DAYS_MODIFY,
-            approval_request_id=request_id,
-        )
-        _send_leave_day_picker(sender, rd, request_id)
-        return True
-
-    if upper.startswith("LEAVE_DAYS_"):
-        tail = upper[len("LEAVE_DAYS_") :]
-        if not tail.isdigit():
-            return False
-        day_count = int(tail)
-        snap = d.session_ref(sender).get()
-        if not snap.exists:
-            return False
-        data = snap.to_dict() or {}
-        if data.get("state") != WAITING_LEAVE_DAYS_MODIFY:
-            return False
-        request_id = (data.get("approval_request_id") or "").strip()
-        if not request_id:
-            return False
-        return _apply_leave_day_count(sender, request_id, day_count)
-
-    snap = d.session_ref(sender).get()
-    if not snap.exists:
-        return False
-    data = snap.to_dict() or {}
-    if data.get("state") != WAITING_LEAVE_DAYS_MODIFY:
-        return False
-    request_id = (data.get("approval_request_id") or "").strip()
-    if not request_id:
-        return False
-    if upper in ("APPROVE", "DENY") or upper.startswith("APPROVE_") or upper.startswith("DENY_"):
-        d.session_merge(sender, state="WAITING_APPROVAL_ACTION", approval_request_id=request_id)
-        return False
-    if upper.startswith("MODIFY_DAYS_"):
-        return False
-    try:
-        day_count = int(raw)
-    except ValueError:
-        rd = d.db.collection("requests").document(request_id).get().to_dict() or {}
-        max_days = leave_days_requested_from_doc(rd)
-        d.send_to(
-            sender,
-            f"Invalid number of days. Enter a whole number from 1 to {max_days}.",
-        )
-        _resend_leave_approval_prompt(sender, rd, request_id)
-        return True
-    return _apply_leave_day_count(sender, request_id, day_count)
 
 
 def _set_pending_approval(recipient: str, request_id: str) -> None:
@@ -969,7 +749,7 @@ def _after_jmd_when_md_offline(
         if _visitor_jmd_fully_approved(rd_fresh):
             d.on_visitor_md_approved(ref, rd_fresh)
     else:
-        d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
+        d.send_to(employee, _employee_final_approval_message(req_label))
     logger.info(
         "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
         request_id,
@@ -1044,51 +824,9 @@ def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
         _set_pending_approval(wa_id, request_id)
 
 
-def notify_pending_leave_md_approvals(sender: str, *, limit: int = 10) -> int:
-    """When MD goes online, prompt for leave rows awaiting MD (jmd approved, md pending)."""
-    d = _require()
-    if not sender:
-        return 0
-    notified = 0
-    try:
-        for snap in d.db.collection("requests").where("type", "==", "LEAVE").stream():
-            rd = snap.to_dict() or {}
-            if (rd.get("jmd_status") or "").strip().upper() != "APPROVED":
-                continue
-            if (rd.get("md_status") or "").strip().upper() != "PENDING":
-                continue
-            md_wa = request_md_whatsapp(rd)
-            if not d.same_whatsapp(sender, md_wa):
-                continue
-            rid = (rd.get("request_id") or snap.id or "").strip()
-            if not rid:
-                continue
-            notify_approver(md_wa, rd, rid)
-            notified += 1
-            if notified >= limit:
-                break
-    except Exception:
-        logger.exception("pending leave MD notify failed sender=%s", sender)
-        return notified
-    if notified:
-        logger.info("notified MD of %s pending leave(s) sender=%s", notified, sender)
-    return notified
-
-
-def _employee_final_approval_message(req_label: str, rd: dict | None = None) -> str:
+def _employee_final_approval_message(req_label: str) -> str:
     if req_label == "leave":
-        data = rd or {}
-        days_label = format_leave_days_label(data)
-        days_val = leave_days_value_from_doc(data)
-        from_d = (data.get("leave_from_date") or "").strip()
-        to_d = (data.get("leave_to_date") or from_d).strip()
-        msg = f"Your leave request has been approved for {days_label}."
-        if days_val <= 1 or (from_d and to_d and from_d == to_d):
-            if from_d:
-                msg += f"\nDate: {from_d}"
-        elif from_d:
-            msg += f"\nFrom: {from_d}\nTo: {to_d}"
-        return msg
+        return "Your leave request has been approved."
     if req_label == "permission":
         return "Your permission request has been approved."
     if req_label == "visitor":
@@ -1101,10 +839,9 @@ def _uses_legacy_test_single_approver(rd: dict) -> bool:
 
 
 def _cl_permission_chain(rd: dict) -> bool:
-    route = (rd.get("jmd_route") or "").strip().upper()
     return bool(rd.get("permission_cl_chain")) or (
         (rd.get("permission_for") or "").strip().lower() == "cl"
-        and route in ("PPC", "PPC1", "PPC2")
+        and (rd.get("jmd_route") or "").strip().upper() == "PPC"
     )
 
 
@@ -1220,8 +957,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                     "md_status": "N/A",
                     "approved_datetime": d.utcnow(),
                 })
-                rd_fresh = ref.get().to_dict() or rd
-                d.send_to(employee, _employee_final_approval_message(label, rd_fresh))
+                d.send_to(employee, _employee_final_approval_message(label))
                 logger.info("jmd approved %s (final) request_id=%s", label, request_id)
             else:
                 ref.update({
@@ -1245,58 +981,34 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 rd = ref.get().to_dict() or rd
                 notify_approver(md_wa, rd, request_id)
                 logger.info(
-                    "%s approved CL permission request_id=%s → hr",
-                    (rd.get("jmd_route") or "PPC").strip().upper(),
+                    "ppc approved CL permission request_id=%s → hr",
                     request_id,
                 )
             else:
                 md_off = _md_is_offline_now(d, md_wa)
-                if req_type == "LEAVE":
-                    ref.update({
-                        "jmd": request_jmd_whatsapp(rd),
-                        "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
-                        "md": md_wa,
-                        "manager_status": "N/A",
-                        "jmd_status": "APPROVED",
-                        "md_status": "PENDING",
-                    })
-                    rd = ref.get().to_dict() or rd
-                    if md_off:
-                        d.send_to(
-                            employee,
-                            "Your leave request was approved by JMD and is pending MD approval.",
-                        )
-                        logger.info(
-                            "jmd approved leave request_id=%s → md pending (md offline)",
-                            request_id,
-                        )
-                    else:
-                        notify_approver(md_wa, rd, request_id)
-                        logger.info("jmd approved leave request_id=%s → md", request_id)
+                ref.update({
+                    "jmd": request_jmd_whatsapp(rd),
+                    "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                    "md": md_wa,
+                    "manager_status": "N/A",
+                    "jmd_status": "APPROVED",
+                    "md_status": _md_status_after_jmd(md_off),
+                    **_md_offline_bypass_fields(d, md_off),
+                })
+                rd = ref.get().to_dict() or rd
+                if md_off:
+                    _after_jmd_when_md_offline(
+                        d,
+                        ref,
+                        rd,
+                        md_wa,
+                        employee=employee,
+                        req_label=req_label,
+                        request_id=request_id,
+                    )
                 else:
-                    ref.update({
-                        "jmd": request_jmd_whatsapp(rd),
-                        "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
-                        "md": md_wa,
-                        "manager_status": "N/A",
-                        "jmd_status": "APPROVED",
-                        "md_status": _md_status_after_jmd(md_off),
-                        **_md_offline_bypass_fields(d, md_off),
-                    })
-                    rd = ref.get().to_dict() or rd
-                    if md_off:
-                        _after_jmd_when_md_offline(
-                            d,
-                            ref,
-                            rd,
-                            md_wa,
-                            employee=employee,
-                            req_label=req_label,
-                            request_id=request_id,
-                        )
-                    else:
-                        notify_approver(md_wa, rd, request_id)
-                        logger.info("jmd approved request_id=%s → md", request_id)
+                    notify_approver(md_wa, rd, request_id)
+                    logger.info("jmd approved request_id=%s → md", request_id)
         else:
             ref.update({
                 "manager_status": "N/A",
@@ -1323,11 +1035,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                 rd_fresh = fresh.to_dict() if fresh.exists else rd
                 d.on_visitor_md_approved(ref, rd_fresh)
             else:
-                fresh = ref.get()
-                rd_fresh = fresh.to_dict() if fresh.exists else rd
-                d.send_to(
-                    employee, _employee_final_approval_message(req_label, rd_fresh)
-                )
+                d.send_to(employee, _employee_final_approval_message(req_label))
             logger.info("md approved (final) request_id=%s", request_id)
         else:
             ref.update({
@@ -1340,7 +1048,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
     snap = d.session_ref(sender).get()
     if snap.exists:
         data = snap.to_dict() or {}
-        if data.get("state") in ("WAITING_APPROVAL_ACTION", WAITING_LEAVE_DAYS_MODIFY):
+        if data.get("state") == "WAITING_APPROVAL_ACTION":
             if d.db.collection("users").document(sender).get().exists:
                 d.session_merge(sender, state=d.menu_idle_state)
             else:
