@@ -528,6 +528,7 @@ def send_leave_flow_form(
         keys = [k.strip() for k in spec.split(",") if k.strip()]
         vals = {"name": (employee_name or "Employee")[:50]}
         body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
     try:
         send_flow_template(
             phone,
@@ -535,6 +536,7 @@ def send_leave_flow_form(
             language_code=lang,
             body_values=body_values,
             callback_data="leave-flow",
+            flow_token=f"leave_{phone_10}"[:256],
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )
@@ -603,7 +605,8 @@ def send_visitor_flow_form(
         spec = (os.getenv("VISITOR_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
         keys = [k.strip() for k in spec.split(",") if k.strip()]
         vals = {"name": (employee_name or "Employee")[:50]}
-        body_values = [str(vals.get(k, ""))[:1024] for k in keys]
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
     try:
         send_flow_template(
             phone,
@@ -611,6 +614,7 @@ def send_visitor_flow_form(
             language_code=lang,
             body_values=body_values,
             callback_data="visitor-flow",
+            flow_token=f"visitor_{phone_10}"[:256],
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )
