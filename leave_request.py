@@ -291,12 +291,39 @@ def _dates_for_when(when: str) -> tuple[str, str]:
     return s, s
 
 
-def _leave_days(from_s: str, to_s: str) -> int:
+def _normalize_leave_duration(raw: str) -> str:
+    d = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if d in ("half_day", "half", "halfday", "0.5"):
+        return "half_day"
+    return "full_day"
+
+
+def _leave_days(
+    from_s: str, to_s: str, *, leave_duration: str = "full_day"
+) -> float:
     f = _parse_ddmmy(from_s)
     t = _parse_ddmmy(to_s)
     if not f or not t:
-        return 1
-    return max(1, (t - f).days + 1)
+        calendar = 1
+    else:
+        calendar = max(1, (t - f).days + 1)
+    if _normalize_leave_duration(leave_duration) == "half_day" and calendar == 1:
+        return 0.5
+    return float(calendar)
+
+
+def format_leave_days_display(days, leave_duration: str = "") -> str:
+    """Human-readable day count for approval UI and messages."""
+    dur = _normalize_leave_duration(leave_duration)
+    try:
+        value = float(days)
+    except (TypeError, ValueError):
+        value = 1.0
+    if dur == "half_day" or value == 0.5:
+        return "0.5"
+    if value == int(value):
+        return str(int(value))
+    return str(value)
 
 
 def _overlap_cancel_body(overlap_status: str) -> str:
@@ -515,7 +542,15 @@ def _submit(
         )
         return
 
-    days = _leave_days(from_d, to_d)
+    leave_duration = _normalize_leave_duration(session.get("leave_duration") or "full_day")
+    days = session.get("leave_days")
+    if days is None:
+        days = _leave_days(from_d, to_d, leave_duration=leave_duration)
+    else:
+        try:
+            days = float(days)
+        except (TypeError, ValueError):
+            days = _leave_days(from_d, to_d, leave_duration=leave_duration)
     leave_dates = expand_leave_date_range(from_d, to_d)
     leaves_last_month, leaves_current_month = get_employee_leave_counts(
         employee_id,
@@ -536,6 +571,7 @@ def _submit(
         "leave_reason_code": session.get("leave_reason_code") or "",
         "leave_from_date": from_d,
         "leave_to_date": to_d,
+        "leave_duration": leave_duration,
         "leave_days": days,
         "leave_dates": leave_dates,
         "leaves_last_month": leaves_last_month,
@@ -678,9 +714,14 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     else:
         return None
 
+    leave_duration = _normalize_leave_duration(
+        _flow_pick(data, "leave_duration", "duration")
+    )
     return {
         "leave_from_date": from_d,
         "leave_to_date": to_d,
+        "leave_duration": leave_duration,
+        "leave_days": _leave_days(from_d, to_d, leave_duration=leave_duration),
         "leave_reason_code": reason_code,
         "leave_reason": reason,
     }

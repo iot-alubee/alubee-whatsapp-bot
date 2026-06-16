@@ -435,8 +435,17 @@ def _approval_message_body(
         rd = request_rd or {}
         from_d = (rd.get("leave_from_date") or "").strip()
         to_d = (rd.get("leave_to_date") or from_d).strip()
-        days = int(rd.get("leave_days") or 1)
-        if days <= 1 or (from_d and to_d and from_d == to_d):
+        from leave_request import format_leave_days_display
+
+        days_display = format_leave_days_display(
+            rd.get("leave_days"),
+            rd.get("leave_duration") or "",
+        )
+        try:
+            days_num = float(rd.get("leave_days") or 1)
+        except (TypeError, ValueError):
+            days_num = 1.0
+        if days_num <= 1 or (from_d and to_d and from_d == to_d):
             date_lines = f"Date: {from_d or '—'}\n"
         else:
             date_lines = f"From Date: {from_d or '—'}\nTo Date: {to_d or '—'}\n"
@@ -459,7 +468,7 @@ def _approval_message_body(
             f"{test_tag}Leave approval request\n\n"
             f"Name: {emp}\n"
             f"Department: {dept}\n"
-            f"No. of days leave: {days}\n"
+            f"No. of days leave: {days_display}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
             f"Leaves in Last month: {leaves_last}\n"
