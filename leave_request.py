@@ -43,6 +43,8 @@ REASON_CHOICES = frozenset({"SICK_LEAVE", "CASUAL_LEAVE", "LEAVE_REASON_OTHER"})
 REASON_LABELS = {
     "SICK_LEAVE": "Sick Leave",
     "CASUAL_LEAVE": "Casual Leave",
+    "HEALTH_ISSUE": "Health Issue",
+    "PERSONAL": "Personal",
 }
 
 
@@ -688,19 +690,39 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     else:
         return None
 
+    today = _today_ist()
+    tomorrow = today + timedelta(days=1)
+
     if when == "OTHER":
         from_d = _normalize_flow_date(_flow_pick(data, "from_date", "leave_from_date"))
         to_d = _normalize_flow_date(_flow_pick(data, "to_date", "leave_to_date"))
         if not from_d or not to_d:
             return None
-        if _parse_ddmmy(from_d) and _parse_ddmmy(to_d) and _parse_ddmmy(to_d) < _parse_ddmmy(from_d):
+        from_dt = _parse_ddmmy(from_d)
+        to_dt = _parse_ddmmy(to_d)
+        if not from_dt or not to_dt or to_dt < from_dt:
             return None
+        if from_dt < tomorrow or to_dt < tomorrow:
+            return None
+        leave_duration = "full_day"
+    elif when == "TOMORROW":
+        from_d, to_d = _dates_for_when(when)
+        leave_duration = _normalize_leave_duration(
+            _flow_pick(data, "leave_duration", "duration")
+        )
     else:
         from_d, to_d = _dates_for_when(when)
+        leave_duration = "full_day"
 
     reason_raw = _flow_pick(data, "leave_reason", "reason").lower().replace(" ", "_")
     other_reason = _flow_pick(data, "other_reason", "reason_text")
-    if reason_raw in ("sick_leave", "sick"):
+    if reason_raw in ("health_issue", "health"):
+        reason_code = "HEALTH_ISSUE"
+        reason = REASON_LABELS[reason_code]
+    elif reason_raw == "personal":
+        reason_code = "PERSONAL"
+        reason = REASON_LABELS[reason_code]
+    elif reason_raw in ("sick_leave", "sick"):
         reason_code = "SICK_LEAVE"
         reason = REASON_LABELS[reason_code]
     elif reason_raw in ("casual_leave", "casual"):
@@ -714,9 +736,9 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     else:
         return None
 
-    leave_duration = _normalize_leave_duration(
-        _flow_pick(data, "leave_duration", "duration")
-    )
+    if leave_duration == "half_day" and when != "TOMORROW":
+        return None
+
     return {
         "leave_from_date": from_d,
         "leave_to_date": to_d,

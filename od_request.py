@@ -506,6 +506,10 @@ def _submit(
     company_vehicle_id: str = "",
     company_vehicle: str = "",
     company_vehicle_description: str = "",
+    visiting_to: str = "",
+    visiting_to_label: str = "",
+    purpose: str = "",
+    time_required_hours: int | None = None,
 ) -> None:
     if _find_open_od_for_employee(deps, sender):
         deps.session_ref(sender).delete()
@@ -527,7 +531,8 @@ def _submit(
 
     ref = deps.db.collection("requests").document()
     request_id = ref.id
-    ref.set({
+    display_reason = (visiting_to_label or reason or "").strip()
+    payload = {
         "request_id": request_id,
         "requested_datetime": deps.utcnow(),
         "employee": sender,
@@ -535,7 +540,7 @@ def _submit(
         "employee_name": ud.get("name") or "Employee",
         "department": ud.get("department") or "",
         "type": "OD",
-        "reason": reason,
+        "reason": display_reason,
         "uses_company_vehicle": uses_company_vehicle,
         "company_vehicle_id": company_vehicle_id or "",
         "company_vehicle": company_vehicle or "",
@@ -546,7 +551,14 @@ def _submit(
         "manager_status": "N/A",
         "jmd_status": "PENDING",
         "md_status": "AWAITING_JMD",
-    })
+    }
+    if visiting_to:
+        payload["od_visiting_to"] = visiting_to
+        payload["od_visiting_to_label"] = visiting_to_label or display_reason
+        payload["od_purpose"] = (purpose or "").strip()
+    if time_required_hours is not None:
+        payload["od_time_required_hours"] = time_required_hours
+    ref.set(payload)
     logger.info("OD created %s jmd_route=%s", request_id, chain["jmd_route"])
 
     rd = ref.get().to_dict()
@@ -709,6 +721,7 @@ def _flow_pick(data: dict, *needles: str) -> str:
 
 
 def _resolve_od_reason_from_flow(data: dict) -> str:
+    """Legacy flow: reason from old od_reason / other_reason fields."""
     raw = _flow_pick(data, "od_reason", "reason", "visiting_to").lower().replace(" ", "_")
     if raw in ("unit_i", "unit1", "1"):
         return "Unit I"
@@ -720,6 +733,43 @@ def _resolve_od_reason_from_flow(data: dict) -> str:
     if raw == "other":
         return other or ""
     return _flow_pick(data, "other_reason") or raw.replace("_", " ").title()
+
+
+OD_VISITING_TO_LABELS: dict[str, str] = {
+    "unit_i": "Unit I",
+    "unit_ii": "Unit II",
+    "hosur_town": "Hosur Town",
+    "supplier_place": "Supplier Place",
+    "bangalore": "Bangalore",
+    "md_home": "MD Home",
+}
+
+
+def _resolve_visiting_to_from_flow(data: dict) -> tuple[str, str]:
+    raw = _flow_pick(data, "visiting_to", "od_reason").lower().replace(" ", "_")
+    aliases = {
+        "unit1": "unit_i",
+        "unit2": "unit_ii",
+        "unitii": "unit_ii",
+        "hosur": "hosur_town",
+        "supplier": "supplier_place",
+        "mdhome": "md_home",
+    }
+    code = aliases.get(raw, raw)
+    label = OD_VISITING_TO_LABELS.get(code, "")
+    return code, label
+
+
+def _parse_time_required_hours(data: dict) -> int | None:
+    raw = _flow_pick(data, "time_required", "time_required_hours", "od_time_required")
+    if not raw:
+        return None
+    if not raw.isdigit():
+        return None
+    hours = int(raw)
+    if hours < 1 or hours > 12:
+        return None
+    return hours
 
 
 def parse_flow_response(response_json: dict | str | None) -> dict | None:
@@ -737,6 +787,38 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         return None
     if not isinstance(data, dict) or not data:
         return None
+
+    visiting_code, visiting_label = _resolve_visiting_to_from_flow(data)
+    if visiting_code and visiting_label:
+        purpose = _flow_pick(data, "purpose", "od_purpose")
+        if visiting_code != "md_home" and not purpose:
+            return None
+        hours = _parse_time_required_hours(data)
+        if hours is None:
+            return None
+
+        cv_raw = _flow_pick(data, "company_vehicle", "uses_company_vehicle").lower()
+        if cv_raw not in ("yes", "no", "y", "n"):
+            return None
+        uses_cv = cv_raw in ("yes", "y")
+
+        vehicle_id = ""
+        if uses_cv:
+            vehicle_id = _flow_pick(
+                data, "vehicle", "company_vehicle_id", "vehicle_id"
+            ).upper()
+            if not vehicle_id:
+                return None
+
+        return {
+            "reason": visiting_label,
+            "visiting_to": visiting_code,
+            "visiting_to_label": visiting_label,
+            "purpose": purpose if visiting_code != "md_home" else "",
+            "time_required_hours": hours,
+            "uses_company_vehicle": uses_cv,
+            "company_vehicle_id": vehicle_id,
+        }
 
     reason = _resolve_od_reason_from_flow(data)
     if not reason:
@@ -787,4 +869,8 @@ def handle_flow_submission(
         company_vehicle_id=vehicle_id,
         company_vehicle=company_vehicle,
         company_vehicle_description=company_vehicle_description,
+        visiting_to=(parsed.get("visiting_to") or "").strip(),
+        visiting_to_label=(parsed.get("visiting_to_label") or "").strip(),
+        purpose=(parsed.get("purpose") or "").strip(),
+        time_required_hours=parsed.get("time_required_hours"),
     )

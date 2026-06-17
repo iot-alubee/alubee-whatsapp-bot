@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from bot_shared import (
@@ -377,6 +378,22 @@ def build_permission_approval_chain(
     return build_approval_chain(user_data, request_type="PERMISSION")
 
 
+def _format_od_approval_date(ts) -> str:
+    if ts is None:
+        return "—"
+    try:
+        if hasattr(ts, "timestamp"):
+            dt = ts
+        else:
+            return "—"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ist = timezone(timedelta(hours=5, minutes=30))
+        return dt.astimezone(ist).strftime("%d-%m-%Y")
+    except Exception:
+        return "—"
+
+
 def _approval_message_body(
     *,
     employee_name: str,
@@ -401,15 +418,8 @@ def _approval_message_body(
             .strip()
             or "—"
         )
-        coming_for = (
-            (
-                rd.get("purpose_label")
-                or rd.get("coming_for_label")
-                or rd.get("visit_for_label")
-                or ""
-            ).strip()
-            or "—"
-        )
+        visitor_type = (rd.get("visitor_type_label") or "").strip() or "—"
+        purpose = (rd.get("purpose_detail") or rd.get("purpose_label") or "").strip() or "—"
         visiting = (
             (rd.get("visiting_to_label") or "").strip()
             or VISITING_TO_LABELS.get(
@@ -422,13 +432,14 @@ def _approval_message_body(
             f"{test_tag}Visitor approval request\n\n"
             f"Employee: {emp}\n"
             f"Department: {dept}\n"
-            f"Visiting to: {visiting}\n"
-            f"Coming on: {coming_on}\n"
-            f"People: {rd.get('people_count') or '—'}\n"
-            f"Names: {names}\n"
-            f"Coming from: {coming_from}\n"
-            f"Purpose: {coming_for}\n"
-            f"Guest WhatsApp: {rd.get('guest_phone') or '—'}\n\n"
+            f"Visitor Name: {names}\n"
+            f"Visitor type: {visitor_type}\n"
+            f"Visiting To: {visiting}\n"
+            f"Purpose: {purpose}\n"
+            f"Coming On: {coming_on}\n"
+            f"Coming From: {coming_from}\n"
+            f"No of People: {rd.get('people_count') or '—'}\n"
+            f"Mobile Number: {rd.get('guest_phone') or '—'}\n\n"
             "Please approve or deny."
         )
     if req_type == "LEAVE":
@@ -466,13 +477,13 @@ def _approval_message_body(
         test_tag = "[TEST] " if rd.get("leave_test_approver") else ""
         return (
             f"{test_tag}Leave approval request\n\n"
-            f"Name: {emp}\n"
+            f"Employee: {emp}\n"
             f"Department: {dept}\n"
-            f"No. of days leave: {days_display}\n"
+            f"No of Days Leave: {days_display}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
-            f"Leaves in Last month: {leaves_last}\n"
-            f"Leaves in current month: {leaves_curr}\n\n"
+            f"Leaves in Current Month: {leaves_curr}\n"
+            f"Leaves in Last Month: {leaves_last}\n\n"
             "Please approve or deny."
         )
     if req_type == "PERMISSION":
@@ -536,7 +547,10 @@ def _approval_message_body(
         "OD approval request\n\n"
         f"Employee: {emp}\n"
         f"Department: {dept}\n"
-        f"Reason: {reason or '—'}\n\n"
+        f"Date: {_format_od_approval_date((request_rd or {}).get('requested_datetime'))}\n"
+        f"Visiting To: {(request_rd or {}).get('od_visiting_to_label') or reason or '—'}\n"
+        f"Purpose: {((request_rd or {}).get('od_purpose') or '').strip() or '—'}\n"
+        f"Time Required: {(request_rd or {}).get('od_time_required_hours') or '—'}\n\n"
         "Please approve or deny."
     )
 

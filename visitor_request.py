@@ -70,6 +70,31 @@ PURPOSE_LABELS = {
     PURPOSE_OTHER: "Other",
 }
 
+VISITOR_TYPE_LABELS: dict[str, str] = {
+    "supplier": "Supplier",
+    "customer": "Customer",
+    "interview": "Interview",
+    "govt_officials": "Govt Officials",
+    "govt": "Govt Officials",
+    "government_officials": "Govt Officials",
+    "consultant": "Consultant",
+    "contractor": "Contractor",
+    "service_provider": "Service Provider",
+    "guest": "Guest",
+}
+
+
+def _resolve_visitor_type(raw: str) -> tuple[str, str]:
+    key = (raw or "").strip().lower().replace(" ", "_")
+    aliases = {
+        "govt_official": "govt_officials",
+        "government_official": "govt_officials",
+        "serviceprovider": "service_provider",
+    }
+    code = aliases.get(key, key)
+    label = VISITOR_TYPE_LABELS.get(code, "")
+    return code, label
+
 
 @dataclass
 class VisitorDeps:
@@ -745,25 +770,52 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         _flow_pick(data, "coming_on", "coming_on_date", "visit_date", "date")
     )
     coming_from = _flow_pick(data, "coming_from", "comingfrom")
-    purpose_raw = _flow_pick(data, "purpose", "purpose_of_visit", "visit_purpose").lower()
-    if not purpose_raw:
-        return None
-    other_purpose = _flow_pick(
-        data, "other_purpose", "enter_purpose", "purpose_other", "fill_purpose", "other"
-    )
 
-    if purpose_raw in ("customer_visit", "customer") or "customer" in purpose_raw:
-        purpose = PURPOSE_CUSTOMER
-        purpose_label = PURPOSE_LABELS[PURPOSE_CUSTOMER]
-        purpose_detail = ""
-    elif purpose_raw == "other" or "other" in purpose_raw:
-        if not other_purpose:
+    visitor_type_raw = _flow_pick(data, "visitor_type", "visitor_type_code")
+    visitor_type = ""
+    visitor_type_label = ""
+    purpose = ""
+    purpose_label = ""
+    purpose_detail = ""
+
+    if visitor_type_raw:
+        visitor_type, visitor_type_label = _resolve_visitor_type(visitor_type_raw)
+        if not visitor_type_label:
             return None
-        purpose = PURPOSE_OTHER
-        purpose_label = other_purpose
-        purpose_detail = other_purpose
+        purpose_text = _flow_pick(
+            data, "purpose", "purpose_detail", "visit_purpose", "purpose_of_visit"
+        )
+        if not purpose_text:
+            return None
+        purpose = visitor_type
+        purpose_label = purpose_text
+        purpose_detail = purpose_text
     else:
-        return None
+        purpose_raw = _flow_pick(
+            data, "purpose", "purpose_of_visit", "visit_purpose"
+        ).lower()
+        if not purpose_raw:
+            return None
+        other_purpose = _flow_pick(
+            data,
+            "other_purpose",
+            "enter_purpose",
+            "purpose_other",
+            "fill_purpose",
+            "other",
+        )
+        if purpose_raw in ("customer_visit", "customer") or "customer" in purpose_raw:
+            purpose = PURPOSE_CUSTOMER
+            purpose_label = PURPOSE_LABELS[PURPOSE_CUSTOMER]
+            purpose_detail = ""
+        elif purpose_raw == "other" or "other" in purpose_raw:
+            if not other_purpose:
+                return None
+            purpose = PURPOSE_OTHER
+            purpose_label = other_purpose
+            purpose_detail = other_purpose
+        else:
+            return None
 
     count_raw = _flow_pick(data, "no_of_people", "people_count", "number_of_people")
     if not count_raw:
@@ -804,20 +856,24 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     if not visiting_to:
         return None
 
-    return {
+    result = {
         "coming_on_date": coming_on,
         "coming_from": coming_from,
         "purpose": purpose,
         "purpose_label": purpose_label,
         "purpose_detail": purpose_detail,
-        "coming_for": purpose,
-        "coming_for_label": purpose_label,
+        "coming_for": visitor_type or purpose,
+        "coming_for_label": visitor_type_label or purpose_label,
         "people_count": count,
         "visitor_names": names,
         "guest_phone": guest_phone,
         "visiting_to": visiting_to,
         "visiting_to_label": _visiting_to_label(visiting_to),
     }
+    if visitor_type:
+        result["visitor_type"] = visitor_type
+        result["visitor_type_label"] = visitor_type_label
+    return result
 
 
 def handle_flow_submission(sender: str, response_json: dict | str | None, deps: VisitorDeps) -> None:
@@ -901,6 +957,8 @@ def _submit_payload(
     purpose = (data.get("purpose") or data.get("coming_for") or "").strip()
     purpose_label = (data.get("purpose_label") or data.get("coming_for_label") or "").strip()
     purpose_detail = (data.get("purpose_detail") or "").strip()
+    visitor_type = (data.get("visitor_type") or "").strip()
+    visitor_type_label = (data.get("visitor_type_label") or "").strip()
     visiting_to_label = (
         data.get("visiting_to_label") or _visiting_to_label(visiting_to)
     ).strip()
@@ -945,6 +1003,8 @@ def _submit_payload(
         "submission_source": submission_source,
         "visiting_to": visiting_to,
         "visiting_to_label": visiting_to_label,
+        "visitor_type": visitor_type,
+        "visitor_type_label": visitor_type_label,
         "employee_jmd_route": chain.get("employee_jmd_route")
         or (ud.get("jmd_route") or "JMD1").strip().upper(),
         "md": chain["md"],
