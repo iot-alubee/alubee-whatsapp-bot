@@ -148,6 +148,9 @@ SESSION_MENU_IDLE = "MENU_IDLE"
 SESSION_AWAITING_HI = "AWAITING_HI"
 SESSION_APPROVER_AVAILABILITY = "APPROVER_AVAILABILITY"
 
+# Set True to show Permission - Form on the main menu again.
+SHOW_PERMISSION_FORM_IN_MENU = False
+
 _ROW_IDS = {
     "od_request": "OD_REQUEST",
     "od_form": "OD_FORM",
@@ -461,14 +464,16 @@ VISITOR_DEPS = visitor_request.VisitorDeps(
 
 def _numbered_request_menu(employee_name: str) -> str:
     name = _chat_name(employee_name)
-    return (
-        f"Welcome {name} 👋\n\n"
-        "Select an option (reply with the number):\n"
-        "1. OD - Form\n"
-        "2. Visitor - Form\n"
-        "3. Leave - Form\n"
-        "4. Permission - Form"
-    )
+    lines = [
+        f"Welcome {name} 👋\n\n",
+        "Select an option (reply with the number):\n",
+        "1. OD - Form\n",
+        "2. Visitor - Form\n",
+        "3. Leave - Form\n",
+    ]
+    if SHOW_PERMISSION_FORM_IN_MENU:
+        lines.append("4. Permission - Form")
+    return "".join(lines)
 
 
 def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
@@ -539,12 +544,14 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
 def _send_main_menu(wa_id: str, employee_name: str) -> None:
     name = _chat_name(employee_name)
     welcome = f"Welcome {name} 👋\n\nPlease choose an option:"
-    rows = _list_rows(
+    menu_items = [
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
-        ("permission_form", "Permission - Form"),
-    )
+    ]
+    if SHOW_PERMISSION_FORM_IN_MENU:
+        menu_items.append(("permission_form", "Permission - Form"))
+    rows = _list_rows(*menu_items)
     try:
         send_list_menu(
             wa_id_to_phone(wa_id),
@@ -558,10 +565,12 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
             _send_to(wa_id, _numbered_request_menu(employee_name))
         except Exception:
             logger.exception("numbered menu text failed to=%s", wa_id)
-            _send_to(
-                wa_id,
-                f"{welcome}\n\nReply 1–4: OD / Visitor / Leave / Permission Form.",
+            menu_hint = (
+                "Reply 1–4: OD / Visitor / Leave / Permission Form."
+                if SHOW_PERMISSION_FORM_IN_MENU
+                else "Reply 1–3: OD / Visitor / Leave Form."
             )
+            _send_to(wa_id, f"{welcome}\n\n{menu_hint}")
 
 
 def _normalize_choice(raw: str) -> str:
