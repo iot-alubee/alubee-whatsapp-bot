@@ -329,6 +329,19 @@ def _notify_engineer_assigned(engineer_wa: str, rd: dict, deps: ItDeps) -> None:
         except Exception:
             logger.exception("IT engineer session image failed engineer=%s", engineer_wa)
 
+        # If caption-in-image fails, still try image then ticket text (no URL).
+        try:
+            send_image(
+                phone,
+                photo_url,
+                ensure_contact=True,
+                contact_name=engineer_name,
+            )
+            deps.send_to(engineer_wa, ticket_text)
+            return
+        except Exception:
+            logger.exception("IT engineer image-only send failed engineer=%s", engineer_wa)
+
         template_name = (os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME") or "").strip()
         if template_name:
             try:

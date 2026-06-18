@@ -273,69 +273,21 @@ def send_image(
         raise ValueError("image_url must be an https URL")
     link = link[:2048]
     cap = (caption or "").strip()[:1024]
-    base: dict[str, Any] = {
+
+    # Interakt session image API expects data.message.mediaUrl (not Meta image.link).
+    message_obj: dict[str, Any] = {"mediaUrl": link}
+    if cap:
+        message_obj["message"] = cap
+
+    payload: dict[str, Any] = {
         "countryCode": "+91",
         "phoneNumber": phone_to_10(phone),
+        "type": "Image",
+        "data": {"message": message_obj},
     }
     if callback_data:
-        base["callbackData"] = callback_data[:512]
-
-    image_obj: dict[str, Any] = {"link": link}
-    if cap:
-        image_obj["caption"] = cap
-
-    attempts: list[tuple[str, dict[str, Any]]] = [
-        (
-            "image_meta",
-            {
-                **base,
-                "type": "Image",
-                "data": {
-                    "message": {
-                        "type": "image",
-                        "image": dict(image_obj),
-                    },
-                },
-            },
-        ),
-        (
-            "image_link",
-            {
-                **base,
-                "type": "Image",
-                "data": {"message": link},
-            },
-        ),
-        (
-            "template_image_header",
-            {
-                **base,
-                "type": "Template",
-                "template": {
-                    "name": (os.getenv("IT_ENGINEER_PHOTO_TEMPLATE_NAME") or "").strip(),
-                    "languageCode": (
-                        os.getenv("IT_ENGINEER_PHOTO_TEMPLATE_LANGUAGE_CODE") or "en"
-                    ).strip(),
-                    "headerValues": [link],
-                    "bodyValues": [cap or "IT request photo"],
-                },
-            },
-        ),
-    ]
-
-    last_err: Exception | None = None
-    for label, payload in attempts:
-        if label == "template_image_header" and not payload["template"]["name"]:
-            continue
-        try:
-            data = _post(payload)
-            logger.info("Interakt image sent via %s phone=%s", label, phone_to_10(phone))
-            return data
-        except Exception as exc:
-            last_err = exc
-            logger.warning("Interakt image attempt %s failed phone=%s: %s", label, phone_to_10(phone), exc)
-    assert last_err is not None
-    raise last_err
+        payload["callbackData"] = callback_data[:512]
+    return _post(payload)
 
 
 def send_template_with_image_header(
