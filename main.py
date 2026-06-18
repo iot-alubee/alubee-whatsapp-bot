@@ -484,8 +484,7 @@ def _numbered_request_menu(employee_name: str) -> str:
         "1. OD - Form\n"
         "2. Visitor - Form\n"
         "3. Leave - Form\n"
-        "4. Permission - Form\n"
-        "5. IT - Form"
+        "4. IT - Form"
     )
 
 
@@ -561,7 +560,6 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
-        ("permission_form", "Permission - Form"),
         ("it_form", "IT - Form"),
     )
     try:
@@ -579,7 +577,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
             logger.exception("numbered menu text failed to=%s", wa_id)
             _send_to(
                 wa_id,
-                f"{welcome}\n\nReply 1–5: OD / Visitor / Leave / Permission / IT Form.",
+                f"{welcome}\n\nReply 1–4: OD / Visitor / Leave / IT Form.",
             )
 
 
@@ -1000,14 +998,7 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("4", "PERMISSION_FORM", "9"):
-        if state == SESSION_MENU_IDLE:
-            permission_request.try_start_form(sender, PERMISSION_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("5", "IT_FORM"):
+    if incoming in ("4", "5", "IT_FORM"):
         if state == SESSION_MENU_IDLE:
             it_request.try_start_form(sender, IT_DEPS)
         else:

@@ -145,6 +145,12 @@ def _engineer_name(wa_id: str, db: object) -> str:
     return "IT Engineer"
 
 
+def _employee_assigned_message(engineer_wa: str, deps: ItDeps) -> str:
+    name = _engineer_name(engineer_wa, deps.db)
+    mobile = wa_id_to_phone(engineer_wa)
+    return f"Your request has been assigned to {name} ({mobile})."
+
+
 def _format_ist(dt) -> str:
     if not dt:
         return ""
@@ -389,10 +395,7 @@ def _assign_request(
     _notify_engineer_assigned(engineer_wa, rd, deps)
     employee = (rd.get("employee") or "").strip()
     if employee:
-        deps.send_to(
-            employee,
-            f"Your IT request has been assigned to {engineer_name}.",
-        )
+        deps.send_to(employee, _employee_assigned_message(engineer_wa, deps))
 
 
 def process_it_queue(deps: ItDeps, *, preferred_engineer: str | None = None) -> None:
@@ -514,7 +517,6 @@ def _finish_request(
     if current not in IT_OPEN_STATUSES:
         deps.clear_session(sender)
         deps.send_to(sender, "This IT request is already closed.")
-        deps.go_main_menu(sender)
         return
 
     engineer_wa = (rd.get("assigned_engineer") or "").strip()
@@ -537,7 +539,6 @@ def _finish_request(
         process_it_queue(deps, preferred_engineer=engineer_wa)
     else:
         process_it_queue(deps)
-    deps.go_main_menu(sender)
 
 
 def handle_flow_submission(sender: str, response_json: dict | str | None, deps: ItDeps) -> None:
@@ -625,14 +626,9 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
     if pick:
         slot, engineer_wa = pick
         _assign_request(request_id, payload, slot, engineer_wa, deps)
-        deps.send_to(
-            sender,
-            f"Your IT request has been submitted and assigned to "
-            f"{_engineer_name(engineer_wa, deps.db)}.",
-        )
     else:
         deps.send_to(
             sender,
-            "Our IT support engineers are currently attending other requests. "
-            "Your request has been queued and will be assigned as soon as an engineer is free.",
+            "Your IT request has been submitted. "
+            "Our engineers are busy — it will be assigned when one is free.",
         )
