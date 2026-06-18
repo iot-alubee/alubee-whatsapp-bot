@@ -754,7 +754,11 @@ def handle_flow_submission(
 ) -> None:
     parsed = parse_flow_response(response_json)
     if not parsed:
-        deps.send_to(sender, "Could not read the leave form. Please try again or contact admin.")
+        deps.send_to(
+            sender,
+            "Could not read the leave form. Leave cannot be raised for today's date "
+            "when using Other dates. Please try again or contact admin.",
+        )
         return
     exists, ud = get_user_record(sender)
     session = {

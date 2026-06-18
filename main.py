@@ -6,6 +6,7 @@ Request flows live in separate modules:
   - visitor_request.py
   - leave_request.py
   - permission_request.py
+  - it_request.py
   - approval.py (shared JMD → MD)
 """
 
@@ -29,6 +30,7 @@ import approval
 import approver_availability
 import bot_shared
 from bot_shared import wa_from_env
+import it_request
 import leave_request
 import od_request
 import permission_request
@@ -165,6 +167,8 @@ _ROW_IDS = {
     "leave_-_form": "LEAVE_FORM",
     "permission_form": "PERMISSION_FORM",
     "permission_-_form": "PERMISSION_FORM",
+    "it_form": "IT_FORM",
+    "it_-_form": "IT_FORM",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -199,6 +203,8 @@ _ROW_IDS = {
     "permission_cancel": "PERMISSION_CANCEL",
     "cancel_permission": "PERMISSION_CANCEL",
     "permission_exit": "PERMISSION_EXIT",
+    "it_close": "IT_CLOSE",
+    "it_cancel": "IT_CANCEL",
     "permission_late_in": "PERMISSION_LATE_IN",
     "late_in": "PERMISSION_LATE_IN",
     "permission_early_out": "PERMISSION_EARLY_OUT",
@@ -461,6 +467,17 @@ VISITOR_DEPS = visitor_request.VisitorDeps(
     already_pending_msg=VISITOR_ALREADY_PENDING_MSG,
 )
 
+IT_DEPS = it_request.ItDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    clear_session=lambda sender: _session_ref(sender).delete(),
+    go_main_menu=_go_main_menu_for_employee,
+    same_whatsapp=_same_whatsapp,
+)
+
 
 def _numbered_request_menu(employee_name: str) -> str:
     name = _chat_name(employee_name)
@@ -470,9 +487,10 @@ def _numbered_request_menu(employee_name: str) -> str:
         "1. OD - Form\n",
         "2. Visitor - Form\n",
         "3. Leave - Form\n",
+        "4. IT - Form\n",
     ]
     if SHOW_PERMISSION_FORM_IN_MENU:
-        lines.append("4. Permission - Form")
+        lines.append("5. Permission - Form")
     return "".join(lines)
 
 
@@ -548,6 +566,7 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
+        ("it_form", "IT - Form"),
     ]
     if SHOW_PERMISSION_FORM_IN_MENU:
         menu_items.append(("permission_form", "Permission - Form"))
@@ -596,6 +615,8 @@ def _normalize_choice(raw: str) -> str:
         "leave form": "LEAVE_FORM",
         "permission - form": "PERMISSION_FORM",
         "permission form": "PERMISSION_FORM",
+        "it - form": "IT_FORM",
+        "it form": "IT_FORM",
     }
     return titles.get(s.lower(), s)
 
@@ -700,6 +721,9 @@ def _looks_like_flow_payload(payload) -> bool:
             "leave_reason",
             "permission_for",
             "permission_type",
+            "it_category",
+            "issue_type",
+            "issue_photo",
         }
     )
 
@@ -719,6 +743,8 @@ def _flow_callback_kind(body: dict) -> str:
         return "leave-flow"
     if callback in ("permission-flow", "permission_form", "permission"):
         return "permission-flow"
+    if callback in ("it-flow", "it_form", "it"):
+        return "it-flow"
     return callback
 
 
@@ -731,6 +757,7 @@ def _is_flow_reply_webhook(body: dict) -> bool:
         "visitor-flow",
         "leave-flow",
         "permission-flow",
+        "it-flow",
     ):
         return True
     data = body.get("data") or {}
@@ -958,6 +985,10 @@ def _process(sender: str, incoming: str) -> None:
         permission_request.handle(sender, incoming, session or {}, PERMISSION_DEPS)
         return
 
+    if it_request.is_it_state(state):
+        it_request.handle(sender, incoming, session or {}, IT_DEPS)
+        return
+
     if incoming in ("1", "OD_FORM", "6"):
         if state == SESSION_MENU_IDLE:
             od_request.try_start_form(sender, OD_DEPS)
@@ -979,7 +1010,14 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("4", "PERMISSION_FORM", "5", "9"):
+    if incoming in ("4", "IT_FORM"):
+        if state == SESSION_MENU_IDLE:
+            it_request.try_start_form(sender, IT_DEPS)
+        else:
+            _send_to(sender, "Send Hi to start.")
+        return
+
+    if incoming in ("5", "PERMISSION_FORM", "9"):
         if state == SESSION_MENU_IDLE:
             permission_request.try_start_form(sender, PERMISSION_DEPS)
         else:
@@ -1063,6 +1101,8 @@ def health():
         "leave_flow_template": leave_request.leave_flow_template_name(),
         "permission_form_configured": permission_request.permission_flow_enabled(),
         "permission_flow_template": permission_request.permission_flow_template_name(),
+        "it_form_configured": it_request.it_flow_enabled(),
+        "it_flow_template": it_request.it_flow_template_name(),
     }
 
 
@@ -1129,6 +1169,18 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("could not notify user after permission flow error")
+        elif flow_kind in ("it-flow", "it_form", "it"):
+            try:
+                it_request.handle_flow_submission(sender, response_json, IT_DEPS)
+            except Exception:
+                logger.exception("IT flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your IT form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after IT flow error")
         elif flow_kind == "flow" and isinstance(response_json, dict):
             keys = {str(k).lower() for k in response_json.keys()}
             if keys & {"od_reason", "company_vehicle", "vehicle"}:
@@ -1151,6 +1203,11 @@ async def webhook(request: Request):
                     permission_request.handle_flow_submission(sender, response_json, PERMISSION_DEPS)
                 except Exception:
                     logger.exception("permission flow submit failed sender=%s", sender)
+            elif keys & {"it_category", "issue_type"}:
+                try:
+                    it_request.handle_flow_submission(sender, response_json, IT_DEPS)
+                except Exception:
+                    logger.exception("IT flow submit failed sender=%s", sender)
             else:
                 logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
         else:

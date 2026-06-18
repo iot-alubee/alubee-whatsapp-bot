@@ -256,6 +256,36 @@ def send_text(phone: str, text: str, *, callback_data: str = "") -> dict[str, An
     return _post(payload)
 
 
+def send_image(
+    phone: str,
+    image_url: str,
+    *,
+    caption: str = "",
+    callback_data: str = "",
+) -> dict[str, Any]:
+    """Session image message (HTTPS URL). Works when recipient has an active 24h window."""
+    link = (image_url or "").strip()
+    if not link.lower().startswith("https://"):
+        raise ValueError("image_url must be an https URL")
+    payload: dict[str, Any] = {
+        "countryCode": "+91",
+        "phoneNumber": phone_to_10(phone),
+        "type": "Image",
+        "data": {
+            "message": {
+                "type": "image",
+                "image": {"link": link[:2048]},
+            },
+        },
+    }
+    cap = (caption or "").strip()
+    if cap:
+        payload["data"]["message"]["caption"] = cap[:1024]
+    if callback_data:
+        payload["callbackData"] = callback_data[:512]
+    return _post(payload)
+
+
 def send_interactive_list(
     phone: str,
     body_text: str,
@@ -586,6 +616,42 @@ def send_permission_flow_form(
         return True
     except Exception:
         logger.exception("permission flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
+def send_it_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send IT WhatsApp Form template (env IT_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("IT_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("IT_FLOW_TEMPLATE_NAME not set — cannot send IT form")
+        return False
+    lang = (os.getenv("IT_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("IT_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="it-flow",
+            flow_token=f"it_{phone_10}"[:256],
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info("IT flow template sent phone=%s template=%s", phone_to_10(phone), template_name)
+        return True
+    except Exception:
+        logger.exception("IT flow template failed phone=%s", phone_to_10(phone))
         return False
 
 
