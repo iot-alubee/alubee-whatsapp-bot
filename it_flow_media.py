@@ -48,12 +48,28 @@ def _entry_meta(entry: dict) -> dict:
     return flat
 
 
+def _cdn_url_from_entry(entry: dict) -> str:
+    for key in ("cdn_url", "url", "media_url", "download_url", "file_url"):
+        val = (entry.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _media_id_from_entry(entry: dict) -> str:
+    for key in ("media_id", "id", "mediaId"):
+        val = str(entry.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def _looks_like_photo_entry(item: dict) -> bool:
     if not isinstance(item, dict):
         return False
-    if item.get("cdn_url"):
-        return bool(_entry_meta(item))
-    if item.get("media_id") and _entry_meta(item):
+    if _cdn_url_from_entry(item) and _entry_meta(item):
+        return True
+    if _media_id_from_entry(item):
         return True
     return False
 
@@ -118,11 +134,80 @@ def photo_debug_summary(raw_photo: Any) -> str:
             return f"unparsed_photo_string len={len(raw_photo.strip())}"
         if isinstance(raw_photo, dict):
             return f"photo_dict_keys={','.join(sorted(raw_photo.keys()))}"
+        if isinstance(raw_photo, list) and raw_photo:
+            first = raw_photo[0]
+            if isinstance(first, dict):
+                return (
+                    f"list_len={len(raw_photo)} "
+                    f"first_keys={','.join(sorted(first.keys()))}"
+                )
+            return f"list_len={len(raw_photo)} first_type={type(first).__name__}"
         return f"photo_present_type={kind}_no_entries"
     entry = entries[0]
-    has_cdn = bool((entry.get("cdn_url") or "").strip())
+    has_cdn = bool(_cdn_url_from_entry(entry))
     has_meta = bool(_entry_meta(entry))
-    return f"entries=1 cdn_url={has_cdn} meta={has_meta}"
+    media_id = _media_id_from_entry(entry)
+    return (
+        f"entries=1 cdn_url={has_cdn} meta={has_meta} "
+        f"media_id={bool(media_id)} keys={','.join(sorted(entry.keys()))}"
+    )
+
+
+def _whatsapp_graph_token() -> str:
+    for key in (
+        "WHATSAPP_CLOUD_API_TOKEN",
+        "META_WHATSAPP_ACCESS_TOKEN",
+        "WHATSAPP_ACCESS_TOKEN",
+        "GRAPH_API_TOKEN",
+    ):
+        val = (os.getenv(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _whatsapp_graph_version() -> str:
+    raw = (os.getenv("WHATSAPP_GRAPH_API_VERSION") or "v21.0").strip()
+    return raw if raw.startswith("v") else f"v{raw}"
+
+
+def _verify_sha256(content: bytes, expected_b64: str) -> None:
+    expected = (expected_b64 or "").strip()
+    if not expected:
+        return
+    digest = base64.b64encode(hashlib.sha256(content).digest()).decode()
+    if not hmac.compare_digest(digest, expected):
+        raise ValueError("Downloaded media sha256 mismatch")
+
+
+def download_whatsapp_cloud_media(media_id: str, *, expected_sha256: str = "") -> bytes:
+    """Download Flow PhotoPicker media via WhatsApp Cloud API (webhook reference format)."""
+    token = _whatsapp_graph_token()
+    if not token:
+        raise RuntimeError(
+            "WHATSAPP_CLOUD_API_TOKEN is not set (required for Flow photo download)"
+        )
+    version = _whatsapp_graph_version()
+    meta_url = f"https://graph.facebook.com/{version}/{media_id}"
+    meta_resp = requests.get(
+        meta_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    meta_resp.raise_for_status()
+    media_url = (meta_resp.json() or {}).get("url") or ""
+    if not media_url:
+        raise ValueError(f"No media url for id={media_id}")
+
+    file_resp = requests.get(
+        media_url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    file_resp.raise_for_status()
+    content = file_resp.content
+    _verify_sha256(content, expected_sha256)
+    return content
 
 
 def decrypt_flow_media_file(cdn_bytes: bytes, meta: dict) -> bytes:
@@ -208,34 +293,45 @@ def process_it_issue_photo(raw_photo: Any, request_id: str) -> tuple[dict[str, s
         return None, photo_debug_summary(raw_photo)
 
     entry = entries[0]
-    cdn_url = (entry.get("cdn_url") or "").strip()
+    cdn_url = _cdn_url_from_entry(entry)
     meta = _entry_meta(entry)
-    if not cdn_url:
-        return None, "photo_missing_cdn_url"
-    if not meta:
-        return None, "photo_missing_encryption_metadata"
-
     file_name = _safe_filename(str(entry.get("file_name") or "issue.jpg"))
+    expected_sha256 = str(entry.get("sha256") or entry.get("plaintext_hash") or "")
     try:
-        resp = requests.get(cdn_url, timeout=60)
-        resp.raise_for_status()
-        plaintext = decrypt_flow_media_file(resp.content, meta)
-        content_type = _content_type_for_name(file_name)
+        if cdn_url and meta:
+            resp = requests.get(cdn_url, timeout=60)
+            resp.raise_for_status()
+            plaintext = decrypt_flow_media_file(resp.content, meta)
+            source = "flow_cdn"
+        else:
+            media_id = _media_id_from_entry(entry)
+            if not media_id:
+                return None, "photo_missing_media_id"
+            plaintext = download_whatsapp_cloud_media(
+                media_id,
+                expected_sha256=expected_sha256,
+            )
+            source = "cloud_api"
+        content_type = str(entry.get("mime_type") or "").strip() or _content_type_for_name(
+            file_name
+        )
         url, path = _upload_to_firebase_storage(
             request_id, file_name, plaintext, content_type
         )
         logger.info(
-            "IT issue photo uploaded request_id=%s path=%s bytes=%s",
+            "IT issue photo uploaded request_id=%s path=%s bytes=%s source=%s",
             request_id,
             path,
             len(plaintext),
+            source,
         )
         return {
             "issue_photo_url": url,
             "issue_photo_path": path,
             "issue_photo_file_name": file_name,
             "issue_photo_status": "uploaded",
-        }, "uploaded"
+            "issue_photo_source": source,
+        }, f"uploaded:{source}"
     except Exception as exc:
         logger.exception("IT issue photo processing failed request_id=%s", request_id)
         return None, f"upload_failed:{type(exc).__name__}:{exc}"
