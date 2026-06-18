@@ -262,25 +262,112 @@ def send_image(
     *,
     caption: str = "",
     callback_data: str = "",
+    ensure_contact: bool = False,
+    contact_name: str = "",
 ) -> dict[str, Any]:
     """Session image message (HTTPS URL). Works when recipient has an active 24h window."""
+    if ensure_contact:
+        ensure_customer(phone, name=contact_name)
     link = (image_url or "").strip()
     if not link.lower().startswith("https://"):
         raise ValueError("image_url must be an https URL")
+    link = link[:2048]
+    cap = (caption or "").strip()[:1024]
+    base: dict[str, Any] = {
+        "countryCode": "+91",
+        "phoneNumber": phone_to_10(phone),
+    }
+    if callback_data:
+        base["callbackData"] = callback_data[:512]
+
+    image_obj: dict[str, Any] = {"link": link}
+    if cap:
+        image_obj["caption"] = cap
+
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        (
+            "image_meta",
+            {
+                **base,
+                "type": "Image",
+                "data": {
+                    "message": {
+                        "type": "image",
+                        "image": dict(image_obj),
+                    },
+                },
+            },
+        ),
+        (
+            "image_link",
+            {
+                **base,
+                "type": "Image",
+                "data": {"message": link},
+            },
+        ),
+        (
+            "template_image_header",
+            {
+                **base,
+                "type": "Template",
+                "template": {
+                    "name": (os.getenv("IT_ENGINEER_PHOTO_TEMPLATE_NAME") or "").strip(),
+                    "languageCode": (
+                        os.getenv("IT_ENGINEER_PHOTO_TEMPLATE_LANGUAGE_CODE") or "en"
+                    ).strip(),
+                    "headerValues": [link],
+                    "bodyValues": [cap or "IT request photo"],
+                },
+            },
+        ),
+    ]
+
+    last_err: Exception | None = None
+    for label, payload in attempts:
+        if label == "template_image_header" and not payload["template"]["name"]:
+            continue
+        try:
+            data = _post(payload)
+            logger.info("Interakt image sent via %s phone=%s", label, phone_to_10(phone))
+            return data
+        except Exception as exc:
+            last_err = exc
+            logger.warning("Interakt image attempt %s failed phone=%s: %s", label, phone_to_10(phone), exc)
+    assert last_err is not None
+    raise last_err
+
+
+def send_template_with_image_header(
+    phone: str,
+    template_name: str,
+    image_url: str,
+    *,
+    language_code: str = "en",
+    body_values: list[str] | None = None,
+    callback_data: str = "",
+    ensure_contact: bool = False,
+    contact_name: str = "",
+) -> dict[str, Any]:
+    """Approved template with image header — works outside the 24h session window."""
+    if ensure_contact:
+        ensure_customer(phone, name=contact_name)
+    link = (image_url or "").strip()
+    if not link.lower().startswith("https://"):
+        raise ValueError("image_url must be an https URL")
+    template: dict[str, Any] = {
+        "name": template_name.strip(),
+        "languageCode": (language_code or "en").strip(),
+        "headerValues": [link[:2048]],
+    }
+    if body_values:
+        template["bodyValues"] = [str(v)[:1024] for v in body_values]
     payload: dict[str, Any] = {
         "countryCode": "+91",
         "phoneNumber": phone_to_10(phone),
-        "type": "Image",
-        "data": {
-            "message": {
-                "type": "image",
-                "image": {"link": link[:2048]},
-            },
-        },
+        "type": "Template",
+        "template": template,
     }
-    cap = (caption or "").strip()
-    if cap:
-        payload["data"]["message"]["caption"] = cap[:1024]
     if callback_data:
         payload["callbackData"] = callback_data[:512]
     return _post(payload)

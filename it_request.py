@@ -11,7 +11,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from bot_shared import get_user_record, query_requests_by_type, query_requests_for_employee, wa_from_10
-from interakt_api import send_image, send_reply_buttons, wa_id_to_phone
+from interakt_api import send_image, send_reply_buttons, send_template_with_image_header, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
 
@@ -311,16 +311,41 @@ def _engineer_assignment_message(rd: dict) -> str:
 
 
 def _notify_engineer_assigned(engineer_wa: str, rd: dict, deps: ItDeps) -> None:
-    deps.send_to(engineer_wa, _engineer_assignment_message(rd))
+    ticket_text = _engineer_assignment_message(rd)
     photo_url = (rd.get("issue_photo_url") or "").strip()
-    if not photo_url:
-        return
     phone = wa_id_to_phone(engineer_wa)
-    try:
-        send_image(phone, photo_url, caption="Issue photo")
-    except Exception:
-        logger.exception("IT engineer image send failed engineer=%s", engineer_wa)
-        deps.send_to(engineer_wa, f"Issue photo: {photo_url}")
+    engineer_name = _engineer_name(engineer_wa, deps.db)
+
+    if photo_url:
+        try:
+            send_image(
+                phone,
+                photo_url,
+                caption=ticket_text,
+                ensure_contact=True,
+                contact_name=engineer_name,
+            )
+            return
+        except Exception:
+            logger.exception("IT engineer session image failed engineer=%s", engineer_wa)
+
+        template_name = (os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME") or "").strip()
+        if template_name:
+            try:
+                send_template_with_image_header(
+                    phone,
+                    template_name,
+                    photo_url,
+                    language_code=(os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_LANGUAGE_CODE") or "en").strip(),
+                    body_values=[ticket_text],
+                    ensure_contact=True,
+                    contact_name=engineer_name,
+                )
+                return
+            except Exception:
+                logger.exception("IT engineer template image failed engineer=%s", engineer_wa)
+
+    deps.send_to(engineer_wa, ticket_text)
 
 
 def _assign_request(
