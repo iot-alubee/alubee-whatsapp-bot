@@ -274,19 +274,25 @@ def send_image(
     link = link[:2048]
     cap = (caption or "").strip()[:1024]
 
-    # Interakt session image API expects data.message.mediaUrl (not Meta image.link).
-    message_obj: dict[str, Any] = {"mediaUrl": link}
+    # Interakt: mediaUrl is a top-level field on data (sibling of message), not nested.
+    data: dict[str, Any] = {"mediaUrl": link}
     if cap:
-        message_obj["message"] = cap
+        data["message"] = cap
 
     payload: dict[str, Any] = {
         "countryCode": "+91",
         "phoneNumber": phone_to_10(phone),
         "type": "Image",
-        "data": {"message": message_obj},
+        "data": data,
     }
     if callback_data:
         payload["callbackData"] = callback_data[:512]
+    logger.info(
+        "Interakt image payload phone=%s has_mediaUrl=%s has_caption=%s",
+        phone_to_10(phone),
+        bool(data.get("mediaUrl")),
+        bool(cap),
+    )
     return _post(payload)
 
 
