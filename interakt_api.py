@@ -503,44 +503,6 @@ def send_flow_template(
     return _post(payload)
 
 
-def send_od_flow_form(
-    phone: str,
-    *,
-    employee_name: str = "",
-    body_values: list[str] | None = None,
-) -> bool:
-    """Send OD WhatsApp Form template (env OD_FLOW_TEMPLATE_NAME, default od_request)."""
-    template_name = (
-        os.getenv("OD_FLOW_TEMPLATE_NAME")
-        or os.getenv("OD_FLOW_TEMPLATE_DEFAULT")
-        or "od_request"
-    ).strip()
-    if not template_name:
-        logger.warning("OD flow template name empty — cannot send OD form")
-        return False
-    lang = (os.getenv("OD_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
-    if body_values is None:
-        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
-        keys = [k.strip() for k in spec.split(",") if k.strip()]
-        vals = {"name": (employee_name or "Employee")[:50]}
-        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
-    try:
-        send_flow_template(
-            phone,
-            template_name,
-            language_code=lang,
-            body_values=body_values,
-            callback_data="od-flow",
-            ensure_contact=True,
-            contact_name=(employee_name or "Employee")[:50],
-        )
-        logger.info("OD flow template sent phone=%s template=%s", phone_to_10(phone), template_name)
-        return True
-    except Exception:
-        logger.exception("OD flow template failed phone=%s", phone_to_10(phone))
-        return False
-
-
 def send_leave_flow_form(
     phone: str,
     *,
@@ -688,6 +650,40 @@ def send_visitor_flow_form(
         return True
     except Exception:
         logger.exception("visitor flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
+def send_od_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send OD WhatsApp Form template (env OD_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("OD_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("OD_FLOW_TEMPLATE_NAME not set — cannot send OD form")
+        return False
+    lang = (os.getenv("OD_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("OD_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys]
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="od-flow",
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info("OD flow template sent phone=%s template=%s", phone_to_10(phone), template_name)
+        return True
+    except Exception:
+        logger.exception("OD flow template failed phone=%s", phone_to_10(phone))
         return False
 
 

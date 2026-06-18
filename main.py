@@ -150,9 +150,6 @@ SESSION_MENU_IDLE = "MENU_IDLE"
 SESSION_AWAITING_HI = "AWAITING_HI"
 SESSION_APPROVER_AVAILABILITY = "APPROVER_AVAILABILITY"
 
-# Set True to show Permission - Form on the main menu again.
-SHOW_PERMISSION_FORM_IN_MENU = False
-
 _ROW_IDS = {
     "od_request": "OD_REQUEST",
     "od_form": "OD_FORM",
@@ -481,17 +478,15 @@ IT_DEPS = it_request.ItDeps(
 
 def _numbered_request_menu(employee_name: str) -> str:
     name = _chat_name(employee_name)
-    lines = [
-        f"Welcome {name} 👋\n\n",
-        "Select an option (reply with the number):\n",
-        "1. OD - Form\n",
-        "2. Visitor - Form\n",
-        "3. Leave - Form\n",
-        "4. IT - Form\n",
-    ]
-    if SHOW_PERMISSION_FORM_IN_MENU:
-        lines.append("5. Permission - Form")
-    return "".join(lines)
+    return (
+        f"Welcome {name} 👋\n\n"
+        "Select an option (reply with the number):\n"
+        "1. OD - Form\n"
+        "2. Visitor - Form\n"
+        "3. Leave - Form\n"
+        "4. Permission - Form\n"
+        "5. IT - Form"
+    )
 
 
 def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
@@ -562,15 +557,13 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
 def _send_main_menu(wa_id: str, employee_name: str) -> None:
     name = _chat_name(employee_name)
     welcome = f"Welcome {name} 👋\n\nPlease choose an option:"
-    menu_items = [
+    rows = _list_rows(
         ("od_form", "OD - Form"),
         ("visitor_form", "Visitor - Form"),
         ("leave_form", "Leave - Form"),
+        ("permission_form", "Permission - Form"),
         ("it_form", "IT - Form"),
-    ]
-    if SHOW_PERMISSION_FORM_IN_MENU:
-        menu_items.append(("permission_form", "Permission - Form"))
-    rows = _list_rows(*menu_items)
+    )
     try:
         send_list_menu(
             wa_id_to_phone(wa_id),
@@ -584,12 +577,10 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
             _send_to(wa_id, _numbered_request_menu(employee_name))
         except Exception:
             logger.exception("numbered menu text failed to=%s", wa_id)
-            menu_hint = (
-                "Reply 1–4: OD / Visitor / Leave / Permission Form."
-                if SHOW_PERMISSION_FORM_IN_MENU
-                else "Reply 1–3: OD / Visitor / Leave Form."
+            _send_to(
+                wa_id,
+                f"{welcome}\n\nReply 1–5: OD / Visitor / Leave / Permission / IT Form.",
             )
-            _send_to(wa_id, f"{welcome}\n\n{menu_hint}")
 
 
 def _normalize_choice(raw: str) -> str:
@@ -665,8 +656,32 @@ def _flow_response_from_interactive(reply) -> dict | str | None:
     )
 
 
+def _looks_like_flow_payload(payload) -> bool:
+    if not isinstance(payload, dict):
+        return bool(payload)
+    keys = {str(k).lower() for k in payload.keys()}
+    return bool(
+        keys
+        & {
+            "od_reason",
+            "company_vehicle",
+            "vehicle",
+            "coming_on",
+            "coming_from",
+            "purpose",
+            "visitor_name",
+            "leave_when",
+            "leave_reason",
+            "permission_for",
+            "permission_type",
+            "it_category",
+            "issue_type",
+            "issue_photo",
+        }
+    )
+
+
 def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
-    """Walk Interakt webhook JSON for flow submit payload (shape varies by event)."""
     if depth > 12:
         return None
     if isinstance(obj, dict):
@@ -701,31 +716,6 @@ def _deep_find_flow_response(obj, depth: int = 0) -> dict | str | None:
             if found:
                 return found
     return None
-
-
-def _looks_like_flow_payload(payload) -> bool:
-    if not isinstance(payload, dict):
-        return bool(payload)
-    keys = {str(k).lower() for k in payload.keys()}
-    return bool(
-        keys
-        & {
-            "od_reason",
-            "company_vehicle",
-            "vehicle",
-            "coming_on",
-            "coming_from",
-            "purpose",
-            "visitor_name",
-            "leave_when",
-            "leave_reason",
-            "permission_for",
-            "permission_type",
-            "it_category",
-            "issue_type",
-            "issue_photo",
-        }
-    )
 
 
 def _flow_callback_kind(body: dict) -> str:
@@ -1010,16 +1000,16 @@ def _process(sender: str, incoming: str) -> None:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("4", "IT_FORM"):
+    if incoming in ("4", "PERMISSION_FORM", "9"):
         if state == SESSION_MENU_IDLE:
-            it_request.try_start_form(sender, IT_DEPS)
+            permission_request.try_start_form(sender, PERMISSION_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return
 
-    if incoming in ("5", "PERMISSION_FORM", "9"):
+    if incoming in ("5", "IT_FORM"):
         if state == SESSION_MENU_IDLE:
-            permission_request.try_start_form(sender, PERMISSION_DEPS)
+            it_request.try_start_form(sender, IT_DEPS)
         else:
             _send_to(sender, "Send Hi to start.")
         return

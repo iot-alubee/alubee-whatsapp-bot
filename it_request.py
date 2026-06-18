@@ -236,11 +236,9 @@ def _resolve_priority(raw: str) -> tuple[str, str]:
 
 
 def _issue_photo_from_flow_data(data: dict) -> object | None:
-    for key in ("issue_photo", "photo", "issue_photos"):
-        val = data.get(key)
-        if val:
-            return val
-    return None
+    from it_flow_media import deep_find_issue_photo
+
+    return deep_find_issue_photo(data)
 
 
 def _flow_data_dict(response_json: dict | str | None) -> dict:
@@ -559,13 +557,31 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
 
     flow_data = _flow_data_dict(response_json)
     photo_raw = _issue_photo_from_flow_data(flow_data)
-    if photo_raw:
-        from it_flow_media import process_it_issue_photo
+    from it_flow_media import photo_debug_summary, process_it_issue_photo
 
-        photo_fields = process_it_issue_photo(photo_raw, request_id)
+    logger.info(
+        "IT flow submit request_id=%s flow_keys=%s photo=%s",
+        request_id,
+        sorted(flow_data.keys()) if flow_data else [],
+        photo_debug_summary(photo_raw),
+    )
+    if photo_raw:
+        photo_fields, status_msg = process_it_issue_photo(photo_raw, request_id)
+        merge = {"issue_photo_debug": status_msg}
         if photo_fields:
-            ref.set(photo_fields, merge=True)
+            merge.update(photo_fields)
             payload.update(photo_fields)
+        else:
+            merge["issue_photo_status"] = "failed"
+        ref.set(merge, merge=True)
+    else:
+        ref.set(
+            {
+                "issue_photo_status": "missing",
+                "issue_photo_debug": "no_photo_in_payload",
+            },
+            merge=True,
+        )
 
     pick = _pick_available_engineer(deps.db, deps.same_whatsapp)
     if pick:

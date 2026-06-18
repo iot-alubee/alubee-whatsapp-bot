@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -31,28 +32,97 @@ def _b64decode(value: str) -> bytes:
     return base64.b64decode(raw + pad)
 
 
+def _entry_meta(entry: dict) -> dict:
+    nested = entry.get("encryption_metadata")
+    if isinstance(nested, dict) and nested:
+        return nested
+    keys = (
+        "encryption_key",
+        "hmac_key",
+        "iv",
+        "encrypted_hash",
+        "plaintext_hash",
+        "hmac",
+    )
+    flat = {k: entry.get(k) for k in keys if entry.get(k) is not None}
+    return flat
+
+
+def _looks_like_photo_entry(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("cdn_url"):
+        return bool(_entry_meta(item))
+    if item.get("media_id") and _entry_meta(item):
+        return True
+    return False
+
+
 def _photo_entries(raw: Any) -> list[dict]:
     if raw is None:
         return []
     if isinstance(raw, dict):
-        return [raw] if raw.get("cdn_url") or raw.get("encryption_metadata") else []
+        return [raw] if _looks_like_photo_entry(raw) else []
     if isinstance(raw, list):
-        out = []
-        for item in raw:
-            if isinstance(item, dict) and (item.get("cdn_url") or item.get("encryption_metadata")):
-                out.append(item)
-        return out
+        return [item for item in raw if isinstance(item, dict) and _looks_like_photo_entry(item)]
     if isinstance(raw, str):
         s = raw.strip()
-        if s.startswith("["):
+        if not s:
+            return []
+        if s.startswith(("[", "{")):
             try:
-                import json
-
                 parsed = json.loads(s)
                 return _photo_entries(parsed)
             except json.JSONDecodeError:
                 return []
     return []
+
+
+def deep_find_issue_photo(obj: Any, depth: int = 0) -> Any | None:
+    """Search nested flow/webhook JSON for PhotoPicker payload."""
+    if depth > 10 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key in ("issue_photo", "photo", "issue_photos", "photo_picker"):
+            val = obj.get(key)
+            if val:
+                return val
+        if _looks_like_photo_entry(obj):
+            return obj
+        for value in obj.values():
+            found = deep_find_issue_photo(value, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = deep_find_issue_photo(item, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith(("[", "{")):
+            try:
+                return deep_find_issue_photo(json.loads(s), depth + 1)
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def photo_debug_summary(raw_photo: Any) -> str:
+    if raw_photo is None:
+        return "no_photo_in_payload"
+    entries = _photo_entries(raw_photo)
+    if not entries:
+        kind = type(raw_photo).__name__
+        if isinstance(raw_photo, str):
+            return f"unparsed_photo_string len={len(raw_photo.strip())}"
+        if isinstance(raw_photo, dict):
+            return f"photo_dict_keys={','.join(sorted(raw_photo.keys()))}"
+        return f"photo_present_type={kind}_no_entries"
+    entry = entries[0]
+    has_cdn = bool((entry.get("cdn_url") or "").strip())
+    has_meta = bool(_entry_meta(entry))
+    return f"entries=1 cdn_url={has_cdn} meta={has_meta}"
 
 
 def decrypt_flow_media_file(cdn_bytes: bytes, meta: dict) -> bytes:
@@ -128,21 +198,22 @@ def _upload_to_firebase_storage(
     return url, blob_path
 
 
-def process_it_issue_photo(raw_photo: Any, request_id: str) -> dict[str, str] | None:
+def process_it_issue_photo(raw_photo: Any, request_id: str) -> tuple[dict[str, str] | None, str]:
     """
     Download + decrypt one optional Flow photo and persist to Firebase Storage.
-    Returns Firestore fields or None when no photo / processing failed.
+    Returns (Firestore fields or None, status message for debugging).
     """
     entries = _photo_entries(raw_photo)
     if not entries:
-        return None
+        return None, photo_debug_summary(raw_photo)
 
     entry = entries[0]
     cdn_url = (entry.get("cdn_url") or "").strip()
-    meta = entry.get("encryption_metadata") or {}
-    if not cdn_url or not isinstance(meta, dict):
-        logger.warning("IT photo missing cdn_url or encryption_metadata request_id=%s", request_id)
-        return None
+    meta = _entry_meta(entry)
+    if not cdn_url:
+        return None, "photo_missing_cdn_url"
+    if not meta:
+        return None, "photo_missing_encryption_metadata"
 
     file_name = _safe_filename(str(entry.get("file_name") or "issue.jpg"))
     try:
@@ -153,11 +224,18 @@ def process_it_issue_photo(raw_photo: Any, request_id: str) -> dict[str, str] | 
         url, path = _upload_to_firebase_storage(
             request_id, file_name, plaintext, content_type
         )
+        logger.info(
+            "IT issue photo uploaded request_id=%s path=%s bytes=%s",
+            request_id,
+            path,
+            len(plaintext),
+        )
         return {
             "issue_photo_url": url,
             "issue_photo_path": path,
             "issue_photo_file_name": file_name,
-        }
-    except Exception:
+            "issue_photo_status": "uploaded",
+        }, "uploaded"
+    except Exception as exc:
         logger.exception("IT issue photo processing failed request_id=%s", request_id)
-        return None
+        return None, f"upload_failed:{type(exc).__name__}:{exc}"
