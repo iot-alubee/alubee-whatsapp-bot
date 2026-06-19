@@ -33,6 +33,8 @@ VISITING_TO_LABELS = {
     VISITING_BOTH: "Both",
 }
 
+LEAVE_MANAGE_STATE = "WAITING_LEAVE_MANAGE_DAYS"
+
 _VISITING_TO_ALIASES = {
     "unit_i": VISITING_UNIT_I,
     "unit_ii": VISITING_UNIT_II,
@@ -446,7 +448,7 @@ def _approval_message_body(
         rd = request_rd or {}
         from_d = (rd.get("leave_from_date") or "").strip()
         to_d = (rd.get("leave_to_date") or from_d).strip()
-        from leave_request import format_leave_days_display
+        from leave_request import format_leave_days_display, leave_manage_eligible
 
         days_display = format_leave_days_display(
             rd.get("leave_days"),
@@ -475,16 +477,32 @@ def _approval_message_body(
                 leaves_last = rd.get("leaves_last_month", 0)
                 leaves_curr = rd.get("leaves_current_month", 0)
         test_tag = "[TEST] " if rd.get("leave_test_approver") else ""
+        manage_hint = (
+            "\nUse Manage to reduce days before approving."
+            if leave_manage_eligible(rd)
+            else ""
+        )
+        original = rd.get("leave_days_original")
+        reduced_note = ""
+        if original is not None:
+            try:
+                if float(original) != float(rd.get("leave_days") or 0):
+                    reduced_note = (
+                        f" (reduced from "
+                        f"{format_leave_days_display(original, '')})"
+                    )
+            except (TypeError, ValueError):
+                pass
         return (
             f"{test_tag}Leave approval request\n\n"
             f"Employee: {emp}\n"
             f"Department: {dept}\n"
-            f"No of Days Leave: {days_display}\n"
+            f"No of Days Leave: {days_display}{reduced_note}\n"
             f"{date_lines}"
             f"Reason: {reason or '—'}\n"
             f"Leaves in Current Month: {leaves_curr}\n"
             f"Leaves in Last Month: {leaves_last}\n\n"
-            "Please approve or deny."
+            f"Please approve, deny, or manage.{manage_hint}"
         )
     if req_type == "PERMISSION":
         rd = request_rd or {}
@@ -555,6 +573,23 @@ def _approval_message_body(
     )
 
 
+def _approval_action_buttons(
+    request_id: str,
+    request_rd: dict | None,
+) -> list[tuple[str, str]]:
+    rid = (request_id or "").strip()
+    approve_id = f"APPROVE_{rid}"[:256]
+    deny_id = f"DENY_{rid}"[:256]
+    buttons = [(approve_id, "Approve"), (deny_id, "Deny")]
+    rd = request_rd or {}
+    if (rd.get("type") or "").strip().upper() == "LEAVE":
+        from leave_request import leave_manage_eligible
+
+        if leave_manage_eligible(rd):
+            buttons.append((f"MANAGE_{rid}"[:256], "Manage"))
+    return buttons
+
+
 def send_approval_buttons(
     wa_id: str,
     *,
@@ -575,19 +610,18 @@ def send_approval_buttons(
         return False
 
     rid = (request_id or "").strip()
-    approve_id = f"APPROVE_{rid}"[:256]
-    deny_id = f"DENY_{rid}"[:256]
     body = _approval_message_body(
         employee_name=employee_name,
         department=department,
         reason=reason,
         request_rd=request_rd,
     )
+    buttons = _approval_action_buttons(rid, request_rd)
     try:
         send_reply_buttons(
             wa_id_to_phone(wa_id),
             body,
-            [(approve_id, "Approve"), (deny_id, "Deny")],
+            buttons,
             callback_data=request_id,
             ensure_contact=True,
             contact_name=d.chat_name(employee_name),
@@ -600,7 +634,7 @@ def send_approval_buttons(
             send_reply_buttons(
                 wa_id_to_phone(wa_id),
                 body,
-                [(approve_id, "Approve"), (deny_id, "Deny")],
+                buttons,
                 callback_data=request_id,
             )
             return True
@@ -637,6 +671,156 @@ def resolve_approval(incoming: str, approver: str):
                 if rid:
                     return upper == "APPROVE", rid
     return None, None
+
+
+def resolve_leave_manage_request_id(incoming: str) -> str | None:
+    raw = (incoming or "").strip()
+    if raw.upper().startswith("MANAGE_"):
+        rid = raw.split("_", 1)[1].strip()
+        return rid or None
+    return None
+
+
+def is_leave_manage_state(state: str | None) -> bool:
+    return (state or "") == LEAVE_MANAGE_STATE
+
+
+def _resend_leave_approval_buttons(sender: str, rd: dict, request_id: str) -> None:
+    notify_approver(sender, rd, request_id)
+
+
+def handle_leave_manage_gate(sender: str, incoming: str) -> bool:
+    """Start reduce-leave flow when approver taps Manage."""
+    request_id = resolve_leave_manage_request_id(incoming)
+    if not request_id:
+        return False
+
+    d = _require()
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.send_to(sender, "This leave request is invalid or already handled.")
+        return True
+
+    rd = snap.to_dict() or {}
+    if (rd.get("type") or "").strip().upper() != "LEAVE":
+        return False
+
+    from leave_request import current_leave_days_num, leave_manage_eligible
+
+    role = _approval_role(sender, rd)
+    if not role or role not in ("jmd", "md"):
+        d.send_to(sender, "You cannot manage this leave request now.")
+        return True
+
+    if not leave_manage_eligible(rd):
+        d.send_to(sender, "This leave request cannot be reduced (single-day leave).")
+        return True
+
+    current = current_leave_days_num(rd)
+    max_reduce = int(current) - 1
+    d.session_merge(
+        sender,
+        state=LEAVE_MANAGE_STATE,
+        approval_request_id=request_id,
+        leave_manage_role=role,
+    )
+    from_d = (rd.get("leave_from_date") or "").strip()
+    to_d = (rd.get("leave_to_date") or from_d).strip()
+    d.send_to(
+        sender,
+        "Leave manage\n\n"
+        f"Requested: {int(current)} day(s)\n"
+        f"From: {from_d or '—'}\n"
+        f"To: {to_d or '—'}\n\n"
+        f"Reply with reduced days (1 to {max_reduce}), or CANCEL to go back.",
+    )
+    return True
+
+
+def handle_leave_manage_input(sender: str, incoming: str, session: dict) -> None:
+    d = _require()
+    request_id = (session.get("approval_request_id") or "").strip()
+    if not request_id:
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "Session expired. Send Hi to start again.")
+        return
+
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "This leave request is no longer available.")
+        return
+
+    rd = snap.to_dict() or {}
+    role = _approval_role(sender, rd)
+    if not role or role != (session.get("leave_manage_role") or role):
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "You cannot manage this leave request now.")
+        return
+
+    from leave_request import (
+        apply_leave_reduction,
+        current_leave_days_num,
+        format_leave_days_display,
+        leave_manage_eligible,
+        parse_reduced_leave_days,
+    )
+
+    if not leave_manage_eligible(rd):
+        d.session_merge(
+            sender,
+            state="WAITING_APPROVAL_ACTION",
+            approval_request_id=request_id,
+        )
+        d.send_to(sender, "Leave is now single-day. Use Approve or Deny on the buttons.")
+        _resend_leave_approval_buttons(sender, rd, request_id)
+        return
+
+    current = current_leave_days_num(rd)
+    new_days, err = parse_reduced_leave_days(incoming, current_days=current)
+    if err == "cancel":
+        d.session_merge(
+            sender,
+            state="WAITING_APPROVAL_ACTION",
+            approval_request_id=request_id,
+        )
+        d.send_to(sender, "Leave manage cancelled.")
+        _resend_leave_approval_buttons(sender, rd, request_id)
+        return
+    if err or new_days is None:
+        d.send_to(sender, err or "Invalid input. Try again or reply CANCEL.")
+        return
+
+    from_d = (rd.get("leave_from_date") or "").strip()
+    patch = apply_leave_reduction(from_d, new_days)
+    if rd.get("leave_days_original") is None:
+        patch["leave_days_original"] = current
+    patch["leave_managed_by"] = sender
+    patch["leave_managed_at"] = d.utcnow()
+    ref.update(patch)
+
+    fresh = ref.get().to_dict() or {}
+    days_disp = format_leave_days_display(fresh.get("leave_days"), "")
+    d.session_merge(
+        sender,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=request_id,
+    )
+    d.send_to(
+        sender,
+        f"Leave reduced to {days_disp} day(s) "
+        f"({fresh.get('leave_from_date') or '—'} to {fresh.get('leave_to_date') or '—'}).\n"
+        "Use Approve or Deny below.",
+    )
+    _resend_leave_approval_buttons(sender, fresh, request_id)
+    logger.info(
+        "leave managed request_id=%s by=%s new_days=%s",
+        request_id,
+        sender,
+        new_days,
+    )
 
 
 def _approval_role(sender: str, rd: dict) -> str | None:
@@ -772,7 +956,7 @@ def _after_jmd_when_md_offline(
         if _visitor_jmd_fully_approved(rd_fresh):
             d.on_visitor_md_approved(ref, rd_fresh)
     else:
-        d.send_to(employee, _employee_final_approval_message(req_label))
+        d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
     logger.info(
         "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
         request_id,
@@ -847,8 +1031,12 @@ def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
         _set_pending_approval(wa_id, request_id)
 
 
-def _employee_final_approval_message(req_label: str) -> str:
+def _employee_final_approval_message(req_label: str, rd: dict | None = None) -> str:
     if req_label == "leave":
+        if rd:
+            from leave_request import employee_leave_approved_message
+
+            return employee_leave_approved_message(rd)
         return "Your leave request has been approved."
     if req_label == "permission":
         return "Your permission request has been approved."
@@ -980,7 +1168,7 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
                     "md_status": "N/A",
                     "approved_datetime": d.utcnow(),
                 })
-                d.send_to(employee, _employee_final_approval_message(label))
+                d.send_to(employee, _employee_final_approval_message(label, rd))
                 logger.info("jmd approved %s (final) request_id=%s", label, request_id)
             else:
                 ref.update({
@@ -1053,12 +1241,12 @@ def handle_approval_gate(sender: str, incoming: str) -> bool:
             ):
                 patch["jmd_status"] = "APPROVED"
             ref.update(patch)
+            fresh = ref.get()
+            rd_fresh = fresh.to_dict() if fresh.exists else rd
             if (rd.get("type") or "").strip().upper() == "VISITOR":
-                fresh = ref.get()
-                rd_fresh = fresh.to_dict() if fresh.exists else rd
                 d.on_visitor_md_approved(ref, rd_fresh)
             else:
-                d.send_to(employee, _employee_final_approval_message(req_label))
+                d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
             logger.info("md approved (final) request_id=%s", request_id)
         else:
             ref.update({

@@ -946,12 +946,19 @@ def _process(sender: str, incoming: str) -> None:
     if _try_handle_approver_availability(sender, incoming):
         return
 
+    if approval.handle_leave_manage_gate(sender, incoming):
+        return
+
     if approval.handle_approval_gate(sender, incoming):
         return
 
     session_doc = _session_ref(sender).get()
     session = session_doc.to_dict() if session_doc.exists else None
     state = (session or {}).get("state")
+
+    if approval.is_leave_manage_state(state):
+        approval.handle_leave_manage_input(sender, incoming, session or {})
+        return
 
     if state == SESSION_AWAITING_HI:
         _send_to(sender, "Send Hi to start.")

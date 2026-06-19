@@ -328,6 +328,79 @@ def format_leave_days_display(days, leave_duration: str = "") -> str:
     return str(value)
 
 
+def current_leave_days_num(rd: dict) -> float:
+    try:
+        days = float(rd.get("leave_days") or 1)
+    except (TypeError, ValueError):
+        days = 1.0
+    from_d = (rd.get("leave_from_date") or "").strip()
+    to_d = (rd.get("leave_to_date") or from_d).strip()
+    if days <= 1 and from_d and to_d and from_d != to_d:
+        return _leave_days(from_d, to_d, leave_duration=rd.get("leave_duration") or "")
+    return days
+
+
+def leave_manage_eligible(rd: dict) -> bool:
+    """True when JMD/MD may reduce a multi-day leave before approval."""
+    if (rd.get("type") or "").strip().upper() != "LEAVE":
+        return False
+    if _normalize_leave_duration(rd.get("leave_duration") or "") == "half_day":
+        return False
+    return current_leave_days_num(rd) > 1
+
+
+def parse_reduced_leave_days(raw: str, *, current_days: float) -> tuple[int | None, str]:
+    text = (raw or "").strip().lower()
+    if text in ("cancel", "back", "exit"):
+        return None, "cancel"
+    if not text.isdigit():
+        max_days = int(current_days) - 1
+        return None, (
+            f"Reply with a number from 1 to {max_days} to reduce leave days, "
+            "or CANCEL to go back."
+        )
+    value = int(text)
+    max_days = int(current_days) - 1
+    if value < 1 or value > max_days:
+        return None, f"Enter a number from 1 to {max_days}, or CANCEL to go back."
+    return value, ""
+
+
+def apply_leave_reduction(from_s: str, new_days: int) -> dict:
+    n = max(1, int(new_days))
+    start = _parse_ddmmy(from_s)
+    if not start:
+        to_s = from_s
+    else:
+        to_s = _format_ddmmy(start + timedelta(days=n - 1))
+    dates = expand_leave_date_range(from_s, to_s)
+    return {
+        "leave_days": float(n),
+        "leave_to_date": to_s,
+        "leave_dates": dates,
+        "leave_duration": "full_day",
+    }
+
+
+def employee_leave_approved_message(rd: dict) -> str:
+    days = format_leave_days_display(
+        rd.get("leave_days"),
+        rd.get("leave_duration") or "",
+    )
+    original = rd.get("leave_days_original")
+    if original is not None:
+        try:
+            if float(original) != float(rd.get("leave_days") or 0):
+                orig_disp = format_leave_days_display(original, "")
+                return (
+                    f"Your leave request has been approved for {days} day(s) "
+                    f"(reduced from {orig_disp})."
+                )
+        except (TypeError, ValueError):
+            pass
+    return f"Your leave request has been approved for {days} day(s)."
+
+
 def _overlap_cancel_body(overlap_status: str) -> str:
     if overlap_status == "approved":
         status_line = (
