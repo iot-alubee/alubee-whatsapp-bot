@@ -82,6 +82,42 @@ PRIORITY_LABELS = {
     "low": "Low",
 }
 
+MACHINE_LABELS: dict[str, str] = {
+    "125t_1": "125T-1",
+    "125t_2": "125T-2",
+    "125t_3": "125T-3",
+    "125t_4": "125T-4",
+    "125t_5": "125T-5",
+    "125t_6": "125T-6",
+    "125t_7": "125T-7",
+    "250t_1": "250T-1",
+    "350t_1": "350T-1",
+    "350t_2": "350T-2",
+    "350t_3": "350T-3",
+    "350t_4": "350T-4",
+    **{f"cnc_{i}": f"CNC-{i}" for i in range(1, 10)},
+    **{f"vmc_{i}": f"VMC-{i}" for i in range(1, 9)},
+    **{f"fet_{i}": f"FET-{i}" for i in range(1, 16)},
+    "fet_17": "FET-17",
+    "fet_18": "FET-18",
+    "fet_19": "FET-19",
+}
+
+IOT_MACHINE_IDS_BY_DEPT: dict[str, frozenset[str]] = {
+    "PDC": frozenset({
+        "125t_1", "125t_2", "125t_3", "125t_4", "125t_5", "125t_6", "125t_7",
+        "250t_1", "350t_1", "350t_2", "350t_3", "350t_4",
+    }),
+    "CNC": frozenset({
+        *[f"cnc_{i}" for i in range(1, 10)],
+        *[f"vmc_{i}" for i in range(1, 9)],
+    }),
+    "FETTLING": frozenset({
+        *[f"fet_{i}" for i in range(1, 16)],
+        "fet_17", "fet_18", "fet_19",
+    }),
+}
+
 ISSUES_BY_CATEGORY: dict[str, frozenset[str]] = {
     "printer": frozenset({
         "printer_connection_error", "not_printing", "printer_not_listed",
@@ -241,6 +277,27 @@ def _resolve_priority(raw: str) -> tuple[str, str]:
     return key, label
 
 
+def _needs_iot_machine_no(ud: dict | None) -> bool:
+    if not ud:
+        return False
+    dept = (ud.get("department") or "").strip().upper()
+    route = (ud.get("jmd_route") or "").strip().upper()
+    return route == "JMD1" and dept in IOT_MACHINE_IDS_BY_DEPT
+
+
+def _iot_machine_ids_for_user(ud: dict | None) -> frozenset[str]:
+    if not ud:
+        return frozenset()
+    dept = (ud.get("department") or "").strip().upper()
+    return IOT_MACHINE_IDS_BY_DEPT.get(dept, frozenset())
+
+
+def _resolve_machine(raw: str) -> tuple[str, str]:
+    key = (raw or "").strip().lower()
+    label = MACHINE_LABELS.get(key, "")
+    return key, label
+
+
 def _issue_photo_from_flow_data(data: dict) -> object | None:
     from it_flow_media import deep_find_issue_photo
 
@@ -278,10 +335,12 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     issue_raw = _flow_pick(data, "issue_type", "issue")
     priority_raw = _flow_pick(data, "priority")
     description = _flow_pick(data, "description", "issue_description")
+    machine_raw = _flow_pick(data, "machine_no")
 
     category, category_label = _resolve_category(category_raw)
     issue, issue_label = _resolve_issue(issue_raw)
     priority, priority_label = _resolve_priority(priority_raw)
+    machine_no, machine_no_label = _resolve_machine(machine_raw)
 
     if not category or not category_label:
         return None
@@ -290,7 +349,7 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     if not priority or not priority_label:
         return None
 
-    return {
+    out = {
         "it_category": category,
         "it_category_label": category_label,
         "issue_type": issue,
@@ -299,16 +358,25 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         "priority": priority,
         "priority_label": priority_label,
     }
+    if machine_no:
+        out["machine_no"] = machine_no
+        out["machine_no_label"] = machine_no_label
+    return out
 
 
 def _engineer_assignment_message(rd: dict) -> str:
     desc = (rd.get("description") or "").strip()
     desc_line = f"Description: {desc}" if desc else "Description: —"
+    machine_line = ""
+    machine_label = (rd.get("machine_no_label") or "").strip()
+    if machine_label:
+        machine_line = f"Machine: {machine_label}\n"
     return (
         "You have been assigned the below ticket\n\n"
         f"Name: {rd.get('employee_name') or 'Employee'}\n"
         f"Department: {rd.get('department') or '—'}\n"
         f"Category: {rd.get('it_category_label') or '—'}\n"
+        f"{machine_line}"
         f"Issue: {rd.get('issue_type_label') or '—'}\n"
         f"{desc_line}\n"
         f"Priority: {rd.get('priority_label') or '—'}\n"
@@ -560,9 +628,24 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
+    flow_data = _flow_data_dict(response_json)
+    if (
+        parsed.get("it_category") == "iot"
+        and _needs_iot_machine_no(ud)
+        and parsed.get("machine_no") not in _iot_machine_ids_for_user(ud)
+    ):
+        deps.send_to(
+            sender,
+            "Please select a machine number for your IoT request and submit again.",
+        )
+        return
+
     ref = deps.db.collection("requests").document()
     request_id = ref.id
     now = deps.utcnow()
+    reason = f"{parsed['it_category_label']} — {parsed['issue_type_label']}"
+    if parsed.get("machine_no_label"):
+        reason = f"{parsed['it_category_label']} — {parsed['machine_no_label']} — {parsed['issue_type_label']}"
     payload = {
         "request_id": request_id,
         "requested_datetime": now,
@@ -571,11 +654,13 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
         "employee_name": ud.get("name") or "Employee",
         "department": ud.get("department") or "",
         "type": "IT",
-        "reason": f"{parsed['it_category_label']} — {parsed['issue_type_label']}",
+        "reason": reason,
         "it_category": parsed["it_category"],
         "it_category_label": parsed["it_category_label"],
         "issue_type": parsed["issue_type"],
         "issue_type_label": parsed["issue_type_label"],
+        "machine_no": parsed.get("machine_no") or "",
+        "machine_no_label": parsed.get("machine_no_label") or "",
         "description": parsed.get("description") or "",
         "priority": parsed["priority"],
         "priority_label": parsed["priority_label"],
@@ -594,7 +679,6 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
     }
     ref.set(payload)
 
-    flow_data = _flow_data_dict(response_json)
     photo_raw = _issue_photo_from_flow_data(flow_data)
     from it_flow_media import photo_debug_summary, process_it_issue_photo
 
