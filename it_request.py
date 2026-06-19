@@ -541,9 +541,18 @@ def try_start_form(sender: str, deps: ItDeps) -> None:
 
     exists, ud = get_user_record(sender)
     name = "Employee"
+    department = ""
+    jmd_route = ""
     if exists and ud:
         name = ud.get("name") or name
-    if send_it_flow_form(wa_id_to_phone(sender), employee_name=name):
+        department = (ud.get("department") or "").strip()
+        jmd_route = (ud.get("jmd_route") or "").strip()
+    if send_it_flow_form(
+        wa_id_to_phone(sender),
+        employee_name=name,
+        department=department,
+        jmd_route=jmd_route,
+    ):
         return
     logger.warning("IT flow template send failed sender=%s", sender)
     deps.send_to(sender, "Could not open IT form. Please try again or contact admin.")

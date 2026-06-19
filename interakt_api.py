@@ -631,6 +631,8 @@ def send_it_flow_form(
     *,
     employee_name: str = "",
     body_values: list[str] | None = None,
+    department: str = "",
+    jmd_route: str = "",
 ) -> bool:
     """Send IT WhatsApp Form template (env IT_FLOW_TEMPLATE_NAME)."""
     template_name = (os.getenv("IT_FLOW_TEMPLATE_NAME") or "").strip()
@@ -644,6 +646,14 @@ def send_it_flow_form(
         vals = {"name": (employee_name or "Employee")[:50]}
         body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
     phone_10 = phone_to_10(phone)
+    dept_key = (department or "").strip().upper()
+    if dept_key == "FET":
+        dept_key = "FETTLING"
+    route_key = (jmd_route or "").strip().lower()
+    if dept_key in ("PDC", "CNC", "FETTLING") and route_key in ("jmd1", "jmd2"):
+        flow_token = f"it_{phone_10}_{dept_key.lower()}_{route_key}"[:256]
+    else:
+        flow_token = f"it_{phone_10}"[:256]
     try:
         send_flow_template(
             phone,
@@ -651,7 +661,7 @@ def send_it_flow_form(
             language_code=lang,
             body_values=body_values,
             callback_data="it-flow",
-            flow_token=f"it_{phone_10}"[:256],
+            flow_token=flow_token,
             ensure_contact=True,
             contact_name=(employee_name or "Employee")[:50],
         )
