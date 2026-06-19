@@ -103,6 +103,8 @@ MACHINE_LABELS: dict[str, str] = {
     "fet_19": "FET-19",
 }
 
+IOT_MACHINE_DEPARTMENTS = frozenset({"PDC", "CNC", "FETTLING"})
+
 IOT_MACHINE_IDS_BY_DEPT: dict[str, frozenset[str]] = {
     "PDC": frozenset({
         "125t_1", "125t_2", "125t_3", "125t_4", "125t_5", "125t_6", "125t_7",
@@ -277,18 +279,30 @@ def _resolve_priority(raw: str) -> tuple[str, str]:
     return key, label
 
 
+def _normalize_iot_dept(dept: str) -> str:
+    d = (dept or "").strip().upper()
+    if d == "FET":
+        return "FETTLING"
+    if d in IOT_MACHINE_DEPARTMENTS:
+        return d
+    return ""
+
+
 def _needs_iot_machine_no(ud: dict | None) -> bool:
     if not ud:
         return False
-    dept = (ud.get("department") or "").strip().upper()
+    dept = _normalize_iot_dept(ud.get("department") or "")
     route = (ud.get("jmd_route") or "").strip().upper()
-    return route == "JMD1" and dept in IOT_MACHINE_IDS_BY_DEPT
+    return bool(dept) and route == "JMD1" and dept in IOT_MACHINE_IDS_BY_DEPT
 
 
 def _iot_machine_ids_for_user(ud: dict | None) -> frozenset[str]:
     if not ud:
         return frozenset()
-    dept = (ud.get("department") or "").strip().upper()
+    dept = _normalize_iot_dept(ud.get("department") or "")
+    route = (ud.get("jmd_route") or "").strip().upper()
+    if not dept or route != "JMD1":
+        return frozenset()
     return IOT_MACHINE_IDS_BY_DEPT.get(dept, frozenset())
 
 
