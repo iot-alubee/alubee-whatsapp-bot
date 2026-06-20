@@ -1234,6 +1234,7 @@ def handle_vehicle_assign_pick(
 
 
 def _fetch_today_vehicle_requests(db: object) -> list[tuple[str, dict]]:
+    """Today's vehicle requests with status Assigned (Manage list)."""
     today = _ist_now().date()
     rows: list[tuple[str, dict]] = []
     try:
@@ -1243,8 +1244,7 @@ def _fetch_today_vehicle_requests(db: object) -> list[tuple[str, dict]]:
         return rows
     for snap in snaps:
         rd = snap.to_dict() or {}
-        status = _request_status(rd)
-        if status in ("CANCELLED", "COMPLETED"):
+        if _request_status(rd) != "ASSIGNED":
             continue
         if not _request_on_ist_day(rd, today):
             continue
@@ -1262,13 +1262,13 @@ def try_start_manage(sender: str, deps: VehicleRequestDeps) -> None:
         return
     rows = _fetch_today_vehicle_requests(deps.db)
     if not rows:
-        deps.send_to(sender, "No vehicle requests for today.")
+        deps.send_to(sender, "No assigned vehicle requests for today.")
         return
     list_rows = [_manage_list_row_fields(rid, rd) for rid, rd in rows[:10]]
     try:
         send_list_menu(
             wa_id_to_phone(sender),
-            "Today's vehicle requests:",
+            "Assigned requests for today:",
             list_rows,
             button_label="Manage",
             section_title="Today",
@@ -1277,7 +1277,7 @@ def try_start_manage(sender: str, deps: VehicleRequestDeps) -> None:
     except Exception:
         logger.exception("vehicle manage list failed sender=%s", sender)
         lines = "\n".join(f"• {_manage_row_title(rd)}" for _rid, rd in rows[:10])
-        deps.send_to(sender, f"Today's vehicle requests:\n{lines}")
+        deps.send_to(sender, f"Assigned requests for today:\n{lines}")
 
 
 def _parse_manage_pick(incoming: str) -> str | None:
