@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -231,15 +232,62 @@ def _trip_started(rd: dict) -> bool:
     return _request_status(rd) == "STARTED"
 
 
-def _manage_row_title(rd: dict) -> str:
-    requester = (rd.get("employee_name") or "—").strip()
+_ROMAN_NUMERAL_CHARS = frozenset("IVXLCDM")
+
+
+def _sentence_case_word(word: str) -> str:
+    if not word:
+        return word
+    up = word.upper()
+    if len(up) <= 8 and all(c in _ROMAN_NUMERAL_CHARS for c in up):
+        return up
+    return word[:1].upper() + word[1:].lower()
+
+
+def _sentence_case_name(value: str) -> str:
+    s = (value or "").strip()
+    if not s or s == "—":
+        return s or "—"
+    normalized = re.sub(r"[_\s]+", " ", s)
+    parts = [p for p in normalized.split(" ") if p]
+    if not parts:
+        return "—"
+    return " ".join(_sentence_case_word(p) for p in parts)
+
+
+def _manage_row_line(rd: dict) -> str:
+    requester = _sentence_case_name(rd.get("employee_name") or "—")
     destination = (rd.get("destination_label") or "—").strip()
-    time_val = (rd.get("required_at") or "—").strip()
-    assignee = (rd.get("assigned_to") or "—").strip()
+    assignee = _sentence_case_name(rd.get("assigned_to") or "—")
     if _request_status(rd) == "PENDING":
         assignee = "—"
-    text = f"{requester}-{destination}-{time_val}-{assignee}"
-    return text[:72]
+    time_val = (rd.get("required_at") or "—").strip()
+    return f"{requester} - {destination} - {assignee} - {time_val}"
+
+
+def _manage_row_title(rd: dict) -> str:
+    return _manage_row_line(rd)[:72]
+
+
+def _manage_list_row_fields(request_id: str, rd: dict) -> dict[str, str]:
+    """WhatsApp list row: title + optional continuation (no duplicated text)."""
+    parts = _manage_row_line(rd).split(" - ")
+    title_parts: list[str] = []
+    for part in parts:
+        candidate = " - ".join(title_parts + [part])
+        if len(candidate) <= 24:
+            title_parts.append(part)
+        else:
+            break
+    title = " - ".join(title_parts) if title_parts else _manage_row_line(rd)[:24]
+    remainder = parts[len(title_parts):]
+    row: dict[str, str] = {
+        "id": _manage_list_row_id(request_id),
+        "title": title[:24],
+    }
+    if remainder:
+        row["description"] = " - ".join(remainder)[:72]
+    return row
 
 
 def _manage_list_row_id(request_id: str) -> str:
@@ -374,8 +422,8 @@ def _assignee_notify_template_body_fields() -> list[str]:
 
 def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, str]:
     return {
-        "assignee_name": assignee_name or "—",
-        "requester": rd.get("employee_name") or "—",
+        "assignee_name": _sentence_case_name(assignee_name or "—"),
+        "requester": _sentence_case_name(rd.get("employee_name") or "—"),
         "from": rd.get("from_unit_label") or "—",
         "request_type": rd.get("request_type_label") or "—",
         "category": rd.get("destination_category_label") or "—",
@@ -433,7 +481,7 @@ def _notify_internal_assignee(
         return
 
     assignee_wa, assignee_name = found
-    display_name = assignee_label or assignee_name
+    display_name = _sentence_case_name(assignee_label or assignee_name)
     template_name = _assignee_notify_template_name()
     phone = wa_id_to_phone(assignee_wa)
     rid = (request_id or "").strip()
@@ -741,7 +789,7 @@ def _manager_approval_body(rd: dict) -> str:
         hire_line = f"Hire Vehicle Type: {rd['hire_vehicle_type_label']}\n"
     return (
         "Vehicle request\n\n"
-        f"Requester: {rd.get('employee_name') or '—'}\n"
+        f"Requester: {_sentence_case_name(rd.get('employee_name') or '—')}\n"
         f"Department: {rd.get('department') or '—'}\n"
         f"From: {rd.get('from_unit_label') or '—'}\n"
         f"Request Type: {rd.get('request_type_label') or '—'}\n"
@@ -758,7 +806,7 @@ def _manager_approval_body(rd: dict) -> str:
 def _approval_template_values(rd: dict) -> dict[str, str]:
     hire = rd.get("hire_vehicle_type_label") or "—"
     return {
-        "requester": rd.get("employee_name") or "—",
+        "requester": _sentence_case_name(rd.get("employee_name") or "—"),
         "department": rd.get("department") or "—",
         "from": rd.get("from_unit_label") or "—",
         "request_type": rd.get("request_type_label") or "—",
@@ -1064,7 +1112,7 @@ def _handle_assign_click(sender: str, request_id: str, deps: VehicleRequestDeps)
         (f"VASSIGN_{request_id}_{code}"[:256], label)
         for code, label in options
     ]
-    list_rows = [{"id": rid, "title": label[:24]} for rid, label in rows]
+    list_rows = [{"id": rid, "title": _sentence_case_name(label)[:24]} for rid, label in rows]
     deps.session_merge(
         sender,
         state=SESSION_WAITING_VEHICLE_ASSIGN,
@@ -1174,13 +1222,14 @@ def handle_vehicle_assign_pick(
         assignee_label=assignee_label,
         request_id=request_id,
     )
+    assignee_display = _sentence_case_name(assignee_label)
     employee = (rd.get("employee") or "").strip()
     if employee:
         deps.send_to(
             employee,
-            f"Your vehicle request has been assigned to {assignee_label}.",
+            f"Your vehicle request has been assigned to {assignee_display}.",
         )
-    deps.send_to(sender, f"Assigned to {assignee_label}.")
+    deps.send_to(sender, f"Assigned to {assignee_display}.")
     deps.clear_session(sender)
 
 
@@ -1215,15 +1264,7 @@ def try_start_manage(sender: str, deps: VehicleRequestDeps) -> None:
     if not rows:
         deps.send_to(sender, "No vehicle requests for today.")
         return
-    list_rows = []
-    for rid, rd in rows[:10]:
-        title = _manage_row_title(rd)[:24]
-        desc = _manage_row_title(rd)[:72]
-        list_rows.append({
-            "id": _manage_list_row_id(rid),
-            "title": title,
-            "description": desc,
-        })
+    list_rows = [_manage_list_row_fields(rid, rd) for rid, rd in rows[:10]]
     try:
         send_list_menu(
             wa_id_to_phone(sender),
@@ -1424,7 +1465,7 @@ def _handle_manage_reassign_click(
     list_rows = [
         {
             "id": f"VREASSIGN_{request_id}_{code}"[:256],
-            "title": label[:24],
+            "title": _sentence_case_name(label)[:24],
         }
         for code, label in options
     ]
@@ -1532,10 +1573,12 @@ def handle_vehicle_reassign_pick(
     })
     updated = ref.get().to_dict() or rd
 
+    assignee_display = _sentence_case_name(assignee_label)
+
     if old_wa:
         deps.send_to(
             old_wa,
-            f"The request has been re-assigned to {assignee_label}. Thanks.",
+            f"The request has been re-assigned to {assignee_display}. Thanks.",
         )
 
     _notify_internal_assignee(
@@ -1549,9 +1592,9 @@ def handle_vehicle_reassign_pick(
     if employee:
         deps.send_to(
             employee,
-            f"Your vehicle request has been re-assigned to {assignee_label}.",
+            f"Your vehicle request has been re-assigned to {assignee_display}.",
         )
-    deps.send_to(sender, f"Re-assigned to {assignee_label}.")
+    deps.send_to(sender, f"Re-assigned to {assignee_display}.")
     deps.clear_session(sender)
 
 
