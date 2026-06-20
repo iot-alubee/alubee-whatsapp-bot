@@ -7,6 +7,8 @@ Request flows live in separate modules:
   - leave_request.py
   - permission_request.py
   - it_request.py
+  - vehicle_request.py
+  - maintenance_request.py
   - approval.py (shared JMD → MD)
 """
 
@@ -32,6 +34,8 @@ import bot_shared
 from bot_shared import wa_from_env
 import it_request
 import leave_request
+import vehicle_request
+import maintenance_request
 import od_request
 import permission_request
 import visitor_request
@@ -166,6 +170,12 @@ _ROW_IDS = {
     "permission_-_form": "PERMISSION_FORM",
     "it_form": "IT_FORM",
     "it_-_form": "IT_FORM",
+    "vehicle_request_form": "VEHICLE_REQUEST_FORM",
+    "vehicle_-_request_form": "VEHICLE_REQUEST_FORM",
+    "vehicle_manage": "VEHICLE_MANAGE",
+    "vehicle_-_manage": "VEHICLE_MANAGE",
+    "maintenance_form": "MAINTENANCE_FORM",
+    "maintenance_-_form": "MAINTENANCE_FORM",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -406,7 +416,7 @@ def _go_main_menu_for_employee(sender: str) -> None:
     if exists and ud:
         name = ud.get("name", "Employee")
         _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
-        _send_main_menu(sender, name)
+        _send_main_menu(sender, name, ud)
     else:
         _session_ref(sender).delete()
         _send_to(sender, "User not registered.\nPlease contact admin.")
@@ -475,17 +485,61 @@ IT_DEPS = it_request.ItDeps(
     same_whatsapp=_same_whatsapp,
 )
 
+VEHICLE_REQUEST_DEPS = vehicle_request.VehicleRequestDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    clear_session=lambda sender: _session_ref(sender).delete(),
+    go_main_menu=_go_main_menu_for_employee,
+    same_whatsapp=_same_whatsapp,
+    has_active_whatsapp_session=_has_active_whatsapp_session,
+)
 
-def _numbered_request_menu(employee_name: str) -> str:
+MAINTENANCE_DEPS = maintenance_request.MaintenanceDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    clear_session=lambda sender: _session_ref(sender).delete(),
+    go_main_menu=_go_main_menu_for_employee,
+)
+
+
+def _request_menu_items(
+    user_data: dict | None, wa_id: str = ""
+) -> list[tuple[str, str, str]]:
+    """Number, list-row id, label for main / numbered menu."""
+    items: list[tuple[str, str, str]] = [
+        ("1", "od_form", "OD - Form"),
+        ("2", "visitor_form", "Visitor - Form"),
+        ("3", "leave_form", "Leave - Form"),
+        ("4", "it_form", "IT - Form"),
+    ]
+    if vehicle_request.show_vehicle_menu_for_user(
+        user_data, wa_id, _same_whatsapp
+    ):
+        if vehicle_request.is_logistics_manager(wa_id, _same_whatsapp):
+            items.append(("5", "vehicle_manage", "Vehicle - Manage"))
+        else:
+            items.append(("5", "vehicle_request_form", "Vehicle - Form"))
+    return items
+
+
+def _numbered_request_menu(
+    employee_name: str, user_data: dict | None = None, wa_id: str = ""
+) -> str:
     name = _chat_name(employee_name)
-    return (
-        f"Welcome {name} 👋\n\n"
-        "Select an option (reply with the number):\n"
-        "1. OD - Form\n"
-        "2. Visitor - Form\n"
-        "3. Leave - Form\n"
-        "4. IT - Form"
-    )
+    lines = [
+        f"Welcome {name} 👋",
+        "",
+        "Select an option (reply with the number):",
+    ]
+    for num, _row_id, label in _request_menu_items(user_data, wa_id):
+        lines.append(f"{num}. {label}")
+    return "\n".join(lines)
 
 
 def _list_rows(*items: tuple[str, str]) -> list[dict[str, str]]:
@@ -547,20 +601,22 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
     if exists and ud:
         name = ud.get("name", "Approver")
         _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
-        _send_main_menu(sender, name)
+        _send_main_menu(sender, name, ud)
     else:
         _session_merge(sender, state=SESSION_APPROVER_AVAILABILITY, approver_role=role)
     return True
 
 
-def _send_main_menu(wa_id: str, employee_name: str) -> None:
+def _send_main_menu(
+    wa_id: str, employee_name: str, user_data: dict | None = None
+) -> None:
     name = _chat_name(employee_name)
     welcome = f"Welcome {name} 👋\n\nPlease choose an option:"
     rows = _list_rows(
-        ("od_form", "OD - Form"),
-        ("visitor_form", "Visitor - Form"),
-        ("leave_form", "Leave - Form"),
-        ("it_form", "IT - Form"),
+        *(
+            (row_id, label)
+            for _num, row_id, label in _request_menu_items(user_data, wa_id)
+        )
     )
     try:
         send_list_menu(
@@ -572,13 +628,25 @@ def _send_main_menu(wa_id: str, employee_name: str) -> None:
     except Exception:
         logger.exception("main menu InteractiveList failed to=%s", wa_id)
         try:
-            _send_to(wa_id, _numbered_request_menu(employee_name))
+            _send_to(wa_id, _numbered_request_menu(employee_name, user_data, wa_id))
         except Exception:
             logger.exception("numbered menu text failed to=%s", wa_id)
             _send_to(
                 wa_id,
-                f"{welcome}\n\nReply 1–4: OD / Visitor / Leave / IT Form.",
+                f"{welcome}\n\nReply with the number for your request form.",
             )
+
+
+def _resolve_menu_form(
+    incoming: str, user_data: dict | None, wa_id: str = ""
+) -> str | None:
+    inc = (incoming or "").strip()
+    inc_upper = inc.upper()
+    for num, row_id, _label in _request_menu_items(user_data, wa_id):
+        form_id = _ROW_IDS.get(row_id, row_id.upper()).upper()
+        if inc == num or inc_upper == form_id or inc.lower() == row_id.lower():
+            return form_id
+    return None
 
 
 def _normalize_choice(raw: str) -> str:
@@ -606,6 +674,11 @@ def _normalize_choice(raw: str) -> str:
         "permission form": "PERMISSION_FORM",
         "it - form": "IT_FORM",
         "it form": "IT_FORM",
+        "vehicle - form": "VEHICLE_REQUEST_FORM",
+        "vehicle form": "VEHICLE_REQUEST_FORM",
+        "vehicle request form": "VEHICLE_REQUEST_FORM",
+        "maintenance - form": "MAINTENANCE_FORM",
+        "maintenance form": "MAINTENANCE_FORM",
     }
     return titles.get(s.lower(), s)
 
@@ -733,6 +806,10 @@ def _flow_callback_kind(body: dict) -> str:
         return "permission-flow"
     if callback in ("it-flow", "it_form", "it"):
         return "it-flow"
+    if callback in ("maintenance-flow", "maintenance_form", "maintenance"):
+        return "maintenance-flow"
+    if callback in ("vehicle-request-flow", "vehicle_request_form", "vehicle_request"):
+        return "vehicle-request-flow"
     return callback
 
 
@@ -746,6 +823,8 @@ def _is_flow_reply_webhook(body: dict) -> bool:
         "leave-flow",
         "permission-flow",
         "it-flow",
+        "maintenance-flow",
+        "vehicle-request-flow",
     ):
         return True
     data = body.get("data") or {}
@@ -874,6 +953,12 @@ def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
             callback = "leave-flow"
         elif keys & {"permission_for", "permission_type", "permission_shift"}:
             callback = "permission-flow"
+        elif keys & {"it_category", "issue_type"}:
+            callback = "it-flow"
+        elif keys & {"machine_type", "machine_no", "issue_category"}:
+            callback = "maintenance-flow"
+        elif keys & {"request_type", "destination_category", "load_size"}:
+            callback = "vehicle-request-flow"
     return phone_to_wa_id(phone), response, callback or "flow"
 
 
@@ -935,7 +1020,7 @@ def _process(sender: str, incoming: str) -> None:
         if exists and ud:
             name = ud.get("name", "Employee")
             _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
-            _send_main_menu(sender, name)
+            _send_main_menu(sender, name, ud)
         else:
             _session_ref(sender).delete()
             _send_to(sender, "User not registered.\nPlease contact admin.")
@@ -947,6 +1032,19 @@ def _process(sender: str, incoming: str) -> None:
         return
 
     if approval.handle_leave_manage_gate(sender, incoming):
+        return
+
+    if vehicle_request.handle_assignee_gate(sender, incoming, VEHICLE_REQUEST_DEPS):
+        return
+
+    if vehicle_request.handle_manager_manage_gate(
+        sender, incoming, VEHICLE_REQUEST_DEPS
+    ):
+        return
+
+    if vehicle_request.handle_logistics_manager_gate(
+        sender, incoming, VEHICLE_REQUEST_DEPS
+    ):
         return
 
     if approval.handle_approval_gate(sender, incoming):
@@ -984,32 +1082,45 @@ def _process(sender: str, incoming: str) -> None:
         it_request.handle(sender, incoming, session or {}, IT_DEPS)
         return
 
-    if incoming in ("1", "OD_FORM", "6"):
-        if state == SESSION_MENU_IDLE:
+    if vehicle_request.is_vehicle_reassign_state(state):
+        vehicle_request.handle_vehicle_reassign_pick(
+            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+        )
+        return
+
+    if vehicle_request.is_vehicle_manage_action_state(state):
+        vehicle_request.handle_manager_manage_action(
+            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+        )
+        return
+
+    if vehicle_request.is_vehicle_assign_state(state):
+        vehicle_request.handle_vehicle_assign_pick(
+            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+        )
+        return
+
+    exists, ud = bot_shared.get_user_record(sender)
+    user_data = ud if exists else None
+    menu_form = _resolve_menu_form(incoming, user_data, sender)
+    if menu_form:
+        if state != SESSION_MENU_IDLE:
+            _send_to(sender, "Send Hi to start.")
+            return
+        if menu_form == "OD_FORM":
             od_request.try_start_form(sender, OD_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("2", "VISITOR_FORM", "7"):
-        if state == SESSION_MENU_IDLE:
+        elif menu_form == "VISITOR_FORM":
             visitor_request.try_start_form(sender, VISITOR_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("3", "LEAVE_FORM", "8"):
-        if state == SESSION_MENU_IDLE:
+        elif menu_form == "LEAVE_FORM":
             leave_request.try_start_form(sender, LEAVE_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
-        return
-
-    if incoming in ("4", "5", "IT_FORM"):
-        if state == SESSION_MENU_IDLE:
+        elif menu_form == "IT_FORM":
             it_request.try_start_form(sender, IT_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
+        elif menu_form == "MAINTENANCE_FORM":
+            _send_to(sender, "Maintenance form is not available yet.")
+        elif menu_form == "VEHICLE_MANAGE":
+            vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
+        elif menu_form == "VEHICLE_REQUEST_FORM":
+            vehicle_request.try_start_form(sender, VEHICLE_REQUEST_DEPS)
         return
 
     # Chat / test flows — not shown in main menu
@@ -1091,6 +1202,10 @@ def health():
         "permission_flow_template": permission_request.permission_flow_template_name(),
         "it_form_configured": it_request.it_flow_enabled(),
         "it_flow_template": it_request.it_flow_template_name(),
+        "vehicle_request_form_configured": vehicle_request.vehicle_request_flow_enabled(),
+        "vehicle_request_flow_template": vehicle_request.vehicle_request_flow_template_name(),
+        "maintenance_form_configured": maintenance_request.maintenance_flow_enabled(),
+        "maintenance_flow_template": maintenance_request.maintenance_flow_template_name(),
     }
 
 
@@ -1169,6 +1284,41 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("could not notify user after IT flow error")
+        elif flow_kind in (
+            "vehicle-request-flow",
+            "vehicle_request_form",
+            "vehicle_request",
+            "logistics-flow",
+            "logistics_form",
+            "logistics",
+        ):
+            try:
+                vehicle_request.handle_flow_submission(
+                    sender, response_json, VEHICLE_REQUEST_DEPS
+                )
+            except Exception:
+                logger.exception("vehicle request flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your Vehicle Request form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after vehicle request flow error")
+        elif flow_kind in ("maintenance-flow", "maintenance_form", "maintenance"):
+            try:
+                maintenance_request.handle_flow_submission(
+                    sender, response_json, MAINTENANCE_DEPS
+                )
+            except Exception:
+                logger.exception("maintenance flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your Maintenance form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after maintenance flow error")
         elif flow_kind == "flow" and isinstance(response_json, dict):
             keys = {str(k).lower() for k in response_json.keys()}
             if keys & {"od_reason", "company_vehicle", "vehicle"}:
@@ -1196,6 +1346,20 @@ async def webhook(request: Request):
                     it_request.handle_flow_submission(sender, response_json, IT_DEPS)
                 except Exception:
                     logger.exception("IT flow submit failed sender=%s", sender)
+            elif keys & {"machine_type", "machine_no", "issue_category"}:
+                try:
+                    maintenance_request.handle_flow_submission(
+                        sender, response_json, MAINTENANCE_DEPS
+                    )
+                except Exception:
+                    logger.exception("maintenance flow submit failed sender=%s", sender)
+            elif keys & {"request_type", "destination_category", "vehicle_type"}:
+                try:
+                    vehicle_request.handle_flow_submission(
+                        sender, response_json, VEHICLE_REQUEST_DEPS
+                    )
+                except Exception:
+                    logger.exception("vehicle request flow submit failed sender=%s", sender)
             else:
                 logger.info("ignored flow submit kind=%s sender=%s", flow_kind, sender)
         else:

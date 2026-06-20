@@ -34,6 +34,12 @@ $modules = @(
 
     "it_request.py",
 
+    "vehicle_request.py",
+
+    "maintenance_request.py",
+
+    "maintenance_data.py",
+
     "it_flow_media.py",
 
     "requirements.txt",

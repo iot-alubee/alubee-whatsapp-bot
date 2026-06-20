@@ -672,6 +672,56 @@ def send_it_flow_form(
         return False
 
 
+def send_maintenance_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+    department: str = "",
+    jmd_route: str = "",
+) -> bool:
+    """Send Maintenance WhatsApp Form (env MAINTENANCE_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("MAINTENANCE_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning("MAINTENANCE_FLOW_TEMPLATE_NAME not set — cannot send maintenance form")
+        return False
+    lang = (os.getenv("MAINTENANCE_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("MAINTENANCE_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
+    dept_key = (department or "").strip().upper()
+    if dept_key == "FET":
+        dept_key = "FETTLING"
+    route_key = (jmd_route or "").strip().lower()
+    if dept_key in ("PDC", "CNC", "FETTLING", "SECONDARY") and route_key in ("jmd1", "jmd2"):
+        flow_token = f"maintenance_{phone_10}_{dept_key.lower()}_{route_key}"[:256]
+    else:
+        flow_token = f"maintenance_{phone_10}"[:256]
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="maintenance-flow",
+            flow_token=flow_token,
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info(
+            "maintenance flow template sent phone=%s template=%s",
+            phone_to_10(phone),
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception("maintenance flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
 def send_visitor_flow_form(
     phone: str,
     *,
@@ -740,6 +790,63 @@ def send_od_flow_form(
     except Exception:
         logger.exception("OD flow template failed phone=%s", phone_to_10(phone))
         return False
+
+
+def send_vehicle_request_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+) -> bool:
+    """Send Vehicle Request WhatsApp Form (env VEHICLE_REQUEST_FLOW_TEMPLATE_NAME)."""
+    template_name = (
+        os.getenv("VEHICLE_REQUEST_FLOW_TEMPLATE_NAME")
+        or os.getenv("LOGISTICS_FLOW_TEMPLATE_NAME")
+        or ""
+    ).strip()
+    if not template_name:
+        logger.warning(
+            "VEHICLE_REQUEST_FLOW_TEMPLATE_NAME not set — cannot send vehicle request form"
+        )
+        return False
+    lang = (
+        os.getenv("VEHICLE_REQUEST_FLOW_TEMPLATE_LANGUAGE_CODE")
+        or os.getenv("LOGISTICS_FLOW_TEMPLATE_LANGUAGE_CODE")
+        or "en"
+    ).strip()
+    if body_values is None:
+        spec = (
+            os.getenv("VEHICLE_REQUEST_FLOW_TEMPLATE_BODY_FIELDS")
+            or os.getenv("LOGISTICS_FLOW_TEMPLATE_BODY_FIELDS")
+            or "name"
+        ).strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="vehicle-request-flow",
+            flow_token=f"vehicle_request_{phone_10}"[:256],
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info(
+            "vehicle request flow template sent phone=%s template=%s",
+            phone_to_10(phone),
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception("vehicle request flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
+send_logistics_flow_form = send_vehicle_request_flow_form
 
 
 def send_guest_visit_otp(
