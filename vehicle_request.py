@@ -235,13 +235,13 @@ def _trip_started(rd: dict) -> bool:
 
 
 def _manage_row_title(rd: dict) -> str:
+    requester = (rd.get("employee_name") or "—").strip()
+    destination = (rd.get("destination_label") or "—").strip()
+    time_val = (rd.get("required_at") or "—").strip()
     assignee = (rd.get("assigned_to") or "—").strip()
-    text = (
-        f"{rd.get('employee_name') or '—'}-"
-        f"{rd.get('destination_category_label') or '—'}-"
-        f"{rd.get('destination_label') or '—'}-"
-        f"{assignee}"
-    )
+    if _request_status(rd) == "PENDING":
+        assignee = "—"
+    text = f"{requester}-{destination}-{time_val}-{assignee}"
     return text[:72]
 
 
@@ -1249,33 +1249,37 @@ def _parse_manage_pick(incoming: str) -> str | None:
 def _send_manage_actions(
     sender: str, deps: VehicleRequestDeps, request_id: str, rd: dict
 ) -> None:
-    if _trip_started(rd):
-        deps.send_to(
-            sender,
-            "This trip has already started.\n"
-            "Cancel and Re Assign are not allowed.",
-        )
-        deps.clear_session(sender)
-        return
     status = _request_status(rd)
-    if status == "PENDING":
-        buttons = [
-            (f"VMCANCEL_{request_id}"[:256], "Cancel"),
-        ]
-        body = _manage_row_title(rd) + "\n\nPending — not assigned yet."
-    elif status == "ASSIGNED":
-        buttons = [
-            (f"VMREASSIGN_{request_id}"[:256], "Re Assign"),
-            (f"VMCANCEL_{request_id}"[:256], "Cancel"),
-        ]
-        body = _manage_row_title(rd)
-    else:
-        deps.send_to(
-            sender,
-            f"Request status is {status.lower()}. No actions available.",
-        )
+    if status != "ASSIGNED":
+        if status == "PENDING":
+            deps.send_to(
+                sender,
+                f"{_manage_row_title(rd)}\n\n"
+                "Status: Pending.\n"
+                "Use Assign or Cancel on the approval message.",
+            )
+        elif _trip_started(rd) or status == "STARTED":
+            deps.send_to(
+                sender,
+                f"{_manage_row_title(rd)}\n\n"
+                "This trip has already started.\n"
+                "Re Assign and Cancel are not allowed.",
+            )
+        else:
+            deps.send_to(
+                sender,
+                f"{_manage_row_title(rd)}\n\n"
+                f"Status: {status.lower()}.\n"
+                "Re Assign and Cancel are only for Assigned requests.",
+            )
         deps.clear_session(sender)
         return
+
+    buttons = [
+        (f"VMREASSIGN_{request_id}"[:256], "Re Assign"),
+        (f"VMCANCEL_{request_id}"[:256], "Cancel"),
+    ]
+    body = _manage_row_title(rd)
     deps.session_merge(
         sender,
         state=SESSION_WAITING_VEHICLE_MANAGE_ACTION,
@@ -1358,8 +1362,11 @@ def _handle_manage_cancel(
         deps.clear_session(sender)
         return True
     status = _request_status(rd)
-    if status not in ("PENDING", "ASSIGNED"):
-        deps.send_to(sender, f"Request already {status.lower()}.")
+    if status != "ASSIGNED":
+        deps.send_to(
+            sender,
+            "Cancel from Manage is only allowed when status is Assigned.",
+        )
         deps.clear_session(sender)
         return True
 
@@ -1371,7 +1378,7 @@ def _handle_manage_cancel(
         "is_active_trip": False,
     })
     assignee_wa = (rd.get("assigned_to_wa") or "").strip()
-    if assignee_wa and status == "ASSIGNED":
+    if assignee_wa:
         deps.send_to(
             assignee_wa,
             "Your assigned vehicle request has been cancelled by logistics.",
