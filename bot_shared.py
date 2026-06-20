@@ -99,6 +99,7 @@ def query_requests_for_employee(
     sw = _require("same_whatsapp", same_whatsapp)
     req_type = (req_type or "").strip().upper()
     coll = firestore_db.collection("requests")
+    indexed_ok = False
     for emp_key in (employee, (employee or "").strip().lower()):
         if not emp_key:
             continue
@@ -109,10 +110,19 @@ def query_requests_for_employee(
                 .limit(limit)
                 .stream()
             )
+            indexed_ok = True
             if snaps:
                 return snaps
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "Firestore requests query failed (%s, employee=%s): %s",
+                req_type,
+                emp_key,
+                e,
+            )
             continue
+    if indexed_ok:
+        return []
     out = []
     for snap in query_requests_by_type(firestore_db, req_type, limit=limit * 4):
         d = snap.to_dict() or {}

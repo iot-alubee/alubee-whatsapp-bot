@@ -401,7 +401,7 @@ def _notify_internal_assignee(
     request_id: str,
 ) -> None:
     """Notify logistics department staff when an Internal request is assigned."""
-    if _normalize_id(rd.get("vehicle_type") or "") != "in_house":
+    if _normalize_vehicle_type(rd.get("vehicle_type") or "") != "in_house":
         return
 
     found = _staff_wa_for_assignee_code(deps.db, assignee_code)
@@ -488,6 +488,23 @@ def _flow_pick(data: dict, *keys: str) -> str:
 
 def _normalize_id(raw: str) -> str:
     return (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+_VEHICLE_TYPE_ALIASES: dict[str, str] = {
+    "in_house": "in_house",
+    "in_house_vehicle": "in_house",
+    "internal": "in_house",
+    "company_vehicle": "in_house",
+    "external_hire": "external_hire",
+    "external": "external_hire",
+    "external_vehicle": "external_hire",
+    "hire": "external_hire",
+}
+
+
+def _normalize_vehicle_type(raw: str) -> str:
+    norm = _normalize_id(raw)
+    return _VEHICLE_TYPE_ALIASES.get(norm, norm)
 
 
 def _destination_display(category: str, destination: str, location: str) -> str:
@@ -595,23 +612,37 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     else:
         return None
 
-    vehicle_type = _normalize_id(_flow_pick(data, "vehicle_type"))
+    vehicle_type = _normalize_vehicle_type(_flow_pick(data, "vehicle_type"))
     if vehicle_type not in VEHICLE_TYPE_LABELS:
+        logger.warning(
+            "vehicle request parse failed: vehicle_type=%r raw=%r keys=%s",
+            vehicle_type,
+            _flow_pick(data, "vehicle_type"),
+            list(data.keys()),
+        )
         return None
 
     hire_type = ""
     if vehicle_type == "external_hire":
         hire_type = _normalize_id(_flow_pick(data, "hire_vehicle_type"))
         if hire_type not in HIRE_VEHICLE_TYPE_LABELS:
+            logger.warning(
+                "vehicle request parse failed: hire_vehicle_type=%r keys=%s",
+                hire_type,
+                list(data.keys()),
+            )
             return None
 
     load_size = _normalize_id(_flow_pick(data, "load_size"))
     if load_size not in LOAD_SIZE_LABELS:
+        logger.warning(
+            "vehicle request parse failed: load_size=%r keys=%s",
+            load_size,
+            list(data.keys()),
+        )
         return None
 
-    required_at = _flow_pick(data, "required_at")
-    if not required_at:
-        return None
+    required_at = _flow_pick(data, "required_at") or "—"
 
     km = _estimated_distance_km(category, destination)
     return {
@@ -758,7 +789,7 @@ def _employee_confirmation(rd: dict) -> str:
 
 
 def _assign_options(db: object, vehicle_type: str) -> list[tuple[str, str]]:
-    if _normalize_id(vehicle_type) == "in_house":
+    if _normalize_vehicle_type(vehicle_type) == "in_house":
         return _logistics_department_staff(db)
     return list(EXTERNAL_VENDORS)
 
@@ -850,6 +881,11 @@ def handle_flow_submission(
 ) -> None:
     parsed = parse_flow_response(response_json)
     if not parsed:
+        logger.warning(
+            "vehicle request flow submission unreadable sender=%s payload=%s",
+            sender,
+            response_json,
+        )
         deps.send_to(
             sender,
             "Could not read the Vehicle Request form. Please submit again or contact admin.",
@@ -1512,7 +1548,7 @@ def handle_assignee_gate(
     if _request_status(rd) != "ASSIGNED":
         deps.send_to(sender, f"Request is {_request_status(rd).lower()}.")
         return True
-    if _normalize_id(rd.get("vehicle_type") or "") != "in_house":
+    if _normalize_vehicle_type(rd.get("vehicle_type") or "") != "in_house":
         deps.send_to(sender, "Start is only for internal assignments.")
         return True
 
