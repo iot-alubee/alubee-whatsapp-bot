@@ -228,10 +228,7 @@ def _request_on_ist_day(rd: dict, day) -> bool:
 
 
 def _trip_started(rd: dict) -> bool:
-    status = _request_status(rd)
-    if status == "STARTED":
-        return True
-    return bool(rd.get("started_at"))
+    return _request_status(rd) == "STARTED"
 
 
 def _manage_row_title(rd: dict) -> str:
@@ -1258,7 +1255,7 @@ def _send_manage_actions(
                 "Status: Pending.\n"
                 "Use Assign or Cancel on the approval message.",
             )
-        elif _trip_started(rd) or status == "STARTED":
+        elif status == "STARTED":
             deps.send_to(
                 sender,
                 f"{_manage_row_title(rd)}\n\n"
@@ -1499,7 +1496,7 @@ def handle_vehicle_reassign_pick(
         deps.send_to(sender, "Vehicle request not found.")
         return
     ref, rd = loaded
-    if _trip_started(rd) or _request_status(rd) != "ASSIGNED":
+    if _request_status(rd) != "ASSIGNED":
         deps.clear_session(sender)
         deps.send_to(sender, "Request cannot be re-assigned now.")
         return
@@ -1580,10 +1577,16 @@ def _deactivate_assignee_trips(
         if rd.get("security_out_at"):
             snap.reference.update({"is_active_trip": False})
             continue
-        snap.reference.update({
+        from firebase_admin import firestore as _firestore
+
+        revert_update: dict = {
             "is_active_trip": False,
             "vehicle_request_status": "ASSIGNED",
-        })
+        }
+        if _request_status(rd) == "STARTED" or rd.get("started_at"):
+            revert_update["started_at"] = _firestore.DELETE_FIELD
+            revert_update["started_by"] = _firestore.DELETE_FIELD
+        snap.reference.update(revert_update)
         if rd.get("assignee_can_start") is False:
             continue
         code = rd.get("assigned_to_code") or ""
