@@ -112,6 +112,25 @@ LOAD_SIZE_LABELS = {
     "empty_vehicle": "Empty Vehicle",
 }
 
+FROM_UNIT_LABELS = {
+    "unit_i": "Unit I",
+    "unit_ii": "Unit II",
+}
+
+_FROM_UNIT_ALIASES: dict[str, str] = {
+    "unit_i": "unit_i",
+    "unit_1": "unit_i",
+    "unit_ii": "unit_ii",
+    "unit_2": "unit_ii",
+}
+
+_VEHICLE_REQUIRED_TIME_SLOTS: frozenset[str] = frozenset({
+    "08:30", "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+    "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00",
+    "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30",
+    "19:00", "19:30", "20:00",
+})
+
 EXTERNAL_VENDORS: list[tuple[str, str]] = [
     ("annai_transport", "Annai Transport"),
     ("challa_transport", "Challa Transport"),
@@ -324,7 +343,7 @@ def _approval_template_body_fields() -> list[str]:
         os.getenv("VEHICLE_REQUEST_APPROVAL_TEMPLATE_BODY_FIELDS")
         or os.getenv("LOGISTICS_MANAGER_APPROVAL_TEMPLATE_BODY_FIELDS")
         or (
-            "requester,department,request_type,category,destination,vehicle_type,"
+            "requester,department,from,request_type,category,destination,vehicle_type,"
             "hire_vehicle_type,load_capacity,distance,required_at"
         )
     ).strip()
@@ -351,7 +370,7 @@ def _assignee_notify_template_body_fields() -> list[str]:
     raw = (
         os.getenv("VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS")
         or os.getenv("VEHICLE_INTERNAL_ASSIGNEE_TEMPLATE_BODY_FIELDS")
-        or "assignee_name,requester,request_type,category,destination,time"
+        or "assignee_name,requester,from,request_type,category,destination,time"
     ).strip()
     return [k.strip().lower() for k in raw.split(",") if k.strip()]
 
@@ -360,6 +379,7 @@ def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, 
     return {
         "assignee_name": assignee_name or "—",
         "requester": rd.get("employee_name") or "—",
+        "from": rd.get("from_unit_label") or "—",
         "request_type": rd.get("request_type_label") or "—",
         "category": rd.get("destination_category_label") or "—",
         "destination": rd.get("destination_label") or "—",
@@ -373,19 +393,21 @@ def _assignee_notify_body(rd: dict, assignee_name: str) -> str:
     return (
         f"Hi {first}, new request has been assigned to you. Please refer below.\n\n"
         f"Requester: {v['requester']}\n"
+        f"From: {v['from']}\n"
         f"Request Type: {v['request_type']}\n"
         f"Category: {v['category']}\n"
         f"Destination: {v['destination']}\n"
-        f"Time: {v['time']}"
+        f"Time: {v['time']}\n\n"
+        "Click 'Start' once you are ready!"
     )
 
 
 def _assignee_notify_template_body_values(rd: dict, assignee_name: str) -> list[str]:
     values = _assignee_notify_template_values(rd, assignee_name)
     fields = _assignee_notify_template_body_fields()
-    if len(fields) != 6:
+    if len(fields) != 7:
         logger.warning(
-            "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS should list exactly 6 "
+            "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS should list exactly 7 "
             "fields for Utility template; got %s",
             len(fields),
         )
@@ -419,6 +441,30 @@ def _notify_internal_assignee(
     phone = wa_id_to_phone(assignee_wa)
     rid = (request_id or "").strip()
     start_id = f"VEHICLE_START_{rid}"[:256]
+    can_start = rd.get("assignee_can_start") is not False
+    body = _assignee_notify_body(rd, display_name)
+    start_buttons = [(start_id, "Start")] if can_start else []
+
+    if deps.has_active_whatsapp_session(assignee_wa):
+        try:
+            if start_buttons:
+                send_reply_buttons(
+                    phone,
+                    body,
+                    start_buttons,
+                    callback_data=rid,
+                    ensure_contact=True,
+                    contact_name=display_name,
+                )
+            else:
+                deps.send_to(assignee_wa, body)
+            return
+        except Exception:
+            logger.exception(
+                "vehicle assignee notify with Start failed assignee=%s request_id=%s",
+                assignee_wa,
+                request_id,
+            )
 
     if template_name:
         try:
@@ -429,51 +475,27 @@ def _notify_internal_assignee(
                 language_code=_assignee_notify_template_language(),
                 body_values=_assignee_notify_template_body_values(rd, display_name),
                 callback_data=rid,
+                ensure_contact=False,
             )
             logger.info(
-                "vehicle assignee template sent assignee=%s request_id=%s",
+                "vehicle assignee template sent assignee=%s request_id=%s "
+                "(add Quick Reply Start button on template in Meta)",
                 assignee_wa,
                 request_id,
             )
+            return
         except Exception:
             logger.exception(
                 "vehicle assignee template failed assignee=%s request_id=%s",
                 assignee_wa,
                 request_id,
             )
-    elif deps.has_active_whatsapp_session(assignee_wa):
-        try:
-            deps.send_to(assignee_wa, _assignee_notify_body(rd, display_name))
-        except Exception:
-            logger.exception(
-                "vehicle assignee session notify failed assignee=%s", assignee_wa
-            )
-    else:
-        logger.info(
-            "skip vehicle assignee text notify assignee=%s (set "
-            "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME)",
-            assignee_wa,
-        )
 
-    if rd.get("assignee_can_start") is False:
-        return
-
-    if deps.has_active_whatsapp_session(assignee_wa):
-        try:
-            send_reply_buttons(
-                phone,
-                "Tap Start when you are ready to go.",
-                [(start_id, "Start")],
-                callback_data=rid,
-                ensure_contact=True,
-                contact_name=display_name,
-            )
-        except Exception:
-            logger.exception(
-                "vehicle assignee Start button failed assignee=%s request_id=%s",
-                assignee_wa,
-                request_id,
-            )
+    logger.info(
+        "skip vehicle assignee notify assignee=%s (set "
+        "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME or open WhatsApp session)",
+        assignee_wa,
+    )
 
 
 def _flow_pick(data: dict, *keys: str) -> str:
@@ -505,6 +527,43 @@ _VEHICLE_TYPE_ALIASES: dict[str, str] = {
 def _normalize_vehicle_type(raw: str) -> str:
     norm = _normalize_id(raw)
     return _VEHICLE_TYPE_ALIASES.get(norm, norm)
+
+
+def _normalize_from_unit(raw: str) -> str:
+    norm = _normalize_id(raw)
+    return _FROM_UNIT_ALIASES.get(norm, norm)
+
+
+def _format_time_12h(hhmm: str) -> str:
+    raw = (hhmm or "").strip()
+    if not raw:
+        return "—"
+    for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            hour = parsed.hour % 12 or 12
+            ampm = "AM" if parsed.hour < 12 else "PM"
+            return f"{hour}:{parsed.minute:02d} {ampm}"
+        except ValueError:
+            continue
+    return raw
+
+
+def _build_required_at(data: dict) -> str:
+    legacy = _flow_pick(data, "required_at")
+    if legacy:
+        return legacy
+
+    req_time_raw = _flow_pick(data, "required_time")
+    if not req_time_raw:
+        return "—"
+
+    time_norm = req_time_raw.replace(".", ":").upper()
+    if ":" in time_norm and time_norm not in _VEHICLE_REQUIRED_TIME_SLOTS:
+        time_norm = _normalize_id(time_norm).replace("_", ":")
+    if time_norm in _VEHICLE_REQUIRED_TIME_SLOTS:
+        return _format_time_12h(time_norm)
+    return _format_time_12h(req_time_raw)
 
 
 def _destination_display(category: str, destination: str, location: str) -> str:
@@ -595,6 +654,16 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     if request_type not in REQUEST_TYPE_LABELS:
         return None
 
+    from_unit = _normalize_from_unit(_flow_pick(data, "from_unit"))
+    if from_unit and from_unit not in FROM_UNIT_LABELS:
+        logger.warning(
+            "vehicle request parse failed: from_unit=%r keys=%s",
+            from_unit,
+            list(data.keys()),
+        )
+        return None
+    from_unit_label = FROM_UNIT_LABELS.get(from_unit, "—")
+
     category = _normalize_id(_flow_pick(data, "destination_category"))
     if category not in DESTINATION_CATEGORY_LABELS:
         return None
@@ -642,10 +711,13 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         )
         return None
 
-    required_at = _flow_pick(data, "required_at") or "—"
+    required_at = _build_required_at(data)
+    required_time = _flow_pick(data, "required_time")
 
     km = _estimated_distance_km(category, destination)
     return {
+        "from_unit": from_unit,
+        "from_unit_label": from_unit_label,
         "request_type": request_type,
         "request_type_label": REQUEST_TYPE_LABELS[request_type],
         "destination_category": category,
@@ -661,6 +733,7 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         "load_size_label": LOAD_SIZE_LABELS[load_size],
         "estimated_distance_km": km,
         "estimated_distance_display": "—" if km is None else f"{km} KM",
+        "required_time": required_time,
         "required_at": required_at,
     }
 
@@ -673,6 +746,7 @@ def _manager_approval_body(rd: dict) -> str:
         "Vehicle request\n\n"
         f"Requester: {rd.get('employee_name') or '—'}\n"
         f"Department: {rd.get('department') or '—'}\n"
+        f"From: {rd.get('from_unit_label') or '—'}\n"
         f"Request Type: {rd.get('request_type_label') or '—'}\n"
         f"Category: {rd.get('destination_category_label') or '—'}\n"
         f"Destination: {rd.get('destination_label') or '—'}\n"
@@ -689,6 +763,7 @@ def _approval_template_values(rd: dict) -> dict[str, str]:
     return {
         "requester": rd.get("employee_name") or "—",
         "department": rd.get("department") or "—",
+        "from": rd.get("from_unit_label") or "—",
         "request_type": rd.get("request_type_label") or "—",
         "category": rd.get("destination_category_label") or "—",
         "destination": rd.get("destination_label") or "—",
@@ -701,12 +776,12 @@ def _approval_template_values(rd: dict) -> dict[str, str]:
 
 
 def _template_body_values(rd: dict) -> list[str]:
-    """Ten body variables — must match approved Utility template {{1}}…{{10}}."""
+    """Eleven body variables — must match approved Utility template {{1}}…{{11}}."""
     values = _approval_template_values(rd)
     fields = _approval_template_body_fields()
-    if len(fields) != 10:
+    if len(fields) != 11:
         logger.warning(
-            "VEHICLE_REQUEST_APPROVAL_TEMPLATE_BODY_FIELDS should list exactly 10 "
+            "VEHICLE_REQUEST_APPROVAL_TEMPLATE_BODY_FIELDS should list exactly 11 "
             "fields for Utility template; got %s",
             len(fields),
         )
@@ -778,6 +853,7 @@ def _employee_confirmation(rd: dict) -> str:
         hire_line = f"Hire vehicle: {rd['hire_vehicle_type_label']}\n"
     return (
         "Your vehicle request has been submitted.\n\n"
+        f"From: {rd.get('from_unit_label') or '—'}\n"
         f"Type: {rd.get('request_type_label') or '—'}\n"
         f"Destination: {rd.get('destination_label') or '—'}\n"
         f"Distance: {rd.get('estimated_distance_display') or '—'}\n"
@@ -852,13 +928,6 @@ def try_start_form(sender: str, deps: VehicleRequestDeps) -> None:
         )
         return
 
-    if find_open_vehicle_request(sender, deps.db):
-        deps.send_to(
-            sender,
-            "You already have an open vehicle request.\n"
-            "Please wait until it is completed before raising another.",
-        )
-        return
     if not vehicle_request_flow_enabled():
         deps.send_to(
             sender,
@@ -909,14 +978,6 @@ def handle_flow_submission(
         )
         return
 
-    if find_open_vehicle_request(sender, deps.db):
-        deps.send_to(
-            sender,
-            "You already have an open vehicle request.\n"
-            "Please wait until it is completed before raising another.",
-        )
-        return
-
     ref = deps.db.collection("requests").document()
     request_id = ref.id
     now = deps.utcnow()
@@ -931,6 +992,8 @@ def handle_flow_submission(
         "employee_id": ud.get("employee_id") or "",
         "employee_name": ud.get("name") or "Employee",
         "department": ud.get("department") or "",
+        "from_unit": parsed["from_unit"],
+        "from_unit_label": parsed["from_unit_label"],
         "type": "VEHICLE_REQUEST",
         "reason": reason,
         "request_type": parsed["request_type"],
@@ -948,6 +1011,7 @@ def handle_flow_submission(
         "load_size_label": parsed["load_size_label"],
         "estimated_distance_km": parsed["estimated_distance_km"],
         "estimated_distance_display": parsed["estimated_distance_display"],
+        "required_time": parsed["required_time"],
         "required_at": parsed["required_at"],
         "vehicle_request_status": "PENDING",
         "submission_source": "whatsapp_flow",
@@ -1527,10 +1591,44 @@ def _deactivate_assignee_trips(
         )
 
 
+def _find_assignee_startable_request(db: object, assignee_wa: str) -> str | None:
+    """Latest ASSIGNED internal trip for assignee (template Quick Reply sends \"Start\")."""
+    wa = (assignee_wa or "").strip()
+    if not wa:
+        return None
+    best_id: str | None = None
+    best_ts = ""
+    try:
+        for snap in db.collection("requests").where(
+            "type", "==", "VEHICLE_REQUEST"
+        ).stream():
+            rd = snap.to_dict() or {}
+            if (rd.get("assigned_to_wa") or "").strip() != wa:
+                continue
+            if _request_status(rd) != "ASSIGNED":
+                continue
+            if rd.get("assignee_can_start") is False:
+                continue
+            if _normalize_vehicle_type(rd.get("vehicle_type") or "") != "in_house":
+                continue
+            ts = rd.get("requested_datetime")
+            key = str(ts) if ts is not None else snap.id
+            if key >= best_ts:
+                best_ts = key
+                best_id = snap.id
+    except Exception:
+        logger.exception(
+            "assignee startable request lookup failed assignee=%s", assignee_wa
+        )
+    return best_id
+
+
 def handle_assignee_gate(
     sender: str, incoming: str, deps: VehicleRequestDeps
 ) -> bool:
     request_id = _parse_vehicle_action(incoming, "VEHICLE_START_")
+    if not request_id and (incoming or "").strip().lower() == "start":
+        request_id = _find_assignee_startable_request(deps.db, sender)
     if not request_id:
         return False
     loaded = _load_request(deps.db, request_id)
