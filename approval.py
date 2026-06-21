@@ -6,6 +6,7 @@ Configured from main.py after Firestore and env are ready.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -19,7 +20,7 @@ from bot_shared import (
 
 import approver_availability
 
-from interakt_api import ensure_customer, send_reply_buttons, wa_id_to_phone
+from interakt_api import ensure_customer, send_reply_buttons, send_template, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +591,239 @@ def _approval_action_buttons(
     return buttons
 
 
+def _approval_request_type(request_rd: dict | None) -> str:
+    return ((request_rd or {}).get("type") or "OD").strip().upper()
+
+
+_DEFAULT_APPROVAL_TEMPLATE_NAMES = {
+    "OD": "od_approval",
+    "LEAVE": "leave_approval",
+    "VISITOR": "visitor_approval",
+}
+
+
+def _approval_template_name(request_rd: dict | None) -> str:
+    req_type = _approval_request_type(request_rd)
+    type_key = {
+        "OD": "OD_APPROVAL_TEMPLATE_NAME",
+        "LEAVE": "LEAVE_APPROVAL_TEMPLATE_NAME",
+        "VISITOR": "VISITOR_APPROVAL_TEMPLATE_NAME",
+    }.get(req_type, "")
+    if type_key:
+        name = (os.getenv(type_key) or "").strip()
+        if name:
+            return name
+    shared = (os.getenv("APPROVAL_TEMPLATE_NAME") or "").strip()
+    if shared:
+        return shared
+    return _DEFAULT_APPROVAL_TEMPLATE_NAMES.get(req_type, "")
+
+
+def _approval_uses_template(request_rd: dict | None) -> bool:
+    req_type = _approval_request_type(request_rd)
+    return req_type in ("OD", "LEAVE", "VISITOR") and bool(
+        _approval_template_name(request_rd)
+    )
+
+
+def _approval_template_language() -> str:
+    return (
+        os.getenv("APPROVAL_TEMPLATE_LANGUAGE_CODE")
+        or os.getenv("OD_APPROVAL_TEMPLATE_LANGUAGE_CODE")
+        or "en"
+    ).strip()
+
+
+def _default_approval_template_body_fields(req_type: str) -> str:
+    defaults = {
+        "OD": "employee,department,date,visiting_to,purpose,time_required",
+        "LEAVE": (
+            "employee,department,days,from_date,to_date,reason,"
+            "leaves_current_month,leaves_last_month"
+        ),
+        "VISITOR": (
+            "employee,department,visitor_name,visitor_type,visiting_to,purpose,"
+            "coming_on,coming_from,people_count,mobile"
+        ),
+    }
+    return defaults.get(req_type, "employee,department,reason")
+
+
+def _approval_template_body_fields(request_rd: dict | None) -> list[str]:
+    req_type = _approval_request_type(request_rd)
+    raw = (
+        os.getenv(f"{req_type}_APPROVAL_TEMPLATE_BODY_FIELDS")
+        or os.getenv("APPROVAL_TEMPLATE_BODY_FIELDS")
+        or _default_approval_template_body_fields(req_type)
+    ).strip()
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def _approval_template_values(
+    *,
+    employee_name: str,
+    department: str,
+    reason: str,
+    request_rd: dict | None = None,
+) -> dict[str, str]:
+    d = _require()
+    req_type = _approval_request_type(request_rd)
+    rd = request_rd or {}
+    emp = d.chat_name(employee_name)
+    dept = department or "—"
+
+    if req_type == "VISITOR":
+        raw_names = rd.get("visitor_names") or []
+        if isinstance(raw_names, str):
+            names = raw_names.strip() or "—"
+        else:
+            names = ", ".join(raw_names) or "—"
+        coming_on = (rd.get("coming_on_date") or rd.get("visit_date") or "").strip() or "—"
+        coming_from = (
+            (rd.get("coming_from") or rd.get("coming_from_label") or rd.get("organization") or "")
+            .strip()
+            or "—"
+        )
+        visitor_type = (rd.get("visitor_type_label") or "").strip() or "—"
+        purpose = (rd.get("purpose_detail") or rd.get("purpose_label") or "").strip() or "—"
+        visiting = (
+            (rd.get("visiting_to_label") or "").strip()
+            or VISITING_TO_LABELS.get((rd.get("visiting_to") or "").strip().upper(), "")
+            or "—"
+        )
+        return {
+            "employee": emp,
+            "department": dept,
+            "visitor_name": names,
+            "visitor_type": visitor_type,
+            "visiting_to": visiting,
+            "purpose": purpose,
+            "coming_on": coming_on,
+            "coming_from": coming_from,
+            "people_count": str(rd.get("people_count") or "—"),
+            "mobile": str(rd.get("guest_phone") or "—"),
+        }
+
+    if req_type == "LEAVE":
+        from leave_request import format_leave_days_display
+
+        from_d = (rd.get("leave_from_date") or "").strip() or "—"
+        to_d = (rd.get("leave_to_date") or from_d).strip() or "—"
+        days_display = format_leave_days_display(
+            rd.get("leave_days"),
+            rd.get("leave_duration") or "",
+        )
+        original = rd.get("leave_days_original")
+        reduced_note = ""
+        if original is not None:
+            try:
+                if float(original) != float(rd.get("leave_days") or 0):
+                    reduced_note = (
+                        f" (reduced from "
+                        f"{format_leave_days_display(original, '')})"
+                    )
+            except (TypeError, ValueError):
+                pass
+        leaves_last = 0
+        leaves_curr = 0
+        eid = (rd.get("employee_id") or "").strip()
+        if eid:
+            try:
+                leaves_last, leaves_curr = get_employee_leave_counts(
+                    eid,
+                    employee_wa=(rd.get("employee") or "").strip(),
+                    firestore_db=d.db,
+                )
+            except Exception:
+                logger.exception("leave count lookup failed employee_id=%s", eid)
+                leaves_last = rd.get("leaves_last_month", 0)
+                leaves_curr = rd.get("leaves_current_month", 0)
+        return {
+            "employee": emp,
+            "department": dept,
+            "days": f"{days_display}{reduced_note}",
+            "from_date": from_d,
+            "to_date": to_d if to_d != from_d else "—",
+            "reason": reason or "—",
+            "leaves_current_month": str(leaves_curr),
+            "leaves_last_month": str(leaves_last),
+        }
+
+    return {
+        "employee": emp,
+        "department": dept,
+        "date": _format_od_approval_date(rd.get("requested_datetime")),
+        "visiting_to": (rd.get("od_visiting_to_label") or reason or "—"),
+        "purpose": ((rd.get("od_purpose") or "").strip() or "—"),
+        "time_required": str(rd.get("od_time_required_hours") or "—"),
+    }
+
+
+def _approval_template_body_values(
+    *,
+    employee_name: str,
+    department: str,
+    reason: str,
+    request_rd: dict | None = None,
+) -> list[str]:
+    values = _approval_template_values(
+        employee_name=employee_name,
+        department=department,
+        reason=reason,
+        request_rd=request_rd,
+    )
+    fields = _approval_template_body_fields(request_rd)
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _send_approval_template(
+    wa_id: str,
+    *,
+    employee_name: str,
+    department: str,
+    reason: str,
+    request_id: str,
+    request_rd: dict | None = None,
+) -> bool:
+    template_name = _approval_template_name(request_rd)
+    if not template_name:
+        return False
+    rid = (request_id or "").strip()
+    req_type = _approval_request_type(request_rd)
+    try:
+        ensure_customer(wa_id_to_phone(wa_id), name="Approver")
+        send_template(
+            wa_id_to_phone(wa_id),
+            template_name,
+            language_code=_approval_template_language(),
+            body_values=_approval_template_body_values(
+                employee_name=employee_name,
+                department=department,
+                reason=reason,
+                request_rd=request_rd,
+            ),
+            callback_data=rid,
+            ensure_contact=False,
+        )
+        logger.info(
+            "approval template sent type=%s to=%s request_id=%s template=%s",
+            req_type,
+            wa_id,
+            rid,
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "approval template failed type=%s to=%s request_id=%s template=%s",
+            req_type,
+            wa_id,
+            rid,
+            template_name,
+        )
+        return False
+
+
 def send_approval_buttons(
     wa_id: str,
     *,
@@ -600,16 +834,40 @@ def send_approval_buttons(
     request_rd: dict | None = None,
 ) -> bool:
     d = _require()
+    rid = (request_id or "").strip()
+    req_type = _approval_request_type(request_rd)
+
+    if _approval_uses_template(request_rd):
+        if _send_approval_template(
+            wa_id,
+            employee_name=employee_name,
+            department=department,
+            reason=reason,
+            request_id=rid,
+            request_rd=request_rd,
+        ):
+            return True
+
+    if _approval_uses_template(request_rd):
+        logger.warning(
+            "approval template failed for %s request_id=%s to=%s — trying session buttons",
+            req_type,
+            rid,
+            wa_id,
+        )
+
     if not d.has_active_whatsapp_session(wa_id):
         logger.info(
-            "skip approval notify to=%s request_id=%s (no active WhatsApp session in %sh)",
+            "skip approval notify to=%s request_id=%s type=%s "
+            "(no active WhatsApp session in %sh; set %s_APPROVAL_TEMPLATE_NAME)",
             wa_id,
-            request_id,
+            rid,
+            req_type,
             d.whatsapp_session_hours,
+            req_type,
         )
         return False
 
-    rid = (request_id or "").strip()
     body = _approval_message_body(
         employee_name=employee_name,
         department=department,
@@ -673,11 +931,22 @@ def resolve_approval(incoming: str, approver: str):
     return None, None
 
 
-def resolve_leave_manage_request_id(incoming: str) -> str | None:
+def resolve_leave_manage_request_id(
+    incoming: str, approver: str = ""
+) -> str | None:
     raw = (incoming or "").strip()
     if raw.upper().startswith("MANAGE_"):
         rid = raw.split("_", 1)[1].strip()
         return rid or None
+    if raw.upper() == "MANAGE" and approver:
+        d = _require()
+        snap = d.session_ref(approver).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            if data.get("state") == "WAITING_APPROVAL_ACTION":
+                rid = (data.get("approval_request_id") or "").strip()
+                if rid:
+                    return rid
     return None
 
 
@@ -691,7 +960,7 @@ def _resend_leave_approval_buttons(sender: str, rd: dict, request_id: str) -> No
 
 def handle_leave_manage_gate(sender: str, incoming: str) -> bool:
     """Start reduce-leave flow when approver taps Manage."""
-    request_id = resolve_leave_manage_request_id(incoming)
+    request_id = resolve_leave_manage_request_id(incoming, sender)
     if not request_id:
         return False
 

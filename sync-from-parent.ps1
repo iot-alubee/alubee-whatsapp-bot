@@ -18,6 +18,8 @@ $modules = @(
 
     "interakt_api.py",
 
+    "bot_config.py",
+    "bot_config.env",
     "bot_shared.py",
 
     "approval.py",

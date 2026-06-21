@@ -23,10 +23,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import firebase_admin
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from firebase_admin import credentials, firestore
 from google.api_core.exceptions import ResourceExhausted
+
+from bot_config import bootstrap_env
 
 import approval
 import approver_availability
@@ -54,19 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_env() -> None:
-    env_file = _APP_DIR / ".env"
-    if env_file.is_file():
-        load_dotenv(env_file, override=True)
-        return
-    example = _APP_DIR / ".env.example"
-    if example.is_file():
-        load_dotenv(example, override=True)
-        logger.warning(
-            "Interakt/.env not found — loaded .env.example. "
-            "Copy .env.example to .env for your real API key."
-        )
-        return
-    logger.warning("No Interakt/.env — set INTERAKT_API_KEY before sending messages.")
+    bootstrap_env(_APP_DIR)
 
 
 _load_env()
@@ -148,6 +137,8 @@ VISITOR_ALREADY_PENDING_MSG = "You already have a visitor request pending approv
 
 _UNSUPPORTED_REQUEST_IDS = frozenset({
     "VEHICLE_REQUEST",
+    "PERMISSION_REQUEST",
+    "PERMISSION_FORM",
 })
 
 SESSION_MENU_IDLE = "MENU_IDLE"
@@ -664,14 +655,11 @@ def _normalize_choice(raw: str) -> str:
         "od form": "OD_FORM",
         "vehicle request": "VEHICLE_REQUEST",
         "leave request": "LEAVE_REQUEST",
-        "permission request": "PERMISSION_REQUEST",
         "visitor request": "VISITOR_REQUEST",
         "visitor - form": "VISITOR_FORM",
         "visitor form": "VISITOR_FORM",
         "leave - form": "LEAVE_FORM",
         "leave form": "LEAVE_FORM",
-        "permission - form": "PERMISSION_FORM",
-        "permission form": "PERMISSION_FORM",
         "it - form": "IT_FORM",
         "it form": "IT_FORM",
         "vehicle - form": "VEHICLE_REQUEST_FORM",
@@ -1075,7 +1063,8 @@ def _process(sender: str, incoming: str) -> None:
         return
 
     if permission_request.is_permission_state(state):
-        permission_request.handle(sender, incoming, session or {}, PERMISSION_DEPS)
+        _session_ref(sender).delete()
+        _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
     if it_request.is_it_state(state):
@@ -1123,12 +1112,8 @@ def _process(sender: str, incoming: str) -> None:
             vehicle_request.try_start_form(sender, VEHICLE_REQUEST_DEPS)
         return
 
-    # Chat / test flows — not shown in main menu
-    if incoming == "PERMISSION_REQUEST":
-        if state == SESSION_MENU_IDLE:
-            permission_request.try_start(sender, PERMISSION_DEPS)
-        else:
-            _send_to(sender, "Send Hi to start.")
+    if incoming in ("PERMISSION_REQUEST", "PERMISSION_FORM"):
+        _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
     if incoming == "OD_REQUEST":
@@ -1261,17 +1246,11 @@ async def webhook(request: Request):
                 except Exception:
                     logger.exception("could not notify user after leave flow error")
         elif flow_kind in ("permission-flow", "permission_form", "permission"):
+            logger.info("permission flow submit ignored (disabled) sender=%s", sender)
             try:
-                permission_request.handle_flow_submission(sender, response_json, PERMISSION_DEPS)
+                _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
             except Exception:
-                logger.exception("permission flow submit failed sender=%s", sender)
-                try:
-                    _send_to(
-                        sender,
-                        "Sorry, we could not save your permission form. Please send Hi and try again.",
-                    )
-                except Exception:
-                    logger.exception("could not notify user after permission flow error")
+                pass
         elif flow_kind in ("it-flow", "it_form", "it"):
             try:
                 it_request.handle_flow_submission(sender, response_json, IT_DEPS)
@@ -1337,10 +1316,11 @@ async def webhook(request: Request):
                 except Exception:
                     logger.exception("leave flow submit failed sender=%s", sender)
             elif keys & {"permission_for", "reason"}:
+                logger.info("permission flow submit ignored (disabled) sender=%s", sender)
                 try:
-                    permission_request.handle_flow_submission(sender, response_json, PERMISSION_DEPS)
+                    _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
                 except Exception:
-                    logger.exception("permission flow submit failed sender=%s", sender)
+                    pass
             elif keys & {"it_category", "issue_type"}:
                 try:
                     it_request.handle_flow_submission(sender, response_json, IT_DEPS)

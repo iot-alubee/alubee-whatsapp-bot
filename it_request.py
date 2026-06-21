@@ -10,8 +10,14 @@ from datetime import datetime, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from bot_shared import get_user_record, query_requests_by_type, query_requests_for_employee, wa_from_10
-from interakt_api import send_image, send_reply_buttons, send_template_with_image_header, wa_id_to_phone
+from bot_shared import get_user_record, query_requests_by_type, wa_from_10
+from interakt_api import (
+    ensure_customer,
+    send_image,
+    send_template,
+    send_template_with_image_header,
+    wa_id_to_phone,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +36,6 @@ IT_CLOSE = "IT_CLOSE"
 IT_CANCEL = "IT_CANCEL"
 
 IT_STATES = frozenset({IT_CONFIRM_CLOSE})
-
-IT_ALREADY_OPEN_MSG = (
-    "Your request is already in progress.\n"
-    "Would you like to close or cancel it?"
-)
 
 IT_ENGINEER_CANNOT_RAISE_MSG = (
     "IT support engineers cannot raise IT requests through this form."
@@ -197,15 +198,6 @@ def _format_ist(dt) -> str:
     elif isinstance(dt, datetime) and not dt.tzinfo:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(_IST).strftime("%d-%m-%Y %I:%M %p")
-
-
-def find_open_it_request(employee: str, db: object) -> tuple[str, dict] | None:
-    for snap in query_requests_for_employee(db, "IT", employee):
-        d = snap.to_dict() or {}
-        status = (d.get("it_status") or "").strip().upper()
-        if status in IT_OPEN_STATUSES:
-            return snap.id, d
-    return None
 
 
 def _engineer_assigned_count(db: object, engineer_wa: str, same_whatsapp: Callable) -> int:
@@ -398,7 +390,165 @@ def _engineer_assignment_message(rd: dict) -> str:
     )
 
 
-def _notify_engineer_assigned(engineer_wa: str, rd: dict, deps: ItDeps) -> None:
+def _engineer_assign_template_name() -> str:
+    """Template with Image header — used when the user attached an issue photo."""
+    return (
+        os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME")
+        or os.getenv("IT_TICKET_NOTIFICATION_TEMPLATE_NAME")
+        or "it_ticket_notification"
+    ).strip()
+
+
+def _engineer_assign_body_only_template_name() -> str:
+    """Template with no header — used when the user did not attach a photo."""
+    return (
+        os.getenv("IT_ENGINEER_ASSIGN_BODY_TEMPLATE_NAME")
+        or os.getenv("IT_TICKET_NOTIFICATION_BODY_TEMPLATE_NAME")
+        or "it_ticket_notification_no_image"
+    ).strip()
+
+
+def _user_issue_photo_url(rd: dict) -> str:
+    photo = (rd.get("issue_photo_url") or "").strip()
+    if photo.lower().startswith("https://"):
+        return photo
+    status = (rd.get("issue_photo_status") or "").strip().lower()
+    if status == "uploaded":
+        logger.error(
+            "IT issue photo uploaded but issue_photo_url missing request_id=%s",
+            rd.get("request_id") or "—",
+        )
+    return ""
+
+
+def _engineer_assign_template_language() -> str:
+    return (os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+
+
+def _engineer_assign_template_body_fields() -> list[str]:
+    raw = (
+        os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_BODY_FIELDS")
+        or "employee,department,category,machine,issue,description,priority,requested_at"
+    ).strip()
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def _engineer_assign_template_values(rd: dict) -> dict[str, str]:
+    return {
+        "employee": (rd.get("employee_name") or "Employee").strip(),
+        "department": (rd.get("department") or "—").strip(),
+        "category": (rd.get("it_category_label") or "—").strip(),
+        "machine": (rd.get("machine_no_label") or "—").strip() or "—",
+        "issue": (rd.get("issue_type_label") or "—").strip(),
+        "description": (rd.get("description") or "—").strip() or "—",
+        "priority": (rd.get("priority_label") or "—").strip(),
+        "requested_at": _format_ist(rd.get("requested_datetime")) or "—",
+    }
+
+
+def _engineer_assign_template_body_values(rd: dict) -> list[str]:
+    values = _engineer_assign_template_values(rd)
+    fields = _engineer_assign_template_body_fields()
+    if len(fields) != 8:
+        logger.warning(
+            "IT_ENGINEER_ASSIGN_TEMPLATE_BODY_FIELDS should list exactly 8 fields; got %s",
+            len(fields),
+        )
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _send_engineer_assign_template(
+    engineer_wa: str,
+    rd: dict,
+    db: object,
+    *,
+    request_id: str = "",
+) -> bool:
+    phone = wa_id_to_phone(engineer_wa)
+    engineer_name = _engineer_name(engineer_wa, db)
+    body_values = _engineer_assign_template_body_values(rd)
+    callback = (request_id or rd.get("request_id") or "").strip()[:512]
+    user_photo = _user_issue_photo_url(rd)
+
+    if user_photo:
+        template_name = _engineer_assign_template_name()
+        if not template_name:
+            return False
+        try:
+            ensure_customer(phone, name=engineer_name)
+            send_template_with_image_header(
+                phone,
+                template_name,
+                user_photo,
+                language_code=_engineer_assign_template_language(),
+                body_values=body_values,
+                callback_data=callback,
+                ensure_contact=False,
+            )
+            logger.info(
+                "IT engineer assign template sent engineer=%s request_id=%s "
+                "template=%s header=user_photo",
+                engineer_wa,
+                callback,
+                template_name,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "IT engineer image template failed engineer=%s request_id=%s template=%s",
+                engineer_wa,
+                callback,
+                template_name,
+            )
+            return False
+
+    template_name = _engineer_assign_body_only_template_name()
+    if not template_name:
+        logger.error(
+            "IT ticket has no photo — set IT_ENGINEER_ASSIGN_BODY_TEMPLATE_NAME "
+            "(Utility template with no header)"
+        )
+        return False
+    try:
+        ensure_customer(phone, name=engineer_name)
+        send_template(
+            phone,
+            template_name,
+            language_code=_engineer_assign_template_language(),
+            body_values=body_values,
+            callback_data=callback,
+            ensure_contact=False,
+        )
+        logger.info(
+            "IT engineer assign template sent engineer=%s request_id=%s "
+            "template=%s header=none",
+            engineer_wa,
+            callback,
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "IT engineer body template failed engineer=%s request_id=%s template=%s",
+            engineer_wa,
+            callback,
+            template_name,
+        )
+        return False
+
+
+def _notify_engineer_assigned(
+    engineer_wa: str,
+    rd: dict,
+    deps: ItDeps,
+    *,
+    request_id: str = "",
+) -> None:
+    if _send_engineer_assign_template(
+        engineer_wa, rd, deps.db, request_id=request_id
+    ):
+        return
+
     ticket_text = _engineer_assignment_message(rd)
     photo_url = (rd.get("issue_photo_url") or "").strip()
     phone = wa_id_to_phone(engineer_wa)
@@ -417,7 +567,6 @@ def _notify_engineer_assigned(engineer_wa: str, rd: dict, deps: ItDeps) -> None:
         except Exception:
             logger.exception("IT engineer session image failed engineer=%s", engineer_wa)
 
-        # If caption-in-image fails, still try image then ticket text (no URL).
         try:
             send_image(
                 phone,
@@ -429,22 +578,6 @@ def _notify_engineer_assigned(engineer_wa: str, rd: dict, deps: ItDeps) -> None:
             return
         except Exception:
             logger.exception("IT engineer image-only send failed engineer=%s", engineer_wa)
-
-        template_name = (os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME") or "").strip()
-        if template_name:
-            try:
-                send_template_with_image_header(
-                    phone,
-                    template_name,
-                    photo_url,
-                    language_code=(os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_LANGUAGE_CODE") or "en").strip(),
-                    body_values=[ticket_text],
-                    ensure_contact=True,
-                    contact_name=engineer_name,
-                )
-                return
-            except Exception:
-                logger.exception("IT engineer template image failed engineer=%s", engineer_wa)
 
     deps.send_to(engineer_wa, ticket_text)
 
@@ -467,14 +600,16 @@ def _assign_request(
         },
         merge=True,
     )
-    rd = dict(rd)
+    snap = deps.db.collection("requests").document(request_id).get()
+    rd = dict(snap.to_dict() or rd)
     rd.update({
         "it_status": "ASSIGNED",
         "assigned_engineer": engineer_wa,
         "assigned_engineer_name": engineer_name,
         "assigned_engineer_slot": engineer_slot,
+        "request_id": request_id,
     })
-    _notify_engineer_assigned(engineer_wa, rd, deps)
+    _notify_engineer_assigned(engineer_wa, rd, deps, request_id=request_id)
     employee = (rd.get("employee") or "").strip()
     if employee:
         deps.send_to(employee, _employee_assigned_message(engineer_wa, deps))
@@ -506,28 +641,6 @@ def process_it_queue(deps: ItDeps, *, preferred_engineer: str | None = None) -> 
 def try_start_form(sender: str, deps: ItDeps) -> None:
     if is_it_engineer(sender):
         deps.send_to(sender, IT_ENGINEER_CANNOT_RAISE_MSG)
-        return
-
-    open_req = find_open_it_request(sender, deps.db)
-    if open_req:
-        request_id, _rd = open_req
-        deps.session_merge(
-            sender,
-            state=IT_CONFIRM_CLOSE,
-            it_request_id=request_id,
-        )
-        try:
-            send_reply_buttons(
-                wa_id_to_phone(sender),
-                IT_ALREADY_OPEN_MSG,
-                [(IT_CLOSE, "Close"), (IT_CANCEL, "Cancel")],
-            )
-        except Exception:
-            logger.exception("IT close/cancel buttons failed sender=%s", sender)
-            deps.send_to(
-                sender,
-                f"{IT_ALREADY_OPEN_MSG}\n\nReply CLOSE or CANCEL.",
-            )
         return
 
     if not it_flow_enabled():
@@ -640,10 +753,6 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
     parsed = parse_flow_response(response_json)
     if not parsed:
         deps.send_to(sender, "Could not read the IT form. Please submit again or contact admin.")
-        return
-
-    if find_open_it_request(sender, deps.db):
-        deps.send_to(sender, IT_ALREADY_OPEN_MSG)
         return
 
     exists, ud = get_user_record(sender)

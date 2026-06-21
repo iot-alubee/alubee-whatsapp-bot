@@ -19,17 +19,13 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import SSLError as RequestsSSLError
 from requests.exceptions import Timeout as RequestsTimeout
 from urllib3.util.retry import Retry
-from dotenv import load_dotenv
+
+from bot_config import bootstrap_env
 
 logger = logging.getLogger(__name__)
 
 _APP_DIR = Path(__file__).resolve().parent
-if not os.getenv("INTERAKT_API_KEY"):
-    for name in (".env", ".env.example"):
-        path = _APP_DIR / name
-        if path.is_file():
-            load_dotenv(path, override=True)
-            break
+bootstrap_env(_APP_DIR)
 
 INTERAKT_MESSAGE_URL = "https://api.interakt.ai/v1/public/message/"
 INTERAKT_TRACK_USERS_URL = "https://api.interakt.ai/v1/public/track/users/"
