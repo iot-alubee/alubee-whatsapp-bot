@@ -36,6 +36,7 @@ VEHICLE_REQUEST_OPEN_STATUSES = frozenset({
     "PENDING", "ASSIGNED", "STARTED", "IN_PROGRESS",
 })
 SESSION_WAITING_VEHICLE_ASSIGN = "WAITING_VEHICLE_ASSIGN_PICK"
+SESSION_WAITING_VEHICLE_MANAGER_NOTIFY = "WAITING_VEHICLE_MANAGER_NOTIFY"
 SESSION_WAITING_VEHICLE_MANAGE_ACTION = "WAITING_VEHICLE_MANAGE_ACTION"
 SESSION_WAITING_VEHICLE_REASSIGN = "WAITING_VEHICLE_REASSIGN_PICK"
 
@@ -857,6 +858,7 @@ def _notify_logistics_manager(deps: VehicleRequestDeps, rd: dict, request_id: st
                 ensure_contact=True,
                 contact_name="Logistics Manager",
             )
+            _set_pending_manager_notify(deps, mgr, rid)
             return
         except Exception:
             logger.exception(
@@ -879,6 +881,7 @@ def _notify_logistics_manager(deps: VehicleRequestDeps, rd: dict, request_id: st
                 "vehicle request approval template sent request_id=%s (no active session)",
                 request_id,
             )
+            _set_pending_manager_notify(deps, mgr, rid)
             return
         except Exception:
             logger.exception(
@@ -952,6 +955,56 @@ def _parse_vehicle_action(incoming: str, prefix: str) -> str | None:
         return None
     rid = raw[len(prefix) :].strip()
     return rid or None
+
+
+def _is_assign_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("assign", "assign_vehicle", "assign_request")
+
+
+def _is_cancel_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("cancel", "cancelled", "cancel_request")
+
+
+def _pending_manager_notify_request_id(sender: str, deps: VehicleRequestDeps) -> str:
+    snap = deps.session_ref(sender).get()
+    if not snap.exists:
+        return ""
+    data = snap.to_dict() or {}
+    if data.get("state") != SESSION_WAITING_VEHICLE_MANAGER_NOTIFY:
+        return ""
+    return (data.get("vehicle_manager_request_id") or "").strip()
+
+
+def _set_pending_manager_notify(
+    deps: VehicleRequestDeps, manager_wa: str, request_id: str
+) -> None:
+    deps.session_merge(
+        manager_wa,
+        state=SESSION_WAITING_VEHICLE_MANAGER_NOTIFY,
+        vehicle_manager_request_id=(request_id or "").strip(),
+    )
+
+
+def _resolve_manager_template_request_id(
+    incoming: str,
+    sender: str,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
+    want: str,
+) -> str | None:
+    """Map template Quick Reply (Assign/Cancel) + callbackData to request id."""
+    raw = (incoming or "").strip()
+    if want == "assign" and not _is_assign_label(raw):
+        return None
+    if want == "cancel" and not _is_cancel_label(raw):
+        return None
+    cb_rid = (callback_request_id or "").strip()
+    if cb_rid:
+        return cb_rid
+    return _pending_manager_notify_request_id(sender, deps) or None
 
 
 def try_start_form(sender: str, deps: VehicleRequestDeps) -> None:
@@ -1072,16 +1125,36 @@ def handle_flow_submission(
 
 
 def handle_logistics_manager_gate(
-    sender: str, incoming: str, deps: VehicleRequestDeps
+    sender: str,
+    incoming: str,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
 ) -> bool:
     if not is_logistics_manager(sender, deps.same_whatsapp):
         return False
 
     request_id = _parse_vehicle_action(incoming, "VEHICLE_ASSIGN_")
+    if not request_id:
+        request_id = _resolve_manager_template_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="assign",
+        )
     if request_id:
         return _handle_assign_click(sender, request_id, deps)
 
     request_id = _parse_vehicle_action(incoming, "VEHICLE_CANCEL_")
+    if not request_id:
+        request_id = _resolve_manager_template_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="cancel",
+        )
     if request_id:
         return _handle_cancel_click(sender, request_id, deps)
 
@@ -1129,11 +1202,21 @@ def _handle_assign_click(sender: str, request_id: str, deps: VehicleRequestDeps)
         )
     except Exception:
         logger.exception("vehicle assign list failed request_id=%s", request_id)
-        deps.clear_session(sender)
-        lines = "\n".join(f"• {label}" for _code, label in options)
+        numbered: dict[str, str] = {}
+        lines: list[str] = []
+        for idx, (code, label) in enumerate(options, start=1):
+            numbered[str(idx)] = code
+            lines.append(f"{idx}. {_sentence_case_name(label)}")
+        deps.session_merge(
+            sender,
+            state=SESSION_WAITING_VEHICLE_ASSIGN,
+            vehicle_assign_request_id=request_id,
+            vehicle_assign_options=numbered,
+        )
         deps.send_to(
             sender,
-            f"Could not show assign list. Options:\n{lines}\n\nSend Hi and tap Assign again.",
+            "Select vehicle / transport to assign — reply with the number:\n"
+            + "\n".join(lines),
         )
     return True
 
@@ -1175,11 +1258,23 @@ def handle_vehicle_assign_pick(
 
     session_rid = (session or {}).get("vehicle_assign_request_id") or ""
     parsed = _parse_vassign(incoming, request_id_hint=session_rid)
-    if not parsed:
+    assignee_code = ""
+    request_id = session_rid
+
+    if parsed:
+        request_id, assignee_code = parsed
+    else:
+        pick = (incoming or "").strip()
+        opts = (session or {}).get("vehicle_assign_options") or {}
+        if pick.isdigit() and pick in opts and session_rid:
+            assignee_code = str(opts[pick]).strip().lower()
+        else:
+            deps.send_to(sender, "Please pick a vehicle / transport from the list.")
+            return
+
+    if not assignee_code:
         deps.send_to(sender, "Please pick a vehicle / transport from the list.")
         return
-
-    request_id, assignee_code = parsed
     if session_rid and request_id != session_rid:
         deps.send_to(sender, "Session expired. Tap Assign on the request again.")
         deps.clear_session(sender)
@@ -1262,7 +1357,11 @@ def try_start_manage(sender: str, deps: VehicleRequestDeps) -> None:
         return
     rows = _fetch_today_vehicle_requests(deps.db)
     if not rows:
-        deps.send_to(sender, "No assigned vehicle requests for today.")
+        deps.send_to(
+            sender,
+            "No assigned vehicle requests for today.\n"
+            "New requests will arrive here with Assign / Cancel buttons.",
+        )
         return
     list_rows = [_manage_list_row_fields(rid, rd) for rid, rd in rows[:10]]
     try:

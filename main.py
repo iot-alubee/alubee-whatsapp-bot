@@ -1044,6 +1044,13 @@ def _is_configured_approver(sender: str) -> bool:
     )
 
 
+def _is_special_operator(sender: str) -> bool:
+    """JMD/MD approvers or logistics manager — not regular employees."""
+    if _is_configured_approver(sender):
+        return True
+    return vehicle_request.is_logistics_manager(sender, _same_whatsapp)
+
+
 def _process(
     sender: str,
     incoming: str,
@@ -1078,6 +1085,10 @@ def _process(
             )
             _send_approver_availability_menu(sender, current)
             return
+        if vehicle_request.is_logistics_manager(sender, _same_whatsapp):
+            _session_merge(sender, state=SESSION_MENU_IDLE, employee_name="Logistics Manager")
+            vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
+            return
         if exists and ud:
             name = ud.get("name", "Employee")
             _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
@@ -1106,7 +1117,10 @@ def _process(
         return
 
     if vehicle_request.handle_logistics_manager_gate(
-        sender, incoming, VEHICLE_REQUEST_DEPS
+        sender,
+        incoming,
+        VEHICLE_REQUEST_DEPS,
+        callback_request_id=callback_request_id,
     ):
         return
 
@@ -1225,9 +1239,9 @@ def _process(
         _send_to(sender, "Invalid session state")
         return
 
-    if _is_configured_approver(sender):
+    if _is_special_operator(sender):
         logger.info(
-            "ignored approver message sender=%s incoming=%s callback_rid=%s",
+            "ignored operator message sender=%s incoming=%s callback_rid=%s",
             sender,
             incoming,
             callback_request_id or "(none)",
