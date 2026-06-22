@@ -1448,7 +1448,7 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("maintenance flow submit failed sender=%s", sender)
-            elif keys & {"request_type", "destination_category", "vehicle_type"}:
+            elif keys & {"request_type", "destination_category", "load_size"}:
                 try:
                     vehicle_request.handle_flow_submission(
                         sender, response_json, VEHICLE_REQUEST_DEPS

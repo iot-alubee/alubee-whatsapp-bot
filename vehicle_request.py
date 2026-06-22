@@ -729,24 +729,13 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
 
     vehicle_type = _normalize_vehicle_type(_flow_pick(data, "vehicle_type"))
     if vehicle_type not in VEHICLE_TYPE_LABELS:
-        logger.warning(
-            "vehicle request parse failed: vehicle_type=%r raw=%r keys=%s",
-            vehicle_type,
-            _flow_pick(data, "vehicle_type"),
-            list(data.keys()),
-        )
-        return None
+        vehicle_type = "in_house"
 
     hire_type = ""
     if vehicle_type == "external_hire":
         hire_type = _normalize_id(_flow_pick(data, "hire_vehicle_type"))
         if hire_type not in HIRE_VEHICLE_TYPE_LABELS:
-            logger.warning(
-                "vehicle request parse failed: hire_vehicle_type=%r keys=%s",
-                hire_type,
-                list(data.keys()),
-            )
-            return None
+            hire_type = ""
 
     load_size = _normalize_id(_flow_pick(data, "load_size"))
     if load_size not in LOAD_SIZE_LABELS:
