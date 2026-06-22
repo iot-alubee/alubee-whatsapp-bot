@@ -967,6 +967,41 @@ def _is_cancel_label(raw: str) -> bool:
     return key in ("cancel", "cancelled", "cancel_request")
 
 
+def _is_reassign_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("re_assign", "reassign", "re_assign_trip", "reassign_trip")
+
+
+def _pending_manage_action_request_id(sender: str, deps: VehicleRequestDeps) -> str:
+    snap = deps.session_ref(sender).get()
+    if not snap.exists:
+        return ""
+    data = snap.to_dict() or {}
+    if data.get("state") != SESSION_WAITING_VEHICLE_MANAGE_ACTION:
+        return ""
+    return (data.get("vehicle_manage_request_id") or "").strip()
+
+
+def _resolve_manage_action_request_id(
+    incoming: str,
+    sender: str,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
+    want: str,
+) -> str | None:
+    """Map Manage Quick Reply (Re Assign/Cancel) + callbackData to request id."""
+    raw = (incoming or "").strip()
+    if want == "reassign" and not _is_reassign_label(raw):
+        return None
+    if want == "cancel" and not _is_cancel_label(raw):
+        return None
+    cb_rid = (callback_request_id or "").strip()
+    if cb_rid:
+        return cb_rid
+    return _pending_manage_action_request_id(sender, deps) or None
+
+
 def _pending_manager_notify_request_id(sender: str, deps: VehicleRequestDeps) -> str:
     snap = deps.session_ref(sender).get()
     if not snap.exists:
@@ -1435,7 +1470,11 @@ def _send_manage_actions(
 
 
 def handle_manager_manage_gate(
-    sender: str, incoming: str, deps: VehicleRequestDeps
+    sender: str,
+    incoming: str,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
 ) -> bool:
     if not is_logistics_manager(sender, deps.same_whatsapp):
         return False
@@ -1455,10 +1494,26 @@ def handle_manager_manage_gate(
         return True
 
     request_id = _parse_vehicle_action(incoming, "VMCANCEL_")
+    if not request_id:
+        request_id = _resolve_manage_action_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="cancel",
+        )
     if request_id:
         return _handle_manage_cancel(sender, request_id, deps)
 
     request_id = _parse_vehicle_action(incoming, "VMREASSIGN_")
+    if not request_id:
+        request_id = _resolve_manage_action_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="reassign",
+        )
     if request_id:
         return _handle_manage_reassign_click(sender, request_id, deps)
 
@@ -1466,17 +1521,38 @@ def handle_manager_manage_gate(
 
 
 def handle_manager_manage_action(
-    sender: str, incoming: str, session: dict, deps: VehicleRequestDeps
+    sender: str,
+    incoming: str,
+    session: dict,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
 ) -> None:
     if not is_logistics_manager(sender, deps.same_whatsapp):
         deps.clear_session(sender)
         return
     session_rid = (session or {}).get("vehicle_manage_request_id") or ""
     request_id = _parse_vehicle_action(incoming, "VMCANCEL_")
+    if not request_id:
+        request_id = _resolve_manage_action_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="cancel",
+        )
     if request_id and (not session_rid or request_id == session_rid):
         _handle_manage_cancel(sender, request_id, deps)
         return
     request_id = _parse_vehicle_action(incoming, "VMREASSIGN_")
+    if not request_id:
+        request_id = _resolve_manage_action_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="reassign",
+        )
     if request_id and (not session_rid or request_id == session_rid):
         _handle_manage_reassign_click(sender, request_id, deps)
         return
@@ -1584,9 +1660,21 @@ def _handle_manage_reassign_click(
         )
     except Exception:
         logger.exception("vehicle reassign list failed request_id=%s", request_id)
-        deps.clear_session(sender)
-        lines = "\n".join(f"• {label}" for _c, label in options)
-        deps.send_to(sender, f"Select new assignee:\n{lines}")
+        numbered: dict[str, str] = {}
+        lines: list[str] = []
+        for idx, (code, label) in enumerate(options, start=1):
+            numbered[str(idx)] = code
+            lines.append(f"{idx}. {_sentence_case_name(label)}")
+        deps.session_merge(
+            sender,
+            state=SESSION_WAITING_VEHICLE_REASSIGN,
+            vehicle_reassign_request_id=request_id,
+            vehicle_reassign_options=numbered,
+        )
+        deps.send_to(
+            sender,
+            "Select new assignee — reply with the number:\n" + "\n".join(lines),
+        )
     return True
 
 
@@ -1621,10 +1709,23 @@ def handle_vehicle_reassign_pick(
         return
     session_rid = (session or {}).get("vehicle_reassign_request_id") or ""
     parsed = _parse_vreassign(incoming, request_id_hint=session_rid)
-    if not parsed:
+    assignee_code = ""
+    request_id = session_rid
+
+    if parsed:
+        request_id, assignee_code = parsed
+    else:
+        pick = (incoming or "").strip()
+        opts = (session or {}).get("vehicle_reassign_options") or {}
+        if pick.isdigit() and pick in opts and session_rid:
+            assignee_code = str(opts[pick]).strip().lower()
+        else:
+            deps.send_to(sender, "Please pick a new assignee from the list.")
+            return
+
+    if not assignee_code:
         deps.send_to(sender, "Please pick a new assignee from the list.")
         return
-    request_id, assignee_code = parsed
     if session_rid and request_id != session_rid:
         deps.clear_session(sender)
         deps.send_to(sender, "Session expired. Try Manage again.")

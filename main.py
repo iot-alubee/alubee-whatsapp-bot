@@ -855,7 +855,10 @@ def _extract_message(message_field) -> str:
             bid = str(br.get("id") or "").strip()
             btitle = str(br.get("title") or "").strip()
             if bid.upper().startswith(
-                ("APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_")
+                (
+                    "APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_",
+                    "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
+                )
             ):
                 return bid
             if btitle:
@@ -867,7 +870,10 @@ def _extract_message(message_field) -> str:
             bid = str(br.get("id") or "").strip()
             btitle = str(br.get("title") or "").strip()
             if bid.upper().startswith(
-                ("APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_")
+                (
+                    "APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_",
+                    "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
+                )
             ):
                 return bid
             if btitle:
@@ -1086,8 +1092,10 @@ def _process(
             _send_approver_availability_menu(sender, current)
             return
         if vehicle_request.is_logistics_manager(sender, _same_whatsapp):
-            _session_merge(sender, state=SESSION_MENU_IDLE, employee_name="Logistics Manager")
-            vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
+            exists, ud = bot_shared.get_user_record(sender)
+            name = _chat_name((ud or {}).get("name") or "Logistics Manager")
+            _session_merge(sender, state=SESSION_MENU_IDLE, employee_name=name)
+            _send_main_menu(sender, name, ud if exists else {"name": name})
             return
         if exists and ud:
             name = ud.get("name", "Employee")
@@ -1112,7 +1120,10 @@ def _process(
         return
 
     if vehicle_request.handle_manager_manage_gate(
-        sender, incoming, VEHICLE_REQUEST_DEPS
+        sender,
+        incoming,
+        VEHICLE_REQUEST_DEPS,
+        callback_request_id=callback_request_id,
     ):
         return
 
@@ -1170,7 +1181,11 @@ def _process(
 
     if vehicle_request.is_vehicle_manage_action_state(state):
         vehicle_request.handle_manager_manage_action(
-            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+            sender,
+            incoming,
+            session or {},
+            VEHICLE_REQUEST_DEPS,
+            callback_request_id=callback_request_id,
         )
         return
 
