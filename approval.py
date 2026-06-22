@@ -910,43 +910,84 @@ def _set_pending_approval(recipient: str, request_id: str) -> None:
     )
 
 
-def resolve_approval(incoming: str, approver: str):
+def _approval_button_action(raw: str) -> bool | None:
+    """True = approve, False = deny, None = not a template quick-reply label."""
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if key in ("approve", "approved", "yes", "accept", "accepted"):
+        return True
+    if key in ("deny", "denied", "reject", "rejected", "decline", "declined", "no"):
+        return False
+    return None
+
+
+def _is_manage_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("manage", "reduce", "edit")
+
+
+def _pending_approval_request_id(approver: str) -> str:
+    d = _require()
+    snap = d.session_ref(approver).get()
+    if not snap.exists:
+        return ""
+    data = snap.to_dict() or {}
+    if data.get("state") != "WAITING_APPROVAL_ACTION":
+        return ""
+    return (data.get("approval_request_id") or "").strip()
+
+
+def resolve_approval(
+    incoming: str,
+    approver: str,
+    *,
+    callback_request_id: str = "",
+):
     d = _require()
     raw = (incoming or "").strip()
     upper = raw.upper()
+    cb_rid = (callback_request_id or "").strip()
+
     if upper.startswith("APPROVE_"):
         rid = raw.split("_", 1)[1].strip()
         return (True, rid) if rid else (None, None)
     if upper.startswith("DENY_"):
         rid = raw.split("_", 1)[1].strip()
         return (False, rid) if rid else (None, None)
+
+    action = _approval_button_action(raw)
+    if cb_rid and action is not None:
+        return action, cb_rid
+
     if upper in ("APPROVE", "DENY"):
-        snap = d.session_ref(approver).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            if data.get("state") == "WAITING_APPROVAL_ACTION":
-                rid = (data.get("approval_request_id") or "").strip()
-                if rid:
-                    return upper == "APPROVE", rid
+        rid = _pending_approval_request_id(approver)
+        if rid:
+            return upper == "APPROVE", rid
+
+    if action is not None:
+        rid = _pending_approval_request_id(approver)
+        if rid:
+            return action, rid
+
     return None, None
 
 
 def resolve_leave_manage_request_id(
-    incoming: str, approver: str = ""
+    incoming: str,
+    approver: str = "",
+    *,
+    callback_request_id: str = "",
 ) -> str | None:
     raw = (incoming or "").strip()
+    cb_rid = (callback_request_id or "").strip()
+    if cb_rid and _is_manage_label(raw):
+        return cb_rid
     if raw.upper().startswith("MANAGE_"):
         rid = raw.split("_", 1)[1].strip()
         return rid or None
-    if raw.upper() == "MANAGE" and approver:
-        d = _require()
-        snap = d.session_ref(approver).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            if data.get("state") == "WAITING_APPROVAL_ACTION":
-                rid = (data.get("approval_request_id") or "").strip()
-                if rid:
-                    return rid
+    if _is_manage_label(raw) and approver:
+        rid = _pending_approval_request_id(approver)
+        if rid:
+            return rid
     return None
 
 
@@ -958,9 +999,16 @@ def _resend_leave_approval_buttons(sender: str, rd: dict, request_id: str) -> No
     notify_approver(sender, rd, request_id)
 
 
-def handle_leave_manage_gate(sender: str, incoming: str) -> bool:
+def handle_leave_manage_gate(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> bool:
     """Start reduce-leave flow when approver taps Manage."""
-    request_id = resolve_leave_manage_request_id(incoming, sender)
+    request_id = resolve_leave_manage_request_id(
+        incoming, sender, callback_request_id=callback_request_id
+    )
     if not request_id:
         return False
 
@@ -1336,9 +1384,16 @@ def _request_type_label(rd: dict) -> str:
     return "OD"
 
 
-def handle_approval_gate(sender: str, incoming: str) -> bool:
+def handle_approval_gate(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> bool:
     d = _require()
-    resolved = resolve_approval(incoming, sender)
+    resolved = resolve_approval(
+        incoming, sender, callback_request_id=callback_request_id
+    )
     if resolved[0] is None:
         return False
 

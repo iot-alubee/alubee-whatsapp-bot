@@ -852,11 +852,28 @@ def _extract_message(message_field) -> str:
                 return str(lr["id"])
         if message_field.get("type") == "button_reply":
             br = message_field.get("button_reply") or {}
-            if br.get("id"):
-                return str(br["id"])
+            bid = str(br.get("id") or "").strip()
+            btitle = str(br.get("title") or "").strip()
+            if bid.upper().startswith(
+                ("APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_")
+            ):
+                return bid
+            if btitle:
+                return btitle
+            if bid:
+                return bid
         br = message_field.get("button_reply")
-        if isinstance(br, dict) and br.get("id"):
-            return str(br["id"])
+        if isinstance(br, dict):
+            bid = str(br.get("id") or "").strip()
+            btitle = str(br.get("title") or "").strip()
+            if bid.upper().startswith(
+                ("APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_")
+            ):
+                return bid
+            if btitle:
+                return btitle
+            if bid:
+                return bid
         lr = message_field.get("list_reply")
         if isinstance(lr, dict) and lr.get("id"):
             return str(lr["id"])
@@ -876,6 +893,42 @@ def _extract_message(message_field) -> str:
         except json.JSONDecodeError:
             pass
     return raw
+
+
+def _callback_from_meta(meta: object) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    for key in ("callback_data", "callbackData"):
+        val = meta.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = _callback_from_meta(val)
+            if nested:
+                return nested
+    source = meta.get("source_data")
+    if isinstance(source, dict):
+        nested = _callback_from_meta(source)
+        if nested:
+            return nested
+    return ""
+
+
+def _extract_webhook_callback_request_id(body: dict) -> str:
+    """Request id echoed when approver taps a template quick-reply (callbackData)."""
+    data = body.get("data") or {}
+    msg_obj = data.get("message") or {}
+    for candidate in (body, data, msg_obj):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("callbackData", "callback_data"):
+            val = (candidate.get(key) or "").strip()
+            if val:
+                return val
+        rid = _callback_from_meta(candidate.get("meta_data"))
+        if rid:
+            return rid
+    return ""
 
 
 def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
@@ -950,7 +1003,7 @@ def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
     return phone_to_wa_id(phone), response, callback or "flow"
 
 
-def _parse_webhook(body: dict) -> tuple[str, str] | None:
+def _parse_webhook(body: dict) -> tuple[str, str, str] | None:
     wtype = (body.get("type") or "").strip()
     if wtype != "message_received":
         return None
@@ -968,15 +1021,35 @@ def _parse_webhook(body: dict) -> tuple[str, str] | None:
     if _is_interactive_flow_message(raw_msg):
         return None
     incoming = _normalize_choice(_extract_message(raw_msg))
+    callback_rid = _extract_webhook_callback_request_id(body)
     logger.info(
-        "parsed incoming=%s content_type=%s",
+        "parsed incoming=%s callback_rid=%s content_type=%s",
         incoming,
+        callback_rid or "(none)",
         msg_obj.get("message_content_type"),
     )
-    return wa_id, incoming
+    return wa_id, incoming, callback_rid
 
 
-def _process(sender: str, incoming: str) -> None:
+def _is_configured_approver(sender: str) -> bool:
+    return bool(
+        approver_availability.approver_role_for_sender(
+            sender,
+            md=MD_WHATSAPP_NUMBER,
+            jmd_i=JMD_I_WHATSAPP_NUMBER,
+            jmd_ii=JMD_II_WHATSAPP_NUMBER,
+            same_whatsapp=_same_whatsapp,
+            test_md=TEST_MD_WHATSAPP_NUMBER,
+        )
+    )
+
+
+def _process(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> None:
     logger.info("process sender=%s incoming=%s", sender, incoming)
 
     if incoming.lower() in ("hi", "hello"):
@@ -1019,7 +1092,9 @@ def _process(sender: str, incoming: str) -> None:
     if _try_handle_approver_availability(sender, incoming):
         return
 
-    if approval.handle_leave_manage_gate(sender, incoming):
+    if approval.handle_leave_manage_gate(
+        sender, incoming, callback_request_id=callback_request_id
+    ):
         return
 
     if vehicle_request.handle_assignee_gate(sender, incoming, VEHICLE_REQUEST_DEPS):
@@ -1035,7 +1110,9 @@ def _process(sender: str, incoming: str) -> None:
     ):
         return
 
-    if approval.handle_approval_gate(sender, incoming):
+    if approval.handle_approval_gate(
+        sender, incoming, callback_request_id=callback_request_id
+    ):
         return
 
     session_doc = _session_ref(sender).get()
@@ -1146,6 +1223,15 @@ def _process(sender: str, incoming: str) -> None:
 
     if session_doc.exists:
         _send_to(sender, "Invalid session state")
+        return
+
+    if _is_configured_approver(sender):
+        logger.info(
+            "ignored approver message sender=%s incoming=%s callback_rid=%s",
+            sender,
+            incoming,
+            callback_request_id or "(none)",
+        )
         return
 
     _send_to(sender, "Send Hi to start.")
@@ -1355,11 +1441,15 @@ async def webhook(request: Request):
 
     parsed = _parse_webhook(body)
     if parsed:
-        sender, incoming = parsed
+        sender, incoming, callback_rid = parsed
         try:
             for attempt in range(2):
                 try:
-                    _process(sender, incoming)
+                    _process(
+                        sender,
+                        incoming,
+                        callback_request_id=callback_rid,
+                    )
                     break
                 except Exception as e:
                     if attempt == 0 and _is_transient_error(e):
