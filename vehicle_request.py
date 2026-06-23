@@ -36,9 +36,12 @@ VEHICLE_REQUEST_OPEN_STATUSES = frozenset({
     "PENDING", "ASSIGNED", "STARTED", "IN_PROGRESS",
 })
 SESSION_WAITING_VEHICLE_ASSIGN = "WAITING_VEHICLE_ASSIGN_PICK"
+SESSION_WAITING_VEHICLE_ASSIGN_TYPE = "WAITING_VEHICLE_ASSIGN_TYPE"
+SESSION_WAITING_VEHICLE_FLEET_PICK = "WAITING_VEHICLE_FLEET_PICK"
 SESSION_WAITING_VEHICLE_MANAGER_NOTIFY = "WAITING_VEHICLE_MANAGER_NOTIFY"
 SESSION_WAITING_VEHICLE_MANAGE_ACTION = "WAITING_VEHICLE_MANAGE_ACTION"
 SESSION_WAITING_VEHICLE_REASSIGN = "WAITING_VEHICLE_REASSIGN_PICK"
+SESSION_WAITING_VEHICLE_REASSIGN_FLEET = "WAITING_VEHICLE_REASSIGN_FLEET_PICK"
 
 REQUEST_TYPE_LABELS = {
     "delivery": "Delivery",
@@ -138,6 +141,13 @@ EXTERNAL_VENDORS: list[tuple[str, str]] = [
     ("challa_transport", "Challa Transport"),
     ("sridhar_transport", "Sridhar Transport"),
     ("chella_transport", "Chella Transport"),
+]
+
+INTERNAL_FLEET_VEHICLES: list[tuple[str, str]] = [
+    ("dost_3371", "Dost-3371"),
+    ("dost_2568", "Dost-2568"),
+    ("santro_2004", "Santro-2004"),
+    ("santa_fe_1666", "Santa FE-1666"),
 ]
 
 _EXTERNAL_VENDOR_LABELS: dict[str, str] = dict(EXTERNAL_VENDORS)
@@ -350,6 +360,18 @@ def _staff_wa_for_assignee_code(
 
 def is_vehicle_assign_state(state: str | None) -> bool:
     return (state or "").strip() == SESSION_WAITING_VEHICLE_ASSIGN
+
+
+def is_vehicle_assign_type_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_VEHICLE_ASSIGN_TYPE
+
+
+def is_vehicle_fleet_pick_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_VEHICLE_FLEET_PICK
+
+
+def is_vehicle_reassign_fleet_pick_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_VEHICLE_REASSIGN_FLEET
 
 
 def _flow_template_env_name() -> str:
@@ -911,6 +933,450 @@ def _assign_option_map(db: object, vehicle_type: str) -> dict[str, str]:
     return dict(_assign_options(db, vehicle_type))
 
 
+def _fleet_vehicle_map() -> dict[str, str]:
+    return dict(INTERNAL_FLEET_VEHICLES)
+
+
+def _show_fleet_vehicle_list(
+    sender: str,
+    request_id: str,
+    assignee_code: str,
+    assignee_label: str,
+    vehicle_type: str,
+    deps: VehicleRequestDeps,
+    *,
+    mode: str = "assign",
+) -> bool:
+    options = list(INTERNAL_FLEET_VEHICLES)
+    if not options:
+        deps.send_to(sender, "No internal vehicles configured.")
+        return True
+    vtype = _normalize_vehicle_type(vehicle_type)
+    is_reassign = (mode or "").strip().lower() == "reassign"
+    state = SESSION_WAITING_VEHICLE_REASSIGN_FLEET if is_reassign else SESSION_WAITING_VEHICLE_FLEET_PICK
+    session_fields = {
+        "state": state,
+        "vehicle_fleet_request_id": request_id,
+        "vehicle_fleet_vehicle_type": vtype,
+        "vehicle_fleet_assignee_code": assignee_code,
+        "vehicle_fleet_assignee_label": assignee_label,
+    }
+    if is_reassign:
+        session_fields["vehicle_reassign_request_id"] = request_id
+        session_fields["vehicle_reassign_vehicle_type"] = vtype
+    else:
+        session_fields["vehicle_assign_request_id"] = request_id
+        session_fields["vehicle_assign_vehicle_type"] = vtype
+    deps.session_merge(sender, **session_fields)
+    list_rows = [
+        {
+            "id": f"VFLEET_{request_id}_{code}"[:256],
+            "title": label[:24],
+        }
+        for code, label in options
+    ]
+    try:
+        send_list_menu(
+            wa_id_to_phone(sender),
+            f"Select vehicle for {_sentence_case_name(assignee_label)}:",
+            list_rows,
+            button_label="Vehicle",
+            section_title="Vehicles",
+            callback_data=request_id,
+        )
+    except Exception:
+        logger.exception("vehicle fleet list failed request_id=%s", request_id)
+        numbered: dict[str, str] = {}
+        lines: list[str] = []
+        for idx, (code, label) in enumerate(options, start=1):
+            numbered[str(idx)] = code
+            lines.append(f"{idx}. {label}")
+        deps.session_merge(sender, vehicle_fleet_options=numbered, **session_fields)
+        deps.send_to(
+            sender,
+            "Select vehicle — reply with the number:\n" + "\n".join(lines),
+        )
+    return True
+
+
+def _parse_vfleet(incoming: str, *, request_id_hint: str = "") -> tuple[str, str] | None:
+    raw = (incoming or "").strip()
+    if not raw.upper().startswith("VFLEET_"):
+        return None
+    rid_hint = (request_id_hint or "").strip()
+    if rid_hint:
+        prefix = f"VFLEET_{rid_hint}_"
+        if raw.startswith(prefix):
+            code = raw[len(prefix):].strip().lower()
+            if code:
+                return rid_hint, code
+    body = raw[7:]
+    parts = body.split("_", 1)
+    if len(parts) != 2:
+        return None
+    rid, code = parts[0].strip(), parts[1].strip().lower()
+    if rid and code:
+        return rid, code
+    return None
+
+
+def _complete_vehicle_assignment(
+    sender: str,
+    request_id: str,
+    rd: dict,
+    ref: object,
+    *,
+    vtype: str,
+    assignee_code: str,
+    assignee_label: str,
+    staff_wa: str,
+    fleet_vehicle_code: str = "",
+    fleet_vehicle_label: str = "",
+    reassign: bool = False,
+    old_wa: str = "",
+    old_name: str = "",
+    deps: VehicleRequestDeps,
+) -> None:
+    is_internal = vtype == "in_house"
+    update = {
+        "vehicle_request_status": "ASSIGNED",
+        "vehicle_type": vtype,
+        "vehicle_type_label": VEHICLE_TYPE_LABELS.get(vtype, vtype),
+        "assigned_to": assignee_label,
+        "assigned_to_code": assignee_code,
+        "assigned_to_wa": staff_wa,
+        "assigned_by": sender,
+        "assigned_at": deps.utcnow(),
+        "assignee_can_start": is_internal,
+        "is_active_trip": False,
+    }
+    if fleet_vehicle_code:
+        update["fleet_vehicle_code"] = fleet_vehicle_code
+        update["fleet_vehicle_label"] = fleet_vehicle_label
+    elif not is_internal:
+        update["fleet_vehicle_code"] = ""
+        update["fleet_vehicle_label"] = ""
+    if reassign:
+        update["previous_assignee"] = old_name
+        update["previous_assignee_code"] = _normalize_id(rd.get("assigned_to_code") or "")
+        update["previous_assignee_wa"] = old_wa
+        update["reassigned_at"] = deps.utcnow()
+    ref.update(update)
+    updated = ref.get().to_dict() or rd
+    _notify_internal_assignee(
+        deps,
+        updated,
+        assignee_code=assignee_code,
+        assignee_label=assignee_label,
+        request_id=request_id,
+    )
+    assignee_display = _sentence_case_name(assignee_label)
+    vehicle_line = f"\nVehicle: {fleet_vehicle_label}" if fleet_vehicle_label else ""
+    if reassign and old_wa:
+        deps.send_to(
+            old_wa,
+            f"The request has been re-assigned to {assignee_display}. Thanks.",
+        )
+    employee = (rd.get("employee") or "").strip()
+    if employee:
+        if reassign:
+            msg = f"Your vehicle request has been re-assigned to {assignee_display}."
+        else:
+            msg = f"Your vehicle request has been assigned to {assignee_display}.{vehicle_line}"
+        deps.send_to(employee, msg)
+    if reassign:
+        deps.send_to(sender, f"Re-assigned to {assignee_display}.{vehicle_line}")
+    else:
+        deps.send_to(sender, f"Assigned to {assignee_display}.{vehicle_line}")
+    deps.clear_session(sender)
+
+
+def _is_internal_type_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("internal", "in_house", "company_vehicle")
+
+
+def _is_external_type_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("external", "external_hire", "hire", "external_vehicle")
+
+
+def _vehicle_type_from_type_pick(incoming: str) -> str | None:
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+    if upper.startswith("VTYPE_INT_"):
+        return "in_house"
+    if upper.startswith("VTYPE_EXT_"):
+        return "external_hire"
+    if _is_internal_type_label(raw):
+        return "in_house"
+    if _is_external_type_label(raw):
+        return "external_hire"
+    return None
+
+
+def _request_id_from_type_pick(incoming: str) -> str:
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+    for prefix in ("VTYPE_INT_", "VTYPE_EXT_"):
+        if upper.startswith(prefix):
+            return raw[len(prefix) :].strip()
+    return ""
+
+
+def _assign_type_pick_session(sender: str, deps: VehicleRequestDeps) -> dict:
+    snap = deps.session_ref(sender).get()
+    if not snap.exists:
+        return {}
+    data = snap.to_dict() or {}
+    if data.get("state") != SESSION_WAITING_VEHICLE_ASSIGN_TYPE:
+        return {}
+    return data
+
+
+def _resolve_assign_type_pick(
+    incoming: str,
+    sender: str,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
+) -> tuple[str, str] | None:
+    """Return (request_id, in_house|external_hire) when manager picks Internal/External."""
+    vtype = _vehicle_type_from_type_pick(incoming)
+    if not vtype:
+        return None
+    rid = _request_id_from_type_pick(incoming)
+    if not rid:
+        rid = (callback_request_id or "").strip()
+    if not rid:
+        rid = (_assign_type_pick_session(sender, deps).get("vehicle_type_pick_request_id") or "").strip()
+    if not rid:
+        return None
+    return rid, vtype
+
+
+def _prompt_vehicle_type_choice(
+    sender: str,
+    request_id: str,
+    deps: VehicleRequestDeps,
+    *,
+    mode: str,
+) -> None:
+    """Ask Internal vs External before showing assignee list."""
+    rid = (request_id or "").strip()
+    deps.session_merge(
+        sender,
+        state=SESSION_WAITING_VEHICLE_ASSIGN_TYPE,
+        vehicle_type_pick_request_id=rid,
+        vehicle_type_pick_mode=(mode or "assign").strip().lower(),
+    )
+    int_id = f"VTYPE_INT_{rid}"[:256]
+    ext_id = f"VTYPE_EXT_{rid}"[:256]
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            "Select vehicle type:",
+            [(int_id, "Internal"), (ext_id, "External")],
+            callback_data=rid,
+            ensure_contact=True,
+            contact_name="Logistics Manager",
+        )
+    except Exception:
+        logger.exception("vehicle type choice failed request_id=%s", rid)
+        deps.send_to(
+            sender,
+            "Select vehicle type:\n1. Internal\n2. External\n\nReply 1 or 2.",
+        )
+        deps.session_merge(
+            sender,
+            state=SESSION_WAITING_VEHICLE_ASSIGN_TYPE,
+            vehicle_type_pick_request_id=rid,
+            vehicle_type_pick_mode=(mode or "assign").strip().lower(),
+            vehicle_type_pick_numeric=True,
+        )
+
+
+def _show_assignee_list(
+    sender: str,
+    request_id: str,
+    vehicle_type: str,
+    deps: VehicleRequestDeps,
+) -> bool:
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "Vehicle request not found.")
+        return True
+    _ref, rd = loaded
+    if _request_status(rd) != "PENDING":
+        deps.send_to(sender, f"Request already {_request_status(rd).lower()}.")
+        return True
+
+    vtype = _normalize_vehicle_type(vehicle_type)
+    options = _assign_options(deps.db, vtype)
+    if not options:
+        label = "internal staff" if vtype == "in_house" else "external vendors"
+        deps.send_to(
+            sender,
+            f"No {label} available.\nPlease update users in Firestore or contact admin.",
+        )
+        return True
+
+    type_label = VEHICLE_TYPE_LABELS.get(vtype, vtype)
+    rows = [
+        (f"VASSIGN_{request_id}_{code}"[:256], label)
+        for code, label in options
+    ]
+    list_rows = [{"id": rid, "title": _sentence_case_name(label)[:24]} for rid, label in rows]
+    deps.session_merge(
+        sender,
+        state=SESSION_WAITING_VEHICLE_ASSIGN,
+        vehicle_assign_request_id=request_id,
+        vehicle_assign_vehicle_type=vtype,
+    )
+    try:
+        send_list_menu(
+            wa_id_to_phone(sender),
+            f"Select {type_label.lower()} to assign:",
+            list_rows,
+            button_label="Assign",
+            section_title="Assign",
+            callback_data=request_id,
+        )
+    except Exception:
+        logger.exception("vehicle assign list failed request_id=%s", request_id)
+        numbered: dict[str, str] = {}
+        lines: list[str] = []
+        for idx, (code, label) in enumerate(options, start=1):
+            numbered[str(idx)] = code
+            lines.append(f"{idx}. {_sentence_case_name(label)}")
+        deps.session_merge(
+            sender,
+            state=SESSION_WAITING_VEHICLE_ASSIGN,
+            vehicle_assign_request_id=request_id,
+            vehicle_assign_vehicle_type=vtype,
+            vehicle_assign_options=numbered,
+        )
+        deps.send_to(
+            sender,
+            f"Select {type_label.lower()} to assign — reply with the number:\n"
+            + "\n".join(lines),
+        )
+    return True
+
+
+def _show_reassignee_list(
+    sender: str,
+    request_id: str,
+    vehicle_type: str,
+    deps: VehicleRequestDeps,
+) -> bool:
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "Vehicle request not found.")
+        return True
+    _ref, rd = loaded
+    if _trip_started(rd):
+        deps.send_to(
+            sender,
+            "This trip has already started. Re Assign is not allowed.",
+        )
+        deps.clear_session(sender)
+        return True
+    if _request_status(rd) != "ASSIGNED":
+        deps.send_to(sender, "Only assigned requests can be re-assigned.")
+        deps.clear_session(sender)
+        return True
+
+    vtype = _normalize_vehicle_type(vehicle_type)
+    current_code = _normalize_id(rd.get("assigned_to_code") or "")
+    options = [
+        (code, label)
+        for code, label in _assign_options(deps.db, vtype)
+        if code != current_code
+    ]
+    if not options:
+        deps.send_to(sender, "No other assignee available for this type.")
+        return True
+
+    type_label = VEHICLE_TYPE_LABELS.get(vtype, vtype)
+    list_rows = [
+        {
+            "id": f"VREASSIGN_{request_id}_{code}"[:256],
+            "title": _sentence_case_name(label)[:24],
+        }
+        for code, label in options
+    ]
+    deps.session_merge(
+        sender,
+        state=SESSION_WAITING_VEHICLE_REASSIGN,
+        vehicle_reassign_request_id=request_id,
+        vehicle_reassign_vehicle_type=vtype,
+    )
+    try:
+        send_list_menu(
+            wa_id_to_phone(sender),
+            f"Select new {type_label.lower()} assignee:",
+            list_rows,
+            button_label="Re Assign",
+            section_title="Assignee",
+            callback_data=request_id,
+        )
+    except Exception:
+        logger.exception("vehicle reassign list failed request_id=%s", request_id)
+        numbered: dict[str, str] = {}
+        lines: list[str] = []
+        for idx, (code, label) in enumerate(options, start=1):
+            numbered[str(idx)] = code
+            lines.append(f"{idx}. {_sentence_case_name(label)}")
+        deps.session_merge(
+            sender,
+            state=SESSION_WAITING_VEHICLE_REASSIGN,
+            vehicle_reassign_request_id=request_id,
+            vehicle_reassign_vehicle_type=vtype,
+            vehicle_reassign_options=numbered,
+        )
+        deps.send_to(
+            sender,
+            f"Select new {type_label.lower()} assignee — reply with the number:\n"
+            + "\n".join(lines),
+        )
+    return True
+
+
+def handle_vehicle_assign_type_pick(
+    sender: str,
+    incoming: str,
+    session: dict,
+    deps: VehicleRequestDeps,
+    *,
+    callback_request_id: str = "",
+) -> None:
+    if not is_logistics_manager(sender, deps.same_whatsapp):
+        deps.clear_session(sender)
+        return
+    session_data = session or _assign_type_pick_session(sender, deps)
+    if (session_data.get("vehicle_type_pick_numeric")
+        and (incoming or "").strip() == "1"):
+        vtype = "in_house"
+        rid = (session_data.get("vehicle_type_pick_request_id") or "").strip()
+    elif session_data.get("vehicle_type_pick_numeric") and (incoming or "").strip() == "2":
+        vtype = "external_hire"
+        rid = (session_data.get("vehicle_type_pick_request_id") or "").strip()
+    else:
+        resolved = _resolve_assign_type_pick(
+            incoming, sender, deps, callback_request_id=callback_request_id
+        )
+        if not resolved:
+            deps.send_to(sender, "Please choose Internal or External.")
+            return
+        rid, vtype = resolved
+    mode = (session_data.get("vehicle_type_pick_mode") or "assign").strip().lower()
+    if mode == "reassign":
+        _show_reassignee_list(sender, rid, vtype, deps)
+    else:
+        _show_assignee_list(sender, rid, vtype, deps)
+
+
 def _parse_vassign(
     incoming: str, *, request_id_hint: str = ""
 ) -> tuple[str, str] | None:
@@ -1158,6 +1624,17 @@ def handle_logistics_manager_gate(
     if not is_logistics_manager(sender, deps.same_whatsapp):
         return False
 
+    type_pick = _resolve_assign_type_pick(
+        incoming, sender, deps, callback_request_id=callback_request_id
+    )
+    if type_pick:
+        rid, vtype = type_pick
+        sess = _assign_type_pick_session(sender, deps)
+        mode = (sess.get("vehicle_type_pick_mode") or "assign").strip().lower()
+        if mode == "reassign":
+            return _show_reassignee_list(sender, rid, vtype, deps)
+        return _show_assignee_list(sender, rid, vtype, deps)
+
     request_id = _parse_vehicle_action(incoming, "VEHICLE_ASSIGN_")
     if not request_id:
         request_id = _resolve_manager_template_request_id(
@@ -1191,57 +1668,10 @@ def _handle_assign_click(sender: str, request_id: str, deps: VehicleRequestDeps)
         deps.send_to(sender, "Vehicle request not found.")
         return True
     _ref, rd = loaded
-    status = _request_status(rd)
-    if status != "PENDING":
-        deps.send_to(sender, f"Request already {status.lower()}.")
+    if _request_status(rd) != "PENDING":
+        deps.send_to(sender, f"Request already {_request_status(rd).lower()}.")
         return True
-
-    options = _assign_options(deps.db, rd.get("vehicle_type") or "")
-    if not options:
-        deps.send_to(
-            sender,
-            f"No staff found in {_logistics_department_name()} department.\n"
-            "Please update users in Firestore or contact admin.",
-        )
-        return True
-
-    rows = [
-        (f"VASSIGN_{request_id}_{code}"[:256], label)
-        for code, label in options
-    ]
-    list_rows = [{"id": rid, "title": _sentence_case_name(label)[:24]} for rid, label in rows]
-    deps.session_merge(
-        sender,
-        state=SESSION_WAITING_VEHICLE_ASSIGN,
-        vehicle_assign_request_id=request_id,
-    )
-    try:
-        send_list_menu(
-            wa_id_to_phone(sender),
-            "Select vehicle / transport to assign:",
-            list_rows,
-            button_label="Assign",
-            section_title="Assign",
-            callback_data=request_id,
-        )
-    except Exception:
-        logger.exception("vehicle assign list failed request_id=%s", request_id)
-        numbered: dict[str, str] = {}
-        lines: list[str] = []
-        for idx, (code, label) in enumerate(options, start=1):
-            numbered[str(idx)] = code
-            lines.append(f"{idx}. {_sentence_case_name(label)}")
-        deps.session_merge(
-            sender,
-            state=SESSION_WAITING_VEHICLE_ASSIGN,
-            vehicle_assign_request_id=request_id,
-            vehicle_assign_options=numbered,
-        )
-        deps.send_to(
-            sender,
-            "Select vehicle / transport to assign — reply with the number:\n"
-            + "\n".join(lines),
-        )
+    _prompt_vehicle_type_choice(sender, request_id, deps, mode="assign")
     return True
 
 
@@ -1293,11 +1723,11 @@ def handle_vehicle_assign_pick(
         if pick.isdigit() and pick in opts and session_rid:
             assignee_code = str(opts[pick]).strip().lower()
         else:
-            deps.send_to(sender, "Please pick a vehicle / transport from the list.")
+            deps.send_to(sender, "Please pick a driver or transport from the list.")
             return
 
     if not assignee_code:
-        deps.send_to(sender, "Please pick a vehicle / transport from the list.")
+        deps.send_to(sender, "Please pick a driver or transport from the list.")
         return
     if session_rid and request_id != session_rid:
         deps.send_to(sender, "Session expired. Tap Assign on the request again.")
@@ -1315,41 +1745,107 @@ def handle_vehicle_assign_pick(
         deps.send_to(sender, f"Request already {_request_status(rd).lower()}.")
         return
 
-    allowed = _assign_option_map(deps.db, rd.get("vehicle_type") or "")
+    allowed = _assign_option_map(
+        deps.db,
+        (session or {}).get("vehicle_assign_vehicle_type")
+        or rd.get("vehicle_type")
+        or "",
+    )
     assignee_label = allowed.get(assignee_code)
     if not assignee_label:
         deps.send_to(sender, "Invalid selection.")
         return
 
+    vtype = _normalize_vehicle_type(
+        (session or {}).get("vehicle_assign_vehicle_type")
+        or rd.get("vehicle_type")
+        or "in_house"
+    )
+    is_internal = vtype == "in_house"
+    if is_internal:
+        _show_fleet_vehicle_list(
+            sender,
+            request_id,
+            assignee_code,
+            assignee_label,
+            vtype,
+            deps,
+            mode="assign",
+        )
+        return
+
     staff = _staff_wa_for_assignee_code(deps.db, assignee_code)
     staff_wa = staff[0] if staff else ""
-    ref.update({
-        "vehicle_request_status": "ASSIGNED",
-        "assigned_to": assignee_label,
-        "assigned_to_code": assignee_code,
-        "assigned_to_wa": staff_wa,
-        "assigned_by": sender,
-        "assigned_at": deps.utcnow(),
-        "assignee_can_start": True,
-        "is_active_trip": False,
-    })
-    updated = ref.get().to_dict() or rd
-    _notify_internal_assignee(
-        deps,
-        updated,
+    _complete_vehicle_assignment(
+        sender,
+        request_id,
+        rd,
+        ref,
+        vtype=vtype,
         assignee_code=assignee_code,
         assignee_label=assignee_label,
-        request_id=request_id,
+        staff_wa=staff_wa,
+        deps=deps,
     )
-    assignee_display = _sentence_case_name(assignee_label)
-    employee = (rd.get("employee") or "").strip()
-    if employee:
-        deps.send_to(
-            employee,
-            f"Your vehicle request has been assigned to {assignee_display}.",
-        )
-    deps.send_to(sender, f"Assigned to {assignee_display}.")
-    deps.clear_session(sender)
+
+
+def handle_vehicle_fleet_pick(
+    sender: str, incoming: str, session: dict, deps: VehicleRequestDeps
+) -> None:
+    if not is_logistics_manager(sender, deps.same_whatsapp):
+        deps.clear_session(sender)
+        deps.send_to(sender, "Not authorized.")
+        return
+    session_rid = (session or {}).get("vehicle_fleet_request_id") or ""
+    parsed = _parse_vfleet(incoming, request_id_hint=session_rid)
+    fleet_code = ""
+    request_id = session_rid
+    if parsed:
+        request_id, fleet_code = parsed
+    else:
+        pick = (incoming or "").strip()
+        opts = (session or {}).get("vehicle_fleet_options") or {}
+        if pick.isdigit() and pick in opts and session_rid:
+            fleet_code = str(opts[pick]).strip().lower()
+    fleet_map = _fleet_vehicle_map()
+    fleet_label = fleet_map.get(fleet_code, "")
+    if not fleet_code or not fleet_label:
+        deps.send_to(sender, "Please pick a vehicle from the list.")
+        return
+    assignee_code = (session or {}).get("vehicle_fleet_assignee_code") or ""
+    assignee_label = (session or {}).get("vehicle_fleet_assignee_label") or ""
+    if not assignee_code or not assignee_label:
+        deps.clear_session(sender)
+        deps.send_to(sender, "Session expired. Tap Assign on the request again.")
+        return
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.clear_session(sender)
+        deps.send_to(sender, "Vehicle request not found.")
+        return
+    ref, rd = loaded
+    if _request_status(rd) != "PENDING":
+        deps.clear_session(sender)
+        deps.send_to(sender, f"Request already {_request_status(rd).lower()}.")
+        return
+    vtype = _normalize_vehicle_type(
+        (session or {}).get("vehicle_fleet_vehicle_type") or "in_house"
+    )
+    staff = _staff_wa_for_assignee_code(deps.db, assignee_code)
+    staff_wa = staff[0] if staff else ""
+    _complete_vehicle_assignment(
+        sender,
+        request_id,
+        rd,
+        ref,
+        vtype=vtype,
+        assignee_code=assignee_code,
+        assignee_label=assignee_label,
+        staff_wa=staff_wa,
+        fleet_vehicle_code=fleet_code,
+        fleet_vehicle_label=fleet_label,
+        deps=deps,
+    )
 
 
 def _fetch_today_vehicle_requests(db: object) -> list[tuple[str, dict]]:
@@ -1615,55 +2111,7 @@ def _handle_manage_reassign_click(
         deps.send_to(sender, "Only assigned requests can be re-assigned.")
         deps.clear_session(sender)
         return True
-
-    current_code = _normalize_id(rd.get("assigned_to_code") or "")
-    options = [
-        (code, label)
-        for code, label in _assign_options(deps.db, rd.get("vehicle_type") or "")
-        if code != current_code
-    ]
-    if not options:
-        deps.send_to(sender, "No other assignee available.")
-        return True
-
-    list_rows = [
-        {
-            "id": f"VREASSIGN_{request_id}_{code}"[:256],
-            "title": _sentence_case_name(label)[:24],
-        }
-        for code, label in options
-    ]
-    deps.session_merge(
-        sender,
-        state=SESSION_WAITING_VEHICLE_REASSIGN,
-        vehicle_reassign_request_id=request_id,
-    )
-    try:
-        send_list_menu(
-            wa_id_to_phone(sender),
-            "Select new assignee:",
-            list_rows,
-            button_label="Re Assign",
-            section_title="Assignee",
-            callback_data=request_id,
-        )
-    except Exception:
-        logger.exception("vehicle reassign list failed request_id=%s", request_id)
-        numbered: dict[str, str] = {}
-        lines: list[str] = []
-        for idx, (code, label) in enumerate(options, start=1):
-            numbered[str(idx)] = code
-            lines.append(f"{idx}. {_sentence_case_name(label)}")
-        deps.session_merge(
-            sender,
-            state=SESSION_WAITING_VEHICLE_REASSIGN,
-            vehicle_reassign_request_id=request_id,
-            vehicle_reassign_options=numbered,
-        )
-        deps.send_to(
-            sender,
-            "Select new assignee — reply with the number:\n" + "\n".join(lines),
-        )
+    _prompt_vehicle_type_choice(sender, request_id, deps, mode="reassign")
     return True
 
 
@@ -1736,7 +2184,12 @@ def handle_vehicle_reassign_pick(
         deps.send_to(sender, "Choose a different assignee.")
         return
 
-    allowed = _assign_option_map(deps.db, rd.get("vehicle_type") or "")
+    allowed = _assign_option_map(
+        deps.db,
+        (session or {}).get("vehicle_reassign_vehicle_type")
+        or rd.get("vehicle_type")
+        or "",
+    )
     assignee_label = allowed.get(assignee_code)
     if not assignee_label:
         deps.send_to(sender, "Invalid selection.")
@@ -1744,47 +2197,103 @@ def handle_vehicle_reassign_pick(
 
     old_wa = (rd.get("assigned_to_wa") or "").strip()
     old_name = (rd.get("assigned_to") or "").strip()
+    vtype = _normalize_vehicle_type(
+        (session or {}).get("vehicle_reassign_vehicle_type")
+        or rd.get("vehicle_type")
+        or "in_house"
+    )
+    is_internal = vtype == "in_house"
+    if is_internal:
+        _show_fleet_vehicle_list(
+            sender,
+            request_id,
+            assignee_code,
+            assignee_label,
+            vtype,
+            deps,
+            mode="reassign",
+        )
+        return
+
     staff = _staff_wa_for_assignee_code(deps.db, assignee_code)
     staff_wa = staff[0] if staff else ""
-
-    ref.update({
-        "assigned_to": assignee_label,
-        "assigned_to_code": assignee_code,
-        "assigned_to_wa": staff_wa,
-        "assigned_by": sender,
-        "assigned_at": deps.utcnow(),
-        "assignee_can_start": True,
-        "is_active_trip": False,
-        "previous_assignee": old_name,
-        "previous_assignee_code": old_code,
-        "previous_assignee_wa": old_wa,
-        "reassigned_at": deps.utcnow(),
-    })
-    updated = ref.get().to_dict() or rd
-
-    assignee_display = _sentence_case_name(assignee_label)
-
-    if old_wa:
-        deps.send_to(
-            old_wa,
-            f"The request has been re-assigned to {assignee_display}. Thanks.",
-        )
-
-    _notify_internal_assignee(
-        deps,
-        updated,
+    _complete_vehicle_assignment(
+        sender,
+        request_id,
+        rd,
+        ref,
+        vtype=vtype,
         assignee_code=assignee_code,
         assignee_label=assignee_label,
-        request_id=request_id,
+        staff_wa=staff_wa,
+        reassign=True,
+        old_wa=old_wa,
+        old_name=old_name,
+        deps=deps,
     )
-    employee = (rd.get("employee") or "").strip()
-    if employee:
-        deps.send_to(
-            employee,
-            f"Your vehicle request has been re-assigned to {assignee_display}.",
-        )
-    deps.send_to(sender, f"Re-assigned to {assignee_display}.")
-    deps.clear_session(sender)
+
+
+def handle_vehicle_reassign_fleet_pick(
+    sender: str, incoming: str, session: dict, deps: VehicleRequestDeps
+) -> None:
+    if not is_logistics_manager(sender, deps.same_whatsapp):
+        deps.clear_session(sender)
+        return
+    session_rid = (session or {}).get("vehicle_fleet_request_id") or ""
+    parsed = _parse_vfleet(incoming, request_id_hint=session_rid)
+    fleet_code = ""
+    request_id = session_rid
+    if parsed:
+        request_id, fleet_code = parsed
+    else:
+        pick = (incoming or "").strip()
+        opts = (session or {}).get("vehicle_fleet_options") or {}
+        if pick.isdigit() and pick in opts and session_rid:
+            fleet_code = str(opts[pick]).strip().lower()
+    fleet_map = _fleet_vehicle_map()
+    fleet_label = fleet_map.get(fleet_code, "")
+    if not fleet_code or not fleet_label:
+        deps.send_to(sender, "Please pick a vehicle from the list.")
+        return
+    assignee_code = (session or {}).get("vehicle_fleet_assignee_code") or ""
+    assignee_label = (session or {}).get("vehicle_fleet_assignee_label") or ""
+    if not assignee_code or not assignee_label:
+        deps.clear_session(sender)
+        deps.send_to(sender, "Session expired. Try Manage again.")
+        return
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.clear_session(sender)
+        deps.send_to(sender, "Vehicle request not found.")
+        return
+    ref, rd = loaded
+    if _request_status(rd) != "ASSIGNED":
+        deps.clear_session(sender)
+        deps.send_to(sender, "Request cannot be re-assigned now.")
+        return
+    old_wa = (rd.get("assigned_to_wa") or "").strip()
+    old_name = (rd.get("assigned_to") or "").strip()
+    vtype = _normalize_vehicle_type(
+        (session or {}).get("vehicle_fleet_vehicle_type") or "in_house"
+    )
+    staff = _staff_wa_for_assignee_code(deps.db, assignee_code)
+    staff_wa = staff[0] if staff else ""
+    _complete_vehicle_assignment(
+        sender,
+        request_id,
+        rd,
+        ref,
+        vtype=vtype,
+        assignee_code=assignee_code,
+        assignee_label=assignee_label,
+        staff_wa=staff_wa,
+        fleet_vehicle_code=fleet_code,
+        fleet_vehicle_label=fleet_label,
+        reassign=True,
+        old_wa=old_wa,
+        old_name=old_name,
+        deps=deps,
+    )
 
 
 def _deactivate_assignee_trips(

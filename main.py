@@ -1189,6 +1189,28 @@ def _process(
         )
         return
 
+    if vehicle_request.is_vehicle_assign_type_state(state):
+        vehicle_request.handle_vehicle_assign_type_pick(
+            sender,
+            incoming,
+            session or {},
+            VEHICLE_REQUEST_DEPS,
+            callback_request_id=callback_request_id,
+        )
+        return
+
+    if vehicle_request.is_vehicle_fleet_pick_state(state):
+        vehicle_request.handle_vehicle_fleet_pick(
+            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+        )
+        return
+
+    if vehicle_request.is_vehicle_reassign_fleet_pick_state(state):
+        vehicle_request.handle_vehicle_reassign_fleet_pick(
+            sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
+        )
+        return
+
     if vehicle_request.is_vehicle_assign_state(state):
         vehicle_request.handle_vehicle_assign_pick(
             sender, incoming, session or {}, VEHICLE_REQUEST_DEPS
