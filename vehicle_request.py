@@ -54,6 +54,7 @@ DESTINATION_CATEGORY_LABELS = {
     "customer": "Customer",
     "purchase": "Purchase",
     "transport_office": "Transport Office",
+    "other_unit": "Other Unit",
 }
 
 DESTINATION_LABELS = {
@@ -69,6 +70,8 @@ DESTINATION_LABELS = {
     "bagalur_road": "Bagalur Road",
     "seg_mould_inspection": "SEG Mould Inspection",
     "unit_1_to_unit_2": "Unit-1 to Unit-2",
+    "unit_i": "Unit I",
+    "unit_ii": "Unit II",
     "rajeshwari_layout": "Rajeshwari Layout",
     "kamal": "Kamal",
     "lakshmi_steels": "Lakshmi Steels",
@@ -90,6 +93,8 @@ DESTINATION_DISTANCE_KM: dict[str, int] = {
     "bagalur_road": 10,
     "seg_mould_inspection": 50,
     "unit_1_to_unit_2": 3,
+    "unit_i": 3,
+    "unit_ii": 3,
     "rajeshwari_layout": 5,
     "kamal": 2,
     "lakshmi_steels": 6,
@@ -154,7 +159,12 @@ _EXTERNAL_VENDOR_LABELS: dict[str, str] = dict(EXTERNAL_VENDORS)
 _EXTERNAL_VENDOR_CODES = frozenset(_EXTERNAL_VENDOR_LABELS)
 
 _MANUAL_CATEGORIES = frozenset({"purchase", "transport_office"})
-_DROPDOWN_CATEGORIES = frozenset({"supplier", "sub_contractor", "customer"})
+_DROPDOWN_CATEGORIES = frozenset({"supplier", "sub_contractor", "customer", "other_unit"})
+
+_OTHER_UNIT_DESTINATION_BY_FROM: dict[str, str] = {
+    "unit_i": "unit_ii",
+    "unit_ii": "unit_i",
+}
 
 VALID_DESTINATIONS_BY_CATEGORY: dict[str, frozenset[str]] = {
     "supplier": frozenset({
@@ -741,6 +751,10 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
 
     if category in _MANUAL_CATEGORIES:
         if not location:
+            return None
+    elif category == "other_unit":
+        expected = _OTHER_UNIT_DESTINATION_BY_FROM.get(from_unit)
+        if not expected or destination != expected:
             return None
     elif category in _DROPDOWN_CATEGORIES:
         allowed = VALID_DESTINATIONS_BY_CATEGORY.get(category, frozenset())
