@@ -448,12 +448,17 @@ def _assignee_notify_template_body_fields() -> list[str]:
     raw = (
         os.getenv("VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS")
         or os.getenv("VEHICLE_INTERNAL_ASSIGNEE_TEMPLATE_BODY_FIELDS")
-        or "assignee_name,requester,from,request_type,category,destination,time"
+        or "assignee_name,requester,from,request_type,category,destination,vehicle,time"
     ).strip()
     return [k.strip().lower() for k in raw.split(",") if k.strip()]
 
 
 def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, str]:
+    vehicle = (
+        (rd.get("fleet_vehicle_label") or "").strip()
+        or (rd.get("external_vehicle_number") or "").strip()
+        or "—"
+    )
     return {
         "assignee_name": _sentence_case_name(assignee_name or "—"),
         "requester": _sentence_case_name(rd.get("employee_name") or "—"),
@@ -461,6 +466,7 @@ def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, 
         "request_type": rd.get("request_type_label") or "—",
         "category": rd.get("destination_category_label") or "—",
         "destination": rd.get("destination_label") or "—",
+        "vehicle": vehicle,
         "time": rd.get("required_at") or "—",
     }
 
@@ -475,6 +481,7 @@ def _assignee_notify_body(rd: dict, assignee_name: str) -> str:
         f"Request Type: {v['request_type']}\n"
         f"Category: {v['category']}\n"
         f"Destination: {v['destination']}\n"
+        f"Vehicle: {v['vehicle']}\n"
         f"Time: {v['time']}\n\n"
         "Click 'Start' once you are ready!"
     )
@@ -483,9 +490,9 @@ def _assignee_notify_body(rd: dict, assignee_name: str) -> str:
 def _assignee_notify_template_body_values(rd: dict, assignee_name: str) -> list[str]:
     values = _assignee_notify_template_values(rd, assignee_name)
     fields = _assignee_notify_template_body_fields()
-    if len(fields) != 7:
+    if len(fields) != 8:
         logger.warning(
-            "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS should list exactly 7 "
+            "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS should list exactly 8 "
             "fields for Utility template; got %s",
             len(fields),
         )
