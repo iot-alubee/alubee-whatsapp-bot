@@ -35,6 +35,8 @@ VISITING_TO_LABELS = {
 }
 
 LEAVE_MANAGE_STATE = "WAITING_LEAVE_MANAGE_DAYS"
+MD_CLARITY_STATE = "WAITING_MD_OD_CLARITY_COMMENT"
+EMPLOYEE_CLARITY_STATE = "WAITING_EMPLOYEE_OD_CLARITY_REPLY"
 
 _VISITING_TO_ALIASES = {
     "unit_i": VISITING_UNIT_I,
@@ -403,6 +405,7 @@ def _approval_message_body(
     department: str,
     reason: str,
     request_rd: dict | None = None,
+    md_od_clarity: bool = False,
 ) -> str:
     d = _require()
     req_type = ((request_rd or {}).get("type") or "OD").strip().upper()
@@ -562,6 +565,12 @@ def _approval_message_body(
             f"Permission in current month: {perms_curr}\n\n"
             "Please approve or deny."
         )
+    clarity_block = _format_clarity_section(request_rd or {})
+    footer = (
+        "Please approve, deny, or request clarity."
+        if md_od_clarity
+        else "Please approve or deny."
+    )
     return (
         "OD approval request\n\n"
         f"Employee: {emp}\n"
@@ -570,25 +579,64 @@ def _approval_message_body(
         f"Visiting To: {(request_rd or {}).get('od_visiting_to_label') or reason or '—'}\n"
         f"Purpose: {((request_rd or {}).get('od_purpose') or '').strip() or '—'}\n"
         f"Time Required: {(request_rd or {}).get('od_time_required_hours') or '—'}\n\n"
-        "Please approve or deny."
+        f"{clarity_block}"
+        f"{footer}"
     )
+
+
+def _format_clarity_section(rd: dict) -> str:
+    thread = rd.get("clarity_thread") or []
+    if not isinstance(thread, list) or not thread:
+        return ""
+    lines = ["--- Clarity ---"]
+    for idx, item in enumerate(thread, start=1):
+        if not isinstance(item, dict):
+            continue
+        if len(thread) > 1:
+            lines.append(f"Round {idx}")
+        md_c = (item.get("md_comment") or "").strip()
+        emp_c = (item.get("employee_reply") or "").strip()
+        if md_c:
+            lines.append(f"MD: {md_c}")
+        if emp_c:
+            lines.append(f"Employee: {emp_c}")
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines) + "\n\n"
+
+
+def _recipient_is_md(wa_id: str, rd: dict) -> bool:
+    d = _require()
+    md_wa = request_md_whatsapp(rd)
+    return bool(md_wa and d.same_whatsapp(wa_id, md_wa))
+
+
+def _od_md_clarity_enabled(wa_id: str, request_rd: dict | None) -> bool:
+    rd = request_rd or {}
+    if _approval_request_type(rd) != "OD":
+        return False
+    return _recipient_is_md(wa_id, rd)
 
 
 def _approval_action_buttons(
     request_id: str,
     request_rd: dict | None,
+    *,
+    md_clarity: bool = False,
 ) -> list[tuple[str, str]]:
     rid = (request_id or "").strip()
     approve_id = f"APPROVE_{rid}"[:256]
     deny_id = f"DENY_{rid}"[:256]
     buttons = [(approve_id, "Approve"), (deny_id, "Deny")]
     rd = request_rd or {}
-    if (rd.get("type") or "").strip().upper() == "LEAVE":
+    if md_clarity and (rd.get("type") or "").strip().upper() == "OD":
+        buttons.append((f"CLARITY_{rid}"[:256], "Clarity"))
+    elif (rd.get("type") or "").strip().upper() == "LEAVE":
         from leave_request import leave_manage_eligible
 
         if leave_manage_eligible(rd):
             buttons.append((f"MANAGE_{rid}"[:256], "Manage"))
-    return buttons
+    return buttons[:3]
 
 
 def _approval_request_type(request_rd: dict | None) -> str:
@@ -824,6 +872,56 @@ def _send_approval_template(
         return False
 
 
+def _send_session_approval_buttons(
+    wa_id: str,
+    *,
+    employee_name: str,
+    department: str,
+    reason: str,
+    request_id: str,
+    request_rd: dict | None = None,
+    md_od_clarity: bool = False,
+) -> bool:
+    d = _require()
+    rid = (request_id or "").strip()
+    body = _approval_message_body(
+        employee_name=employee_name,
+        department=department,
+        reason=reason,
+        request_rd=request_rd,
+        md_od_clarity=md_od_clarity,
+    )
+    buttons = _approval_action_buttons(
+        rid,
+        request_rd,
+        md_clarity=md_od_clarity,
+    )
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(wa_id),
+            body,
+            buttons,
+            callback_data=request_id,
+            ensure_contact=True,
+            contact_name=d.chat_name(employee_name),
+        )
+        return True
+    except Exception:
+        logger.exception("session approval buttons failed to=%s", wa_id)
+        try:
+            ensure_customer(wa_id_to_phone(wa_id), name="Approver")
+            send_reply_buttons(
+                wa_id_to_phone(wa_id),
+                body,
+                buttons,
+                callback_data=request_id,
+            )
+            return True
+        except Exception:
+            logger.exception("session approval retry failed to=%s", wa_id)
+        return False
+
+
 def send_approval_buttons(
     wa_id: str,
     *,
@@ -836,6 +934,19 @@ def send_approval_buttons(
     d = _require()
     rid = (request_id or "").strip()
     req_type = _approval_request_type(request_rd)
+    md_od_clarity = _od_md_clarity_enabled(wa_id, request_rd)
+
+    if md_od_clarity and d.has_active_whatsapp_session(wa_id):
+        if _send_session_approval_buttons(
+            wa_id,
+            employee_name=employee_name,
+            department=department,
+            reason=reason,
+            request_id=rid,
+            request_rd=request_rd,
+            md_od_clarity=True,
+        ):
+            return True
 
     if _approval_uses_template(request_rd):
         if _send_approval_template(
@@ -868,37 +979,15 @@ def send_approval_buttons(
         )
         return False
 
-    body = _approval_message_body(
+    return _send_session_approval_buttons(
+        wa_id,
         employee_name=employee_name,
         department=department,
         reason=reason,
+        request_id=rid,
         request_rd=request_rd,
+        md_od_clarity=False,
     )
-    buttons = _approval_action_buttons(rid, request_rd)
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(wa_id),
-            body,
-            buttons,
-            callback_data=request_id,
-            ensure_contact=True,
-            contact_name=d.chat_name(employee_name),
-        )
-        return True
-    except Exception as e:
-        logger.exception("approval buttons failed to=%s: %s", wa_id, e)
-        try:
-            ensure_customer(wa_id_to_phone(wa_id), name="Approver")
-            send_reply_buttons(
-                wa_id_to_phone(wa_id),
-                body,
-                buttons,
-                callback_data=request_id,
-            )
-            return True
-        except Exception:
-            logger.exception("approval retry failed to=%s", wa_id)
-        return False
 
 
 def _set_pending_approval(recipient: str, request_id: str) -> None:
@@ -1209,6 +1298,363 @@ def handle_leave_manage_input(sender: str, incoming: str, session: dict) -> None
         sender,
         new_days,
     )
+
+
+def _clarity_cancel_id(request_id: str) -> str:
+    return f"CLARITY_CANCEL_{(request_id or '').strip()}"[:256]
+
+
+def _clarity_reply_id(request_id: str) -> str:
+    return f"CLARITY_REPLY_{(request_id or '').strip()}"[:256]
+
+
+def _is_clarity_action(raw: str) -> bool:
+    text = (raw or "").strip()
+    upper = text.upper()
+    if upper.startswith("CLARITY_"):
+        return True
+    key = text.lower().replace(" ", "_").replace("-", "_")
+    return key == "clarity"
+
+
+def _is_clarity_cancel(raw: str, request_id: str = "") -> bool:
+    text = (raw or "").strip()
+    upper = text.upper()
+    if upper.startswith("CLARITY_CANCEL"):
+        return True
+    rid = (request_id or "").strip()
+    if rid and upper == _clarity_cancel_id(rid).upper():
+        return True
+    return text.lower().replace(" ", "_") == "cancel"
+
+
+def _is_clarity_reply_action(raw: str) -> bool:
+    text = (raw or "").strip()
+    upper = text.upper()
+    if upper.startswith("CLARITY_REPLY"):
+        return True
+    return text.lower().replace(" ", "_") == "reply"
+
+
+def resolve_md_clarity_request_id(
+    incoming: str,
+    approver: str = "",
+    *,
+    callback_request_id: str = "",
+) -> str | None:
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+    cb_rid = (callback_request_id or "").strip()
+    if upper.startswith("CLARITY_REPLY_") or upper.startswith("CLARITY_CANCEL_"):
+        return None
+    if upper.startswith("CLARITY_"):
+        rid = raw[8:].strip()
+        return rid or None
+    if _is_clarity_action(raw) and cb_rid:
+        return cb_rid
+    if _is_clarity_action(raw) and approver:
+        rid = _pending_approval_request_id(approver)
+        if rid:
+            return rid
+    return None
+
+
+def resolve_employee_clarity_request_id(
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> str | None:
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+    cb_rid = (callback_request_id or "").strip()
+    if upper.startswith("CLARITY_REPLY_"):
+        rid = raw[14:].strip()
+        return rid or None
+    if _is_clarity_reply_action(raw) and cb_rid:
+        return cb_rid
+    return None
+
+
+def is_md_clarity_state(state: str | None) -> bool:
+    return (state or "") == MD_CLARITY_STATE
+
+
+def is_employee_clarity_state(state: str | None) -> bool:
+    return (state or "") == EMPLOYEE_CLARITY_STATE
+
+
+def _od_clarity_allowed(sender: str, rd: dict) -> bool:
+    if (rd.get("type") or "").strip().upper() != "OD":
+        return False
+    if _approval_role(sender, rd) != "md":
+        return False
+    if (rd.get("jmd_status") or "").strip().upper() != "APPROVED":
+        return False
+    if (rd.get("md_status") or "").strip().upper() != "PENDING":
+        return False
+    return True
+
+
+def _resend_md_od_approval(sender: str, rd: dict, request_id: str) -> None:
+    d = _require()
+    if _send_session_approval_buttons(
+        sender,
+        employee_name=rd.get("employee_name") or "Employee",
+        department=rd.get("department") or "",
+        reason=rd.get("reason") or "",
+        request_id=request_id,
+        request_rd=rd,
+        md_od_clarity=True,
+    ):
+        _set_pending_approval(sender, request_id)
+        return
+    d.send_to(
+        sender,
+        "Could not resend approval buttons. Send Hi to Alubee and try again.",
+    )
+
+
+def _send_md_clarity_prompt(sender: str, request_id: str) -> None:
+    d = _require()
+    body = (
+        "Clarity request\n\n"
+        "Please type your comment for the requester."
+    )
+    cancel_id = _clarity_cancel_id(request_id)
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            body,
+            [(cancel_id, "Cancel")],
+            callback_data=request_id,
+            ensure_contact=True,
+        )
+    except Exception:
+        logger.exception("MD clarity prompt failed sender=%s", sender)
+        d.send_to(sender, body)
+
+
+def _send_employee_clarity_request(employee_wa: str, rd: dict, request_id: str) -> None:
+    d = _require()
+    thread = rd.get("clarity_thread") or []
+    md_comment = ""
+    if isinstance(thread, list) and thread:
+        last = thread[-1]
+        if isinstance(last, dict):
+            md_comment = (last.get("md_comment") or "").strip()
+    body = (
+        "Clarity requested on your OD request\n\n"
+        f"MD comment:\n{md_comment or '—'}\n\n"
+        "Please reply with your clarification."
+    )
+    reply_id = _clarity_reply_id(request_id)
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(employee_wa),
+            body,
+            [(reply_id, "Reply")],
+            callback_data=request_id,
+            ensure_contact=True,
+            contact_name=d.chat_name(rd.get("employee_name") or "Employee"),
+        )
+    except Exception:
+        logger.exception("employee clarity request failed wa=%s", employee_wa)
+        d.send_to(employee_wa, f"{body}\n\nReply with your clarification.")
+
+
+def handle_md_clarity_gate(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    request_id = resolve_md_clarity_request_id(
+        incoming, sender, callback_request_id=callback_request_id
+    )
+    if not request_id:
+        return False
+
+    d = _require()
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.send_to(sender, "This request is invalid or already handled.")
+        return True
+
+    rd = snap.to_dict() or {}
+    if not _od_clarity_allowed(sender, rd):
+        d.send_to(sender, "You cannot request clarity on this OD request now.")
+        return True
+
+    d.session_merge(
+        sender,
+        state=MD_CLARITY_STATE,
+        approval_request_id=request_id,
+    )
+    _send_md_clarity_prompt(sender, request_id)
+    return True
+
+
+def handle_md_clarity_input(sender: str, incoming: str, session: dict) -> None:
+    d = _require()
+    request_id = (session.get("approval_request_id") or "").strip()
+    if not request_id:
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "Session expired. Send Hi to start again.")
+        return
+
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "This request is no longer available.")
+        return
+
+    rd = snap.to_dict() or {}
+    if not _od_clarity_allowed(sender, rd):
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "You cannot request clarity on this OD request now.")
+        return
+
+    if _is_clarity_cancel(incoming, request_id):
+        d.session_merge(
+            sender,
+            state="WAITING_APPROVAL_ACTION",
+            approval_request_id=request_id,
+        )
+        _resend_md_od_approval(sender, rd, request_id)
+        return
+
+    comment = (incoming or "").strip()
+    if not comment:
+        _send_md_clarity_prompt(sender, request_id)
+        return
+
+    thread = list(rd.get("clarity_thread") or [])
+    thread.append({
+        "md_comment": comment[:500],
+        "md_at": d.utcnow().isoformat(),
+        "employee_reply": "",
+        "employee_at": "",
+    })
+    ref.update({
+        "clarity_thread": thread,
+        "clarity_status": "awaiting_employee",
+    })
+    fresh = ref.get().to_dict() or {}
+
+    employee = (fresh.get("employee") or "").strip()
+    if employee:
+        _send_employee_clarity_request(employee, fresh, request_id)
+
+    d.session_merge(
+        sender,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=request_id,
+    )
+    d.send_to(sender, "Clarity sent to the requester. You will be notified when they reply.")
+    logger.info("OD clarity requested request_id=%s by=%s", request_id, sender)
+
+
+def handle_employee_clarity_reply_gate(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    request_id = resolve_employee_clarity_request_id(
+        incoming, callback_request_id=callback_request_id
+    )
+    if not request_id:
+        return False
+
+    d = _require()
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.send_to(sender, "This request is no longer available.")
+        return True
+
+    rd = snap.to_dict() or {}
+    if (rd.get("type") or "").strip().upper() != "OD":
+        return False
+    employee = (rd.get("employee") or "").strip()
+    if not employee or not d.same_whatsapp(sender, employee):
+        d.send_to(sender, "This clarity request is not for you.")
+        return True
+    if (rd.get("clarity_status") or "").strip() != "awaiting_employee":
+        d.send_to(sender, "There is no pending clarity request for this OD.")
+        return True
+
+    d.session_merge(
+        sender,
+        state=EMPLOYEE_CLARITY_STATE,
+        clarity_request_id=request_id,
+    )
+    d.send_to(sender, "Please type your reply to the MD's clarity request.")
+    return True
+
+
+def handle_employee_clarity_input(sender: str, incoming: str, session: dict) -> None:
+    d = _require()
+    request_id = (session.get("clarity_request_id") or "").strip()
+    if not request_id:
+        d.session_merge(sender, state=d.menu_idle_state)
+        d.send_to(sender, "Session expired. Send Hi to start again.")
+        return
+
+    ref = d.db.collection("requests").document(request_id)
+    snap = ref.get()
+    if not snap.exists:
+        d.session_ref(sender).delete()
+        d.send_to(sender, "This request is no longer available.")
+        return
+
+    rd = snap.to_dict() or {}
+    employee = (rd.get("employee") or "").strip()
+    if not employee or not d.same_whatsapp(sender, employee):
+        d.session_ref(sender).delete()
+        d.send_to(sender, "This clarity request is not for you.")
+        return
+
+    reply = (incoming or "").strip()
+    if not reply:
+        d.send_to(sender, "Please type your reply.")
+        return
+
+    thread = list(rd.get("clarity_thread") or [])
+    if not thread or not isinstance(thread[-1], dict):
+        d.session_ref(sender).delete()
+        d.send_to(sender, "Clarity thread is missing. Contact admin.")
+        return
+    last = dict(thread[-1])
+    if (last.get("employee_reply") or "").strip():
+        d.session_ref(sender).delete()
+        d.send_to(sender, "You have already replied to this clarity request.")
+        return
+    last["employee_reply"] = reply[:500]
+    last["employee_at"] = d.utcnow().isoformat()
+    thread[-1] = last
+    ref.update({
+        "clarity_thread": thread,
+        "clarity_status": "resolved",
+    })
+    fresh = ref.get().to_dict() or {}
+
+    md_wa = request_md_whatsapp(fresh)
+    if md_wa:
+        if d.has_active_whatsapp_session(md_wa):
+            notify_approver(md_wa, fresh, request_id)
+        else:
+            d.send_to(
+                md_wa,
+                "Employee replied to your OD clarity request. "
+                "Send Hi to Alubee to open Approve / Deny / Clarity buttons.",
+            )
+
+    d.session_ref(sender).delete()
+    d.send_to(sender, "Your clarification has been sent to MD.")
+    logger.info("OD clarity replied request_id=%s employee=%s", request_id, sender)
 
 
 def _approval_role(sender: str, rd: dict) -> str | None:

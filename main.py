@@ -856,7 +856,7 @@ def _extract_message(message_field) -> str:
             btitle = str(br.get("title") or "").strip()
             if bid.upper().startswith(
                 (
-                    "APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_",
+                    "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
                 )
             ):
@@ -871,7 +871,7 @@ def _extract_message(message_field) -> str:
             btitle = str(br.get("title") or "").strip()
             if bid.upper().startswith(
                 (
-                    "APPROVE_", "DENY_", "MANAGE_", "VEHICLE_", "VMANAGE_",
+                    "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
                 )
             ):
@@ -1111,6 +1111,16 @@ def _process(
     if _try_handle_approver_availability(sender, incoming):
         return
 
+    if approval.handle_md_clarity_gate(
+        sender, incoming, callback_request_id=callback_request_id
+    ):
+        return
+
+    if approval.handle_employee_clarity_reply_gate(
+        sender, incoming, callback_request_id=callback_request_id
+    ):
+        return
+
     if approval.handle_leave_manage_gate(
         sender, incoming, callback_request_id=callback_request_id
     ):
@@ -1143,6 +1153,14 @@ def _process(
     session_doc = _session_ref(sender).get()
     session = session_doc.to_dict() if session_doc.exists else None
     state = (session or {}).get("state")
+
+    if approval.is_md_clarity_state(state):
+        approval.handle_md_clarity_input(sender, incoming, session or {})
+        return
+
+    if approval.is_employee_clarity_state(state):
+        approval.handle_employee_clarity_input(sender, incoming, session or {})
+        return
 
     if approval.is_leave_manage_state(state):
         approval.handle_leave_manage_input(sender, incoming, session or {})
@@ -1181,6 +1199,16 @@ def _process(
 
     if vehicle_request.is_vehicle_manage_action_state(state):
         vehicle_request.handle_manager_manage_action(
+            sender,
+            incoming,
+            session or {},
+            VEHICLE_REQUEST_DEPS,
+            callback_request_id=callback_request_id,
+        )
+        return
+
+    if vehicle_request.is_vehicle_assign_type_state(state):
+        vehicle_request.handle_vehicle_assign_type_pick(
             sender,
             incoming,
             session or {},
