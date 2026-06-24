@@ -999,6 +999,89 @@ def _resend_leave_approval_buttons(sender: str, rd: dict, request_id: str) -> No
     notify_approver(sender, rd, request_id)
 
 
+def _leave_manage_cancel_id(request_id: str) -> str:
+    return f"LEAVE_MANAGE_CANCEL_{(request_id or '').strip()}"[:256]
+
+
+def _is_leave_manage_cancel(raw: str, request_id: str = "") -> bool:
+    text = (raw or "").strip()
+    upper = text.upper()
+    if upper.startswith("LEAVE_MANAGE_CANCEL"):
+        return True
+    rid = (request_id or "").strip()
+    if rid and upper == _leave_manage_cancel_id(rid).upper():
+        return True
+    key = text.lower().replace(" ", "_").replace("-", "_")
+    return key == "cancel"
+
+
+def _leave_manage_prompt_body(rd: dict, current: float) -> str:
+    from_d = (rd.get("leave_from_date") or "").strip()
+    to_d = (rd.get("leave_to_date") or from_d).strip()
+    max_reduce = int(current) - 1
+    return (
+        "Leave manage\n\n"
+        f"Requested: {int(current)} day(s)\n"
+        f"From: {from_d or '—'}\n"
+        f"To: {to_d or '—'}\n\n"
+        f"Reply with reduced days (1 to {max_reduce})."
+    )
+
+
+def _send_leave_manage_prompt(
+    sender: str,
+    rd: dict,
+    request_id: str,
+    current: float,
+) -> None:
+    d = _require()
+    body = _leave_manage_prompt_body(rd, current)
+    cancel_id = _leave_manage_cancel_id(request_id)
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            body,
+            [(cancel_id, "Cancel")],
+            callback_data=request_id,
+            ensure_contact=True,
+        )
+    except Exception:
+        logger.exception("leave manage prompt buttons failed sender=%s", sender)
+        d.send_to(sender, body)
+
+
+def _send_leave_manage_invalid(
+    sender: str,
+    request_id: str,
+    current: float,
+) -> None:
+    d = _require()
+    max_reduce = int(current) - 1
+    body = f"Invalid number. Please type 1-{max_reduce}."
+    cancel_id = _leave_manage_cancel_id(request_id)
+    try:
+        send_reply_buttons(
+            wa_id_to_phone(sender),
+            body,
+            [(cancel_id, "Cancel")],
+            callback_data=request_id,
+            ensure_contact=True,
+        )
+    except Exception:
+        logger.exception("leave manage invalid buttons failed sender=%s", sender)
+        d.send_to(sender, body)
+
+
+def _cancel_leave_manage(sender: str, rd: dict, request_id: str) -> None:
+    d = _require()
+    d.session_merge(
+        sender,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=request_id,
+    )
+    _resend_leave_approval_buttons(sender, rd, request_id)
+
+
 def handle_leave_manage_gate(
     sender: str,
     incoming: str,
@@ -1035,23 +1118,13 @@ def handle_leave_manage_gate(
         return True
 
     current = current_leave_days_num(rd)
-    max_reduce = int(current) - 1
     d.session_merge(
         sender,
         state=LEAVE_MANAGE_STATE,
         approval_request_id=request_id,
         leave_manage_role=role,
     )
-    from_d = (rd.get("leave_from_date") or "").strip()
-    to_d = (rd.get("leave_to_date") or from_d).strip()
-    d.send_to(
-        sender,
-        "Leave manage\n\n"
-        f"Requested: {int(current)} day(s)\n"
-        f"From: {from_d or '—'}\n"
-        f"To: {to_d or '—'}\n\n"
-        f"Reply with reduced days (1 to {max_reduce}), or CANCEL to go back.",
-    )
+    _send_leave_manage_prompt(sender, rd, request_id, current)
     return True
 
 
@@ -1096,18 +1169,16 @@ def handle_leave_manage_input(sender: str, incoming: str, session: dict) -> None
         return
 
     current = current_leave_days_num(rd)
+    if _is_leave_manage_cancel(incoming, request_id):
+        _cancel_leave_manage(sender, rd, request_id)
+        return
+
     new_days, err = parse_reduced_leave_days(incoming, current_days=current)
     if err == "cancel":
-        d.session_merge(
-            sender,
-            state="WAITING_APPROVAL_ACTION",
-            approval_request_id=request_id,
-        )
-        d.send_to(sender, "Leave manage cancelled.")
-        _resend_leave_approval_buttons(sender, rd, request_id)
+        _cancel_leave_manage(sender, rd, request_id)
         return
-    if err or new_days is None:
-        d.send_to(sender, err or "Invalid input. Try again or reply CANCEL.")
+    if err == "invalid" or new_days is None:
+        _send_leave_manage_invalid(sender, request_id, current)
         return
 
     from_d = (rd.get("leave_from_date") or "").strip()

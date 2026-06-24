@@ -350,19 +350,16 @@ def leave_manage_eligible(rd: dict) -> bool:
 
 
 def parse_reduced_leave_days(raw: str, *, current_days: float) -> tuple[int | None, str]:
-    text = (raw or "").strip().lower()
-    if text in ("cancel", "back", "exit"):
+    text = (raw or "").strip()
+    upper = text.upper()
+    if upper.startswith("LEAVE_MANAGE_CANCEL"):
         return None, "cancel"
     if not text.isdigit():
-        max_days = int(current_days) - 1
-        return None, (
-            f"Reply with a number from 1 to {max_days} to reduce leave days, "
-            "or CANCEL to go back."
-        )
+        return None, "invalid"
     value = int(text)
     max_days = int(current_days) - 1
     if value < 1 or value > max_days:
-        return None, f"Enter a number from 1 to {max_days}, or CANCEL to go back."
+        return None, "invalid"
     return value, ""
 
 
@@ -580,7 +577,11 @@ def _send_reason_buttons(wa_id: str, deps: LeaveDeps) -> None:
 
 
 def _submit_from_session(sender: str, session: dict, deps: LeaveDeps) -> None:
-    reason = (session.get("leave_reason") or "").strip()
+    reason = (
+        (session.get("reason") or "").strip()
+        or (session.get("leave_reason_detail") or "").strip()
+        or (session.get("leave_reason") or "").strip()
+    )
     from_d = (session.get("leave_from_date") or "").strip()
     to_d = (session.get("leave_to_date") or from_d).strip()
     if not reason or not from_d:
@@ -644,6 +645,8 @@ def _submit(
         "type": "LEAVE",
         "reason": reason,
         "leave_reason_code": session.get("leave_reason_code") or "",
+        "leave_reason": session.get("leave_reason") or "",
+        "leave_reason_detail": (session.get("leave_reason_detail") or reason or "")[:500],
         "leave_from_date": from_d,
         "leave_to_date": to_d,
         "leave_duration": leave_duration,
@@ -788,24 +791,35 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         leave_duration = "full_day"
 
     reason_raw = _flow_pick(data, "leave_reason", "reason").lower().replace(" ", "_")
-    other_reason = _flow_pick(data, "other_reason", "reason_text")
+    reason_detail = _flow_pick(
+        data, "reason_details", "reason_detail", "reason_text", "other_reason"
+    ).strip()
     if reason_raw in ("health_issue", "health"):
         reason_code = "HEALTH_ISSUE"
-        reason = REASON_LABELS[reason_code]
+        type_label = REASON_LABELS[reason_code]
+        if not reason_detail:
+            return None
+        reason = f"{type_label} — {reason_detail}"[:500]
     elif reason_raw == "personal":
         reason_code = "PERSONAL"
-        reason = REASON_LABELS[reason_code]
+        type_label = REASON_LABELS[reason_code]
+        if not reason_detail:
+            return None
+        reason = f"{type_label} — {reason_detail}"[:500]
     elif reason_raw in ("sick_leave", "sick"):
         reason_code = "SICK_LEAVE"
-        reason = REASON_LABELS[reason_code]
+        type_label = REASON_LABELS[reason_code]
+        reason = type_label
     elif reason_raw in ("casual_leave", "casual"):
         reason_code = "CASUAL_LEAVE"
-        reason = REASON_LABELS[reason_code]
+        type_label = REASON_LABELS[reason_code]
+        reason = type_label
     elif reason_raw == "other":
-        if not other_reason:
+        if not reason_detail:
             return None
         reason_code = "OTHER"
-        reason = other_reason[:500]
+        type_label = "Other"
+        reason = reason_detail[:500]
     else:
         return None
 
@@ -818,7 +832,9 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         "leave_duration": leave_duration,
         "leave_days": _leave_days(from_d, to_d, leave_duration=leave_duration),
         "leave_reason_code": reason_code,
-        "leave_reason": reason,
+        "leave_reason": type_label,
+        "leave_reason_detail": reason_detail[:500],
+        "reason": reason,
     }
 
 
