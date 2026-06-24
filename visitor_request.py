@@ -33,7 +33,7 @@ from approval import (
     visitor_chain_failure_message,
 )
 
-from bot_shared import digits, find_open_request, wa_from_10
+from bot_shared import digits, wa_from_10
 
 logger = logging.getLogger(__name__)
 
@@ -244,9 +244,6 @@ def visitor_flow_enabled() -> bool:
 
 def try_start_form(sender: str, deps: VisitorDeps) -> None:
     """Send WhatsApp Flow form (menu: Visitor - Form). Chat visitor flow unchanged."""
-    if find_open_request(sender, "VISITOR"):
-        deps.send_to(sender, deps.already_pending_msg)
-        return
     if not visitor_flow_enabled():
         deps.send_to(
             sender,
@@ -276,9 +273,6 @@ def try_start(sender: str, deps: VisitorDeps) -> None:
 
 
 def _try_start_chat(sender: str, deps: VisitorDeps) -> None:
-    if find_open_request(sender, "VISITOR"):
-        deps.send_to(sender, deps.already_pending_msg)
-        return
     deps.session_merge(
         sender,
         state=VISITOR_COMING_ON,
@@ -911,11 +905,6 @@ def _submit(sender: str, session: dict, deps: VisitorDeps) -> None:
 def _submit_payload(
     sender: str, data: dict, deps: VisitorDeps, *, submission_source: str = "chat"
 ) -> None:
-    if find_open_request(sender, "VISITOR"):
-        deps.clear_session(sender)
-        deps.send_to(sender, deps.already_pending_msg)
-        return
-
     from bot_shared import get_user_record
 
     exists, ud = get_user_record(sender)
