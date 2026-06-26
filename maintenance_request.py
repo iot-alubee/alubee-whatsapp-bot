@@ -15,6 +15,7 @@ from maintenance_data import (
     MACHINE_LABELS,
     MACHINE_TYPE_LABELS,
     default_machine_type,
+    infer_machine_type,
     is_supported_department,
     issue_category_options,
     machine_no_options,
@@ -27,6 +28,21 @@ MAINTENANCE_OPEN_STATUSES = frozenset({"PENDING", "ASSIGNED", "IN_PROGRESS"})
 UNSUPPORTED_DEPT_MSG = (
     "Maintenance form is available for PDC, Secondary, Fettling, and CNC departments only."
 )
+SUPERVISOR_ONLY_MSG = "Maintenance form is available for supervisors only."
+
+
+def _is_supervisor(ud: dict | None) -> bool:
+    return bool(ud and ud.get("is_supervisor"))
+
+
+def show_maintenance_menu_for_user(user_data: dict | None) -> bool:
+    """Show Maintenance - Form for supervisors in supported shop-floor departments."""
+    if not maintenance_flow_enabled():
+        return False
+    if not _is_supervisor(user_data):
+        return False
+    dept = _normalize_dept((user_data or {}).get("department") or "")
+    return is_supported_department(dept)
 
 
 @dataclass
@@ -125,21 +141,20 @@ def parse_flow_response(
     dept = _normalize_dept(department)
     route = (jmd_route or "").strip().upper()
 
-    machine_type = _normalize_id(_flow_pick(data, "machine_type"))
-    if not machine_type:
-        machine_type = default_machine_type(dept)
     machine_no = _normalize_id(_flow_pick(data, "machine_no"))
     issue = _normalize_id(_flow_pick(data, "issue_category"))
 
     if not dept or not is_supported_department(dept):
         return None
-    if not machine_type:
+
+    allowed_machines = {m["id"] for m in machine_no_options(dept, route)}
+    if not machine_no or machine_no not in allowed_machines:
         return None
 
-    allowed_machines = {
-        m["id"] for m in machine_no_options(dept, route, machine_type)
-    }
-    if not machine_no or machine_no not in allowed_machines:
+    machine_type = _normalize_id(_flow_pick(data, "machine_type"))
+    if not machine_type:
+        machine_type = infer_machine_type(dept, machine_no) or default_machine_type(dept)
+    if not machine_type:
         return None
 
     allowed_issues = {i["id"] for i in issue_category_options(dept, machine_type)}
@@ -218,6 +233,10 @@ def try_start_form(sender: str, deps: MaintenanceDeps) -> None:
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
         return
 
+    if not _is_supervisor(ud):
+        deps.send_to(sender, SUPERVISOR_ONLY_MSG)
+        return
+
     dept = _normalize_dept(ud.get("department") or "")
     if not is_supported_department(dept):
         deps.send_to(sender, UNSUPPORTED_DEPT_MSG)
@@ -244,6 +263,10 @@ def handle_flow_submission(
     exists, ud = get_user_record(sender)
     if not exists or not ud:
         deps.send_to(sender, "User not registered.\nPlease contact admin.")
+        return
+
+    if not _is_supervisor(ud):
+        deps.send_to(sender, SUPERVISOR_ONLY_MSG)
         return
 
     dept = _normalize_dept(ud.get("department") or "")

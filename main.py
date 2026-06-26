@@ -509,13 +509,21 @@ def _request_menu_items(
         ("3", "leave_form", "Leave - Form"),
         ("4", "it_form", "IT - Form"),
     ]
+    if maintenance_request.show_maintenance_menu_for_user(user_data):
+        items.append(
+            (str(len(items) + 1), "maintenance_form", "Maintenance - Form")
+        )
     if vehicle_request.show_vehicle_menu_for_user(
         user_data, wa_id, _same_whatsapp
     ):
         if vehicle_request.is_logistics_manager(wa_id, _same_whatsapp):
-            items.append(("5", "vehicle_manage", "Vehicle - Manage"))
+            items.append(
+                (str(len(items) + 1), "vehicle_manage", "Vehicle - Manage")
+            )
         else:
-            items.append(("5", "vehicle_request_form", "Vehicle - Form"))
+            items.append(
+                (str(len(items) + 1), "vehicle_request_form", "Vehicle - Form")
+            )
     return items
 
 
@@ -1261,7 +1269,7 @@ def _process(
         elif menu_form == "IT_FORM":
             it_request.try_start_form(sender, IT_DEPS)
         elif menu_form == "MAINTENANCE_FORM":
-            _send_to(sender, "Maintenance form is not available yet.")
+            maintenance_request.try_start_form(sender, MAINTENANCE_DEPS)
         elif menu_form == "VEHICLE_MANAGE":
             vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
         elif menu_form == "VEHICLE_REQUEST_FORM":

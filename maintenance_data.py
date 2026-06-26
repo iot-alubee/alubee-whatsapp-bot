@@ -252,37 +252,50 @@ def machine_type_options(dept: str) -> list[dict[str, str]]:
     return list(MACHINE_TYPE_OPTIONS.get(dept, []))
 
 
-def machine_no_options(dept: str, route: str, machine_type: str) -> list[dict[str, str]]:
+def machine_no_options(dept: str, route: str, machine_type: str = "") -> list[dict[str, str]]:
+    """All machines for department and unit. machine_type is ignored (kept for API compat)."""
+    del machine_type
+    return _all_machines(_normalize_dept(dept), _normalize_route(route))
+
+
+def _normalize_machine_id(machine_no: str) -> str:
+    return (machine_no or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def infer_machine_type(dept: str, machine_no: str) -> str:
+    """Infer machine type from department + selected machine (for issue categories)."""
     dept = _normalize_dept(dept)
-    route = _normalize_route(route)
-    mtype = (machine_type or "").strip().lower()
-    all_m = _all_machines(dept, route)
+    mid = _normalize_machine_id(machine_no)
+    if not mid:
+        return default_machine_type(dept)
 
     if dept == "PDC":
-        return all_m
+        return "pdc"
     if dept == "CNC":
-        if mtype == "cnc":
-            return _filter_by_prefix(all_m, "cnc_")
-        if mtype == "vmc":
-            return _filter_by_prefix(all_m, "vmc_")
-        return []
-    if dept == "FETTLING":
-        if mtype == "trimming":
-            return _filter_by_prefix(all_m, "tm_")
-        if mtype == "milling":
-            return _filter_by_prefix(all_m, "mm_")
-        return []
+        if mid.startswith("cnc_"):
+            return "cnc"
+        if mid.startswith("vmc_"):
+            return "vmc"
+        return ""
     if dept == "SECONDARY":
-        prefix_map = {
-            "drilling": "dm_",
-            "gang_drilling": "gdm_",
-            "tapping": "tm_",
-            "milling": "mm_",
-            "grooving": "gm_",
-        }
-        prefix = prefix_map.get(mtype, "")
-        return _filter_by_prefix(all_m, prefix) if prefix else []
-    return []
+        if mid.startswith("gdm_"):
+            return "gang_drilling"
+        if mid.startswith("dm_"):
+            return "drilling"
+        if mid.startswith("tm_"):
+            return "tapping"
+        if mid.startswith("mm_"):
+            return "milling"
+        if mid.startswith("gm_"):
+            return "grooving"
+        return ""
+    if dept == "FETTLING":
+        if mid.startswith("mm_"):
+            return "milling"
+        if mid.startswith(("tm_", "dm_", "sb_")):
+            return "trimming"
+        return ""
+    return ""
 
 
 def issue_category_options(dept: str, machine_type: str) -> list[dict[str, str]]:
@@ -297,6 +310,28 @@ def issue_category_options(dept: str, machine_type: str) -> list[dict[str, str]]
         return list(SECONDARY_ISSUES_BY_MACHINE_TYPE.get(mtype, []))
     if dept == "FETTLING":
         return list(FETTLING_ISSUES_BY_MACHINE_TYPE.get(mtype, []))
+    return []
+
+
+def all_issue_category_options(dept: str) -> list[dict[str, str]]:
+    """All issue options for a department (form display; submit still validates per machine)."""
+    dept = _normalize_dept(dept)
+    if dept == "PDC":
+        return PDC_ISSUE_CATEGORIES
+    if dept == "CNC":
+        return CNC_ISSUE_CATEGORIES
+    if dept == "SECONDARY":
+        seen: dict[str, dict[str, str]] = {}
+        for opts in SECONDARY_ISSUES_BY_MACHINE_TYPE.values():
+            for opt in opts:
+                seen[opt["id"]] = opt
+        return list(seen.values())
+    if dept == "FETTLING":
+        seen = {}
+        for opts in FETTLING_ISSUES_BY_MACHINE_TYPE.values():
+            for opt in opts:
+                seen[opt["id"]] = opt
+        return list(seen.values())
     return []
 
 
