@@ -1298,6 +1298,21 @@ def _process(
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
+    if it_request.is_it_manager_notify_state(state):
+        if it_request.handle_it_manager_notify_input(
+            sender,
+            incoming,
+            session or {},
+            IT_DEPS,
+            callback_request_id=callback_request_id,
+        ):
+            return
+        _send_to(
+            sender,
+            "Tap Assign on the IT ticket, or send IT - List to choose a request.",
+        )
+        return
+
     if it_request.is_it_manager_reassign_state(state):
         it_request.handle_it_manager_assign_pick(
             sender, incoming, session or {}, IT_DEPS

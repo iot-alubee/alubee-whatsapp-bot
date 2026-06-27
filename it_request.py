@@ -14,6 +14,7 @@ from bot_shared import get_user_record, query_requests_by_type, wa_from_10
 from interakt_api import (
     ensure_customer,
     send_list_menu,
+    send_list_menu_paged,
     send_template,
     send_template_with_image_header,
     wa_id_to_phone,
@@ -31,6 +32,7 @@ IT_ENGINEER_PHONES: tuple[str, ...] = (
 
 SESSION_WAITING_IT_MANAGER_ASSIGN = "WAITING_IT_MANAGER_ASSIGN_PICK"
 SESSION_WAITING_IT_MANAGER_REASSIGN = "WAITING_IT_MANAGER_REASSIGN_PICK"
+SESSION_WAITING_IT_MANAGER_NOTIFY = "WAITING_IT_MANAGER_NOTIFY"
 
 IT_MANAGER_CANNOT_RAISE_MSG = (
     "IT managers cannot raise IT requests.\n"
@@ -209,6 +211,10 @@ def is_it_manager_assign_state(state: str | None) -> bool:
 
 def is_it_manager_reassign_state(state: str | None) -> bool:
     return (state or "").strip() == SESSION_WAITING_IT_MANAGER_REASSIGN
+
+
+def is_it_manager_notify_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_IT_MANAGER_NOTIFY
 
 
 def _engineer_wa_ids() -> list[str]:
@@ -431,12 +437,36 @@ def _user_issue_photo_url(rd: dict) -> str:
     return ""
 
 
-def _list_row_title(text: str, max_len: int = 24) -> str:
-    return (text or "—").strip()[:max_len]
+def _split_list_row(row_id: str, line: str) -> dict[str, str]:
+    """WhatsApp list row: short title (24) + description (72) for overflow text."""
+    parts = [p.strip() for p in (line or "—").split(" - ") if p.strip()]
+    title_parts: list[str] = []
+    for part in parts:
+        candidate = " - ".join(title_parts + [part])
+        if len(candidate) <= 24:
+            title_parts.append(part)
+        else:
+            break
+    title = " - ".join(title_parts) if title_parts else (line or "—")[:24]
+    remainder = parts[len(title_parts):]
+    row: dict[str, str] = {"id": row_id, "title": title[:24]}
+    if remainder:
+        row["description"] = " - ".join(remainder)[:72]
+    return row
 
 
-def _manager_list_row_title(rd: dict) -> str:
-    """Manager IT - List row: Requester - Issue - assignee or Pending."""
+def _merge_list_row_description(row: dict[str, str], extra: str) -> dict[str, str]:
+    extra = (extra or "").strip()
+    if not extra:
+        return row
+    bits = [b for b in (row.get("description") or "", extra) if b.strip()]
+    if bits:
+        row["description"] = " | ".join(bits)[:72]
+    return row
+
+
+def _manager_list_row_line(rd: dict) -> str:
+    """Manager IT - List: Requester - Issue - Pending or assignee name."""
     requester = (rd.get("employee_name") or "—").strip()
     issue = (rd.get("issue_type_label") or "—").strip()
     if _request_status(rd) == "ASSIGNED":
@@ -446,12 +476,94 @@ def _manager_list_row_title(rd: dict) -> str:
     return f"{requester} - {issue} - {assignee}"
 
 
-def _engineer_list_row_title(rd: dict) -> str:
-    """Engineer IT - List row: Requester - Issue - description."""
+def _manager_list_row_extra(rd: dict) -> str:
+    bits: list[str] = []
+    dept = (rd.get("department") or "").strip()
+    if dept:
+        bits.append(f"Dept: {dept}")
+    machine = (rd.get("machine_no_label") or "").strip()
+    if machine:
+        bits.append(f"Machine: {machine}")
+    category = (rd.get("it_category_label") or "").strip()
+    if category:
+        bits.append(category)
+    priority = (rd.get("priority_label") or "").strip()
+    if priority:
+        bits.append(f"Priority: {priority}")
+    return " | ".join(bits)[:72]
+
+
+def _engineer_list_row_line(rd: dict) -> str:
+    """Engineer IT - List: Requester - Issue - description snippet."""
     requester = (rd.get("employee_name") or "—").strip()
     issue = (rd.get("issue_type_label") or "—").strip()
     desc = " ".join(((rd.get("description") or "").strip() or "—").split())
     return f"{requester} - {issue} - {desc}"
+
+
+def _engineer_list_row_extra(rd: dict) -> str:
+    bits: list[str] = []
+    dept = (rd.get("department") or "").strip()
+    if dept:
+        bits.append(f"Dept: {dept}")
+    machine = (rd.get("machine_no_label") or "").strip()
+    if machine:
+        bits.append(f"Machine: {machine}")
+    priority = (rd.get("priority_label") or "").strip()
+    if priority:
+        bits.append(f"Priority: {priority}")
+    requested = _format_ist(rd.get("requested_datetime"))
+    if requested:
+        bits.append(requested)
+    return " | ".join(bits)[:72]
+
+
+def _manager_list_row_fields(request_id: str, rd: dict) -> dict[str, str]:
+    row = _split_list_row(f"ITLIST_{request_id}"[:256], _manager_list_row_line(rd))
+    return _merge_list_row_description(row, _manager_list_row_extra(rd))
+
+
+def _engineer_list_row_fields(request_id: str, rd: dict) -> dict[str, str]:
+    row = _split_list_row(f"ITENG_{request_id}"[:256], _engineer_list_row_line(rd))
+    return _merge_list_row_description(row, _engineer_list_row_extra(rd))
+
+
+def _pending_it_manager_notify_request_id(sender: str, deps: ItDeps) -> str:
+    snap = deps.session_ref(sender).get()
+    if not snap.exists:
+        return ""
+    data = snap.to_dict() or {}
+    if (data.get("state") or "").strip() != SESSION_WAITING_IT_MANAGER_NOTIFY:
+        return ""
+    return (data.get("it_manager_request_id") or "").strip()
+
+
+def _normalize_it_callback_request_id(callback_request_id: str) -> str:
+    raw = (callback_request_id or "").strip()
+    if not raw:
+        return ""
+    if "-p" in raw:
+        return raw.split("-p", 1)[0].strip()
+    return raw
+
+
+def _resolve_it_manager_template_request_id(
+    incoming: str,
+    sender: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+    want: str = "assign",
+) -> str:
+    raw = (incoming or "").strip()
+    if want == "assign" and not _is_assign_label(raw):
+        return ""
+    if want == "reassign" and not _is_reassign_label(raw):
+        return ""
+    cb_rid = _normalize_it_callback_request_id(callback_request_id)
+    if cb_rid and cb_rid not in ("it-manager-list", "it-engineer-list"):
+        return cb_rid
+    return _pending_it_manager_notify_request_id(sender, deps)
 
 
 def _manager_template_name(rd: dict) -> str:
@@ -535,7 +647,7 @@ def _send_manager_ticket_template(
         if is_it_manager(recipient_wa, deps.same_whatsapp):
             deps.session_merge(
                 recipient_wa,
-                state="WAITING_IT_MANAGER_NOTIFY",
+                state=SESSION_WAITING_IT_MANAGER_NOTIFY,
                 it_manager_request_id=request_id,
             )
         logger.info(
@@ -847,11 +959,10 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
             deps.send_to(sender, "No pending or assigned IT requests.")
             return
         list_rows = [
-            {"id": f"ITLIST_{rid}"[:256], "title": _list_row_title(_manager_list_row_title(rd))}
-            for rid, rd in rows
+            _manager_list_row_fields(rid, rd) for rid, rd in rows
         ]
         try:
-            send_list_menu(
+            send_list_menu_paged(
                 wa_id_to_phone(sender),
                 "IT requests (pending & assigned):",
                 list_rows,
@@ -860,7 +971,7 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
                 callback_data="it-manager-list",
             )
         except Exception:
-            lines = "\n".join(f"• {_manager_list_row_title(rd)}" for _rid, rd in rows)
+            lines = "\n".join(f"• {_manager_list_row_line(rd)}" for _rid, rd in rows)
             deps.send_to(sender, "IT requests:\n" + lines)
         return
 
@@ -879,11 +990,10 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
             deps.send_to(sender, "No assigned IT tickets.")
             return
         list_rows = [
-            {"id": f"ITENG_{rid}"[:256], "title": _list_row_title(_engineer_list_row_title(rd))}
-            for rid, rd in rows
+            _engineer_list_row_fields(rid, rd) for rid, rd in rows
         ]
         try:
-            send_list_menu(
+            send_list_menu_paged(
                 wa_id_to_phone(sender),
                 "Your assigned IT tickets:",
                 list_rows,
@@ -892,7 +1002,7 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
                 callback_data="it-engineer-list",
             )
         except Exception:
-            lines = "\n".join(f"• {_engineer_list_row_title(rd)}" for _rid, rd in rows)
+            lines = "\n".join(f"• {_engineer_list_row_line(rd)}" for _rid, rd in rows)
             deps.send_to(sender, "Your assigned tickets:\n" + lines)
         return
 
@@ -948,20 +1058,70 @@ def handle_it_manager_gate(
         return False
 
     request_id = _parse_it_action(incoming, "ITM_ASSIGN_")
-    if not request_id and _is_assign_label(incoming) and callback_request_id:
-        request_id = callback_request_id.strip()
+    if not request_id:
+        request_id = _resolve_it_manager_template_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="assign",
+        )
     if request_id:
-        return _handle_manager_assign_click(sender, request_id, deps)
+        return _handle_manager_template_assign_click(sender, request_id, deps)
 
     request_id = _parse_it_action(incoming, "ITMGR_ASSIGN_")
     if request_id:
-        return _handle_manager_assign_click(sender, request_id, deps)
+        return _handle_manager_template_assign_click(sender, request_id, deps)
 
     request_id = _parse_it_action(incoming, "ITMGR_REASSIGN_")
     if request_id:
         return _handle_manager_reassign_click(sender, request_id, deps)
 
+    if _is_assign_label(incoming):
+        deps.send_to(
+            sender,
+            "Could not identify which ticket to assign.\n"
+            "Use IT - List and open the request again.",
+        )
+        return True
+
     return False
+
+
+def handle_it_manager_notify_input(
+    sender: str,
+    incoming: str,
+    session: dict,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    """Handle Assign on a manager notify template when session is WAITING_IT_MANAGER_NOTIFY."""
+    if not is_it_manager(sender, deps.same_whatsapp):
+        return False
+    if not is_it_manager_notify_state((session or {}).get("state")):
+        return False
+    if not _is_assign_label(incoming) and not _is_reassign_label(incoming):
+        return False
+    request_id = _resolve_it_manager_template_request_id(
+        incoming,
+        sender,
+        deps,
+        callback_request_id=callback_request_id,
+        want="reassign" if _is_reassign_label(incoming) else "assign",
+    )
+    if not request_id:
+        request_id = (session or {}).get("it_manager_request_id") or ""
+    if not request_id:
+        deps.send_to(
+            sender,
+            "Could not identify which ticket to assign.\n"
+            "Use IT - List and open the request again.",
+        )
+        return True
+    if _is_reassign_label(incoming):
+        return _handle_manager_reassign_click(sender, request_id.strip(), deps)
+    return _handle_manager_template_assign_click(sender, request_id.strip(), deps)
 
 
 def handle_it_manager_list_gate(
@@ -1120,7 +1280,7 @@ def handle_it_engineer_close_gate(
 
     request_id = _parse_it_action(incoming, "ITCLOSED_")
     if not request_id and _is_closed_label(incoming) and callback_request_id:
-        request_id = callback_request_id.strip()
+        request_id = _normalize_it_callback_request_id(callback_request_id)
     if not request_id:
         return False
 
