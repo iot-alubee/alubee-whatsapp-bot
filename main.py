@@ -891,7 +891,7 @@ def _extract_message(message_field) -> str:
                 (
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
-                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
+                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_", "MMAINT_USER_CLOSE_",
                     "ITM_", "ITMGR_", "ITLIST_", "ITASSIGN_", "ITENG_", "ITCLOSED_",
                     "ITUSER_CLOSE_",
                 )
@@ -909,7 +909,7 @@ def _extract_message(message_field) -> str:
                 (
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
-                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
+                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_", "MMAINT_USER_CLOSE_",
                     "ITM_", "ITMGR_", "ITLIST_", "ITASSIGN_", "ITENG_", "ITCLOSED_",
                     "ITUSER_CLOSE_",
                 )
@@ -1205,6 +1205,22 @@ def _process(
     ):
         return
 
+    if maintenance_request.handle_maintenance_user_close_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if maintenance_request.handle_maintenance_assignee_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
     if it_request.handle_it_engineer_list_gate(
         sender,
         incoming,
@@ -1230,14 +1246,6 @@ def _process(
         return
 
     if maintenance_request.handle_team_list_gate(
-        sender,
-        incoming,
-        MAINTENANCE_DEPS,
-        callback_request_id=callback_request_id,
-    ):
-        return
-
-    if maintenance_request.handle_maintenance_assignee_gate(
         sender,
         incoming,
         MAINTENANCE_DEPS,
@@ -1334,6 +1342,21 @@ def _process(
         _send_to(
             sender,
             "Tap Assign on the IT ticket, or send IT - List to choose a request.",
+        )
+        return
+
+    if maintenance_request.is_maintenance_manager_notify_state(state):
+        if maintenance_request.handle_maintenance_manager_notify_input(
+            sender,
+            incoming,
+            session or {},
+            MAINTENANCE_DEPS,
+            callback_request_id=callback_request_id,
+        ):
+            return
+        _send_to(
+            sender,
+            "Tap Assign on the maintenance ticket, or use Maintenance - Manage.",
         )
         return
 

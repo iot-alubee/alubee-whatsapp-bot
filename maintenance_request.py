@@ -18,6 +18,7 @@ from bot_shared import get_user_record, query_requests_for_employee, wa_from_10
 from interakt_api import (
     ensure_customer,
     send_list_menu,
+    send_list_menu_paged,
     send_maintenance_flow_form,
     send_reply_buttons,
     send_template,
@@ -37,7 +38,12 @@ from maintenance_data import (
 
 logger = logging.getLogger(__name__)
 
-MAINTENANCE_OPEN_STATUSES = frozenset({"PENDING", "ASSIGNED", "IN_PROGRESS"})
+MAINTENANCE_OPEN_STATUSES = frozenset({
+    "PENDING",
+    "ASSIGNED",
+    "IN_PROGRESS",
+    "AWAITING_USER_CLOSE",
+})
 
 SESSION_WAITING_MAINTENANCE_ASSIGN = "WAITING_MAINTENANCE_ASSIGN_PICK"
 SESSION_WAITING_MAINTENANCE_MANAGER_NOTIFY = "WAITING_MAINTENANCE_MANAGER_NOTIFY"
@@ -365,6 +371,10 @@ def is_maintenance_manage_action_state(state: str | None) -> bool:
     return (state or "").strip() == SESSION_WAITING_MAINTENANCE_MANAGE_ACTION
 
 
+def is_maintenance_manager_notify_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_MAINTENANCE_MANAGER_NOTIFY
+
+
 def _request_status(rd: dict) -> str:
     return (rd.get("maintenance_status") or "PENDING").strip().upper()
 
@@ -504,7 +514,7 @@ def _resolve_manager_template_request_id(
         return None
     if want == "reassign" and not _is_reassign_label(raw):
         return None
-    cb_rid = (callback_request_id or "").strip()
+    cb_rid = _normalize_maint_callback_request_id(callback_request_id)
     if cb_rid:
         return cb_rid
     return _pending_manager_notify_request_id(sender, deps) or None
@@ -530,10 +540,160 @@ def _resolve_manage_action_request_id(
 ) -> str | None:
     if want != "reassign" or not _is_reassign_label(incoming):
         return None
-    cb_rid = (callback_request_id or "").strip()
+    cb_rid = _normalize_maint_callback_request_id(callback_request_id)
     if cb_rid:
         return cb_rid
     return _pending_manage_action_request_id(sender, deps) or None
+
+
+def _normalize_maint_callback_request_id(callback_request_id: str) -> str:
+    raw = (callback_request_id or "").strip()
+    if not raw:
+        return ""
+    if "-p" in raw:
+        return raw.split("-p", 1)[0].strip()
+    if raw in ("maintenance-manage", "maintenance-team-list", "maintenance-manager-list"):
+        return ""
+    return raw
+
+
+def _split_list_row(row_id: str, line: str) -> dict[str, str]:
+    parts = [p.strip() for p in (line or "—").split(" - ") if p.strip()]
+    title_parts: list[str] = []
+    for part in parts:
+        candidate = " - ".join(title_parts + [part])
+        if len(candidate) <= 24:
+            title_parts.append(part)
+        else:
+            break
+    title = " - ".join(title_parts) if title_parts else (line or "—")[:24]
+    remainder = parts[len(title_parts):]
+    row: dict[str, str] = {"id": row_id, "title": title[:24]}
+    if remainder:
+        row["description"] = " - ".join(remainder)[:72]
+    return row
+
+
+def _merge_list_row_description(row: dict[str, str], extra: str) -> dict[str, str]:
+    extra = (extra or "").strip()
+    if not extra:
+        return row
+    bits = [b for b in (row.get("description") or "", extra) if b.strip()]
+    if bits:
+        row["description"] = " | ".join(bits)[:72]
+    return row
+
+
+def _manager_list_row_line(rd: dict) -> str:
+    requester = (rd.get("employee_name") or "—").strip()
+    issue = (rd.get("issue_category_label") or "—").strip()
+    if _request_status(rd) == "ASSIGNED":
+        assignee = (rd.get("assigned_to") or "Assigned").strip()
+    else:
+        assignee = "Pending"
+    return f"{requester} - {issue} - {assignee}"
+
+
+def _manager_list_row_extra(rd: dict) -> str:
+    bits: list[str] = []
+    machine = (rd.get("machine_no_label") or "").strip()
+    if machine:
+        bits.append(f"Machine: {machine}")
+    dept = (rd.get("department") or "").strip()
+    if dept:
+        bits.append(f"Dept: {dept}")
+    requested = _format_ist(rd.get("requested_datetime"))
+    if requested:
+        bits.append(requested)
+    return " | ".join(bits)[:72]
+
+
+def _manager_list_row_fields(request_id: str, rd: dict) -> dict[str, str]:
+    row = _split_list_row(f"MMANAGE_{request_id}"[:256], _manager_list_row_line(rd))
+    return _merge_list_row_description(row, _manager_list_row_extra(rd))
+
+
+def _team_list_row_line(rd: dict) -> str:
+    machine = (rd.get("machine_no_label") or "—").strip()
+    issue = (rd.get("issue_category_label") or "—").strip()
+    if _request_status(rd) == "AWAITING_USER_CLOSE":
+        return f"{machine} - {issue} - Awaiting user close"
+    return f"{machine} - {issue}"
+
+
+def _team_list_row_extra(rd: dict) -> str:
+    bits: list[str] = []
+    requester = (rd.get("employee_name") or "").strip()
+    if requester:
+        bits.append(requester)
+    dept = (rd.get("department") or "").strip()
+    if dept:
+        bits.append(f"Dept: {dept}")
+    requested = _format_ist(rd.get("requested_datetime"))
+    if requested:
+        bits.append(requested)
+    return " | ".join(bits)[:72]
+
+
+def _team_list_row_fields(request_id: str, rd: dict) -> dict[str, str]:
+    row = _split_list_row(f"MTEAM_{request_id}"[:256], _team_list_row_line(rd))
+    return _merge_list_row_description(row, _team_list_row_extra(rd))
+
+
+def _send_manager_ticket_template_to(
+    recipient_wa: str,
+    rd: dict,
+    request_id: str,
+    deps: MaintenanceDeps,
+    *,
+    context: str = "list",
+) -> bool:
+    route = _normalize_route(rd.get("jmd_route") or "")
+    photo_url = _issue_photo_url(rd)
+    if not photo_url:
+        logger.error(
+            "maintenance manager template skipped — no photo request_id=%s",
+            request_id,
+        )
+        return False
+
+    template_name = _manager_template_name(route)
+    if not template_name:
+        logger.warning("maintenance manager template not configured route=%s", route)
+        return False
+
+    body_values = _manager_template_body_values(rd)
+    try:
+        phone = wa_id_to_phone(recipient_wa)
+        ensure_customer(phone, name="Maintenance Manager")
+        send_template_with_image_header(
+            phone,
+            template_name,
+            photo_url,
+            language_code=_manager_template_language(),
+            body_values=body_values,
+            callback_data=request_id[:512],
+            ensure_contact=False,
+        )
+        if is_maintenance_manager(recipient_wa, deps.same_whatsapp):
+            _set_pending_manager_notify(deps, recipient_wa, request_id)
+        logger.info(
+            "maintenance manager image template sent context=%s request_id=%s "
+            "template=%s photo=%s",
+            context,
+            request_id,
+            template_name,
+            photo_url[:80],
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "maintenance manager template failed context=%s request_id=%s template=%s",
+            context,
+            request_id,
+            template_name,
+        )
+        return False
 
 
 def _notify_maintenance_manager(
@@ -548,50 +708,7 @@ def _notify_maintenance_manager(
             request_id,
         )
         return
-
-    photo_url = _issue_photo_url(rd)
-    if not photo_url:
-        logger.error(
-            "maintenance manager notify skipped — no photo request_id=%s",
-            request_id,
-        )
-        return
-
-    template_name = _manager_template_name(route)
-    if not template_name:
-        logger.warning("maintenance manager template not configured route=%s", route)
-        return
-
-    body_values = _manager_template_body_values(rd)
-
-    try:
-        phone = wa_id_to_phone(mgr)
-        ensure_customer(phone, name="Maintenance Manager")
-        send_template_with_image_header(
-            phone,
-            template_name,
-            photo_url,
-            language_code=_manager_template_language(),
-            body_values=body_values,
-            callback_data=request_id[:512],
-            ensure_contact=False,
-        )
-        _set_pending_manager_notify(deps, mgr, request_id)
-        logger.info(
-            "maintenance manager image template sent route=%s request_id=%s "
-            "template=%s photo=%s",
-            route,
-            request_id,
-            template_name,
-            photo_url[:80],
-        )
-    except Exception:
-        logger.exception(
-            "maintenance manager template failed request_id=%s template=%s photo=%s",
-            request_id,
-            template_name,
-            photo_url[:80],
-        )
+    _send_manager_ticket_template_to(mgr, rd, request_id, deps, context="new_ticket")
 
 
 def _notify_assignee(
@@ -833,7 +950,63 @@ def handle_maintenance_manager_gate(
         )
     if request_id:
         return _handle_assign_click(sender, request_id, deps)
+
+    request_id = _parse_maintenance_action(incoming, "MMAINT_REASSIGN_")
+    if not request_id:
+        request_id = _resolve_manager_template_request_id(
+            incoming,
+            sender,
+            deps,
+            callback_request_id=callback_request_id,
+            want="reassign",
+        )
+    if request_id:
+        return _handle_reassign_click(sender, request_id, deps)
+
+    if _is_assign_label(incoming) or _is_reassign_label(incoming):
+        deps.send_to(
+            sender,
+            "Could not identify which ticket to manage.\n"
+            "Use Maintenance - Manage and open the request again.",
+        )
+        return True
     return False
+
+
+def handle_maintenance_manager_notify_input(
+    sender: str,
+    incoming: str,
+    session: dict,
+    deps: MaintenanceDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    """Handle Assign / Re Assign on manager notify template."""
+    if not is_maintenance_manager(sender, deps.same_whatsapp):
+        return False
+    if not is_maintenance_manager_notify_state((session or {}).get("state")):
+        return False
+    if not _is_assign_label(incoming) and not _is_reassign_label(incoming):
+        return False
+    request_id = _resolve_manager_template_request_id(
+        incoming,
+        sender,
+        deps,
+        callback_request_id=callback_request_id,
+        want="reassign" if _is_reassign_label(incoming) else "assign",
+    )
+    if not request_id:
+        request_id = (session or {}).get("maintenance_manager_request_id") or ""
+    if not request_id:
+        deps.send_to(
+            sender,
+            "Could not identify which ticket to manage.\n"
+            "Use Maintenance - Manage and open the request again.",
+        )
+        return True
+    if _is_reassign_label(incoming):
+        return _handle_reassign_click(sender, request_id.strip(), deps)
+    return _handle_assign_click(sender, request_id.strip(), deps)
 
 
 def _manage_row_title(rd: dict) -> str:
@@ -844,29 +1017,26 @@ def _manage_row_title(rd: dict) -> str:
     )
 
 
-def _fetch_today_assigned(db: object, route: str) -> list[tuple[str, dict]]:
-    today = _ist_now().date()
+def _fetch_manager_list(db: object, route: str) -> list[tuple[str, dict]]:
     norm_route = _normalize_route(route)
     rows: list[tuple[str, dict]] = []
     try:
         snaps = db.collection("requests").where("type", "==", "MAINTENANCE").stream()
     except Exception:
-        logger.exception("maintenance manage list query failed")
+        logger.exception("maintenance manager list query failed")
         return rows
     for snap in snaps:
         rd = snap.to_dict() or {}
-        if _request_status(rd) != "ASSIGNED":
+        if _request_status(rd) not in ("PENDING", "ASSIGNED"):
             continue
         if _normalize_route(rd.get("jmd_route") or "") != norm_route:
-            continue
-        if not _request_on_ist_day(rd, today):
             continue
         rows.append((snap.id, rd))
     rows.sort(
         key=lambda item: item[1].get("requested_datetime") or "",
         reverse=True,
     )
-    return rows
+    return rows[:15]
 
 
 def try_start_manage(sender: str, deps: MaintenanceDeps) -> None:
@@ -874,31 +1044,27 @@ def try_start_manage(sender: str, deps: MaintenanceDeps) -> None:
         deps.send_to(sender, "Not authorized.")
         return
     route = _manager_route_for_sender(sender, deps.same_whatsapp)
-    rows = _fetch_today_assigned(deps.db, route)
+    rows = _fetch_manager_list(deps.db, route)
     if not rows:
         deps.send_to(
             sender,
-            "No assigned maintenance requests for today.\n"
-            "New requests will arrive with an Assign button.",
+            "No pending or assigned maintenance requests for your unit.",
         )
         return
-    list_rows = [
-        {"id": f"MMANAGE_{rid}"[:256], "title": _manage_row_title(rd)[:24]}
-        for rid, rd in rows[:10]
-    ]
+    list_rows = [_manager_list_row_fields(rid, rd) for rid, rd in rows]
     try:
-        send_list_menu(
+        send_list_menu_paged(
             wa_id_to_phone(sender),
-            "Assigned maintenance requests for today:",
+            "Maintenance requests (pending & assigned):",
             list_rows,
-            button_label="Manage",
-            section_title="Today",
-            callback_data="maintenance-manage",
+            button_label="Open",
+            section_title="Tickets",
+            callback_data="maintenance-manager-list",
         )
     except Exception:
         logger.exception("maintenance manage list failed sender=%s", sender)
-        lines = "\n".join(f"• {_manage_row_title(rd)}" for _rid, rd in rows[:10])
-        deps.send_to(sender, f"Assigned maintenance requests for today:\n{lines}")
+        lines = "\n".join(f"• {_manager_list_row_line(rd)}" for _rid, rd in rows)
+        deps.send_to(sender, f"Maintenance requests:\n{lines}")
 
 
 def _team_list_row_title(rd: dict) -> str:
@@ -931,7 +1097,7 @@ def _fetch_assignee_assigned(
         return rows
     for snap in snaps:
         rd = snap.to_dict() or {}
-        if _request_status(rd) != "ASSIGNED":
+        if _request_status(rd) not in ("ASSIGNED", "AWAITING_USER_CLOSE"):
             continue
         wa = (rd.get("assigned_to_wa") or "").strip()
         if not wa or not same_whatsapp(assignee_wa, wa):
@@ -941,7 +1107,7 @@ def _fetch_assignee_assigned(
         key=lambda item: item[1].get("requested_datetime") or "",
         reverse=True,
     )
-    return rows[:10]
+    return rows[:15]
 
 
 def try_start_team_list(sender: str, deps: MaintenanceDeps) -> None:
@@ -953,55 +1119,51 @@ def try_start_team_list(sender: str, deps: MaintenanceDeps) -> None:
     if not rows:
         deps.send_to(
             sender,
-            "No assigned maintenance requests.\n"
+            "No active maintenance requests.\n"
             "You will be notified when a job is assigned to you.",
         )
         return
-    list_rows = [
-        {"id": f"MTEAM_{rid}"[:256], "title": _team_list_row_title(rd)[:24]}
-        for rid, rd in rows
-    ]
+    list_rows = [_team_list_row_fields(rid, rd) for rid, rd in rows]
     try:
-        send_list_menu(
+        send_list_menu_paged(
             wa_id_to_phone(sender),
-            "Your assigned maintenance requests:",
+            "Your maintenance tickets (tap to open or request user close):",
             list_rows,
             button_label="Open",
-            section_title="Assigned",
+            section_title="Tickets",
             callback_data="maintenance-team-list",
         )
     except Exception:
         logger.exception("maintenance team list failed sender=%s", sender)
-        lines = "\n".join(f"• {_team_list_row_title(rd)}" for _rid, rd in rows)
-        deps.send_to(sender, f"Your assigned maintenance requests:\n{lines}")
+        lines = "\n".join(f"• {_team_list_row_line(rd)}" for _rid, rd in rows)
+        deps.send_to(sender, f"Your maintenance tickets:\n{lines}")
 
 
-def _send_team_close_action(
+def _send_team_ticket_template(
     sender: str, deps: MaintenanceDeps, request_id: str, rd: dict
-) -> None:
+) -> bool:
     if not _is_maintenance_assignee(sender, rd, deps.same_whatsapp):
         deps.send_to(sender, "Not authorized for this request.")
-        return
-    if _request_status(rd) != "ASSIGNED":
-        deps.send_to(
-            sender,
-            f"Request is already {_request_status(rd).lower()}.",
-        )
-        return
-    closed_id = f"MMAINT_CLOSED_{request_id}"[:256]
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(sender),
-            _team_request_detail(rd),
-            [(closed_id, "Closed")],
-            callback_data=request_id,
-        )
-    except Exception:
-        logger.exception("maintenance team close actions failed request_id=%s", request_id)
-        deps.send_to(
-            sender,
-            _team_request_detail(rd) + "\n\nReply Closed when the job is done.",
-        )
+        return True
+    status = _request_status(rd)
+    if status == "AWAITING_USER_CLOSE":
+        employee = (rd.get("employee") or "").strip()
+        if employee:
+            _notify_supervisor_close_request(
+                employee, rd, request_id, sender, deps
+            )
+            deps.send_to(
+                sender,
+                "Close request sent to the supervisor again. Thank you.",
+            )
+        else:
+            deps.send_to(sender, "No supervisor contact on this request.")
+        return True
+    if status != "ASSIGNED":
+        deps.send_to(sender, f"Request is already {status.lower()}.")
+        return True
+    _notify_assignee(deps, rd, request_id, sender)
+    return True
 
 
 def handle_team_list_gate(
@@ -1027,7 +1189,7 @@ def handle_team_list_gate(
             deps.send_to(sender, "Maintenance request not found.")
             return True
         _ref, rd = loaded
-        _send_team_close_action(sender, deps, request_id, rd)
+        _send_team_ticket_template(sender, deps, request_id, rd)
         return True
     return False
 
@@ -1036,29 +1198,18 @@ def _send_manage_actions(
     sender: str, deps: MaintenanceDeps, request_id: str, rd: dict
 ) -> None:
     status = _request_status(rd)
-    if status != "ASSIGNED":
+    if status not in ("PENDING", "ASSIGNED"):
         deps.send_to(
             sender,
             f"{_manage_row_title(rd)}\n\nStatus: {status.lower()}.",
         )
         deps.clear_session(sender)
         return
-    reassign_id = f"MMAINT_REASSIGN_{request_id}"[:256]
-    deps.session_merge(
-        sender,
-        state=SESSION_WAITING_MAINTENANCE_MANAGE_ACTION,
-        maintenance_manage_request_id=request_id,
-    )
-    try:
-        send_reply_buttons(
-            wa_id_to_phone(sender),
-            _manage_row_title(rd),
-            [(reassign_id, "Re Assign")],
-            callback_data=request_id,
+    if not _send_manager_ticket_template_to(sender, rd, request_id, deps, context="list"):
+        deps.send_to(
+            sender,
+            "Could not load ticket details. Please try Maintenance - Manage again.",
         )
-    except Exception:
-        logger.exception("maintenance manage actions failed request_id=%s", request_id)
-        deps.send_to(sender, _manage_row_title(rd) + "\n\nReply Re Assign to continue.")
 
 
 def handle_manager_manage_gate(
@@ -1123,7 +1274,7 @@ def handle_manager_manage_action(
     if request_id and (not session_rid or request_id == session_rid):
         _handle_reassign_click(sender, request_id, deps)
         return
-    deps.send_to(sender, "Please use Re Assign.")
+    deps.send_to(sender, "Please use Re Assign on the maintenance ticket template.")
 
 
 def _complete_assign_pick(
@@ -1243,8 +1394,18 @@ def handle_maintenance_reassign_pick(
 
 
 def _is_closed_label(raw: str) -> bool:
-    key = (raw or "").strip().lower().replace(" ", "_")
-    return key in ("closed", "close", "completed", "complete", "done")
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("closed", "done")
+
+
+def _is_user_close_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in (
+        "close_ticket",
+        "close_ticket_request",
+        "close",
+        "confirm_close",
+    )
 
 
 def _is_maintenance_assignee(sender: str, rd: dict, same_whatsapp: Callable) -> bool:
@@ -1277,6 +1438,102 @@ def _find_assignee_closable_request(
     return best_id
 
 
+def _find_supervisor_closable_request(
+    db: object, supervisor_wa: str, same_whatsapp: Callable[[str, str], bool]
+) -> str:
+    """Most recent AWAITING_USER_CLOSE maintenance request for this supervisor."""
+    best_id = ""
+    best_ts = None
+    try:
+        snaps = db.collection("requests").where("type", "==", "MAINTENANCE").stream()
+    except Exception:
+        logger.exception("maintenance supervisor closable query failed")
+        return ""
+    for snap in snaps:
+        rd = snap.to_dict() or {}
+        if _request_status(rd) != "AWAITING_USER_CLOSE":
+            continue
+        wa = (rd.get("employee") or "").strip()
+        if not wa or not same_whatsapp(supervisor_wa, wa):
+            continue
+        ts = rd.get("technician_closed_at") or rd.get("requested_datetime")
+        if best_ts is None or (ts and ts > best_ts):
+            best_ts = ts
+            best_id = snap.id
+    return best_id
+
+
+def _user_close_template_name() -> str:
+    return (
+        os.getenv("MAINTENANCE_USER_CLOSE_TEMPLATE_NAME")
+        or "maintenance_tkt_close_v2"
+    ).strip()
+
+
+def _user_close_template_language() -> str:
+    return (
+        os.getenv("MAINTENANCE_USER_CLOSE_TEMPLATE_LANGUAGE_CODE") or "en"
+    ).strip()
+
+
+def _user_close_template_body_fields() -> list[str]:
+    raw = (
+        os.getenv("MAINTENANCE_USER_CLOSE_TEMPLATE_BODY_FIELDS")
+        or "machine,issue,addressed_by"
+    ).strip()
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def _user_close_template_body_values(
+    rd: dict, technician_wa: str, deps: MaintenanceDeps
+) -> list[str]:
+    values = {
+        "machine": (rd.get("machine_no_label") or "—").strip(),
+        "issue": (rd.get("issue_category_label") or "—").strip(),
+        "addressed_by": (rd.get("assigned_to") or "—").strip(),
+        "machine_no": (rd.get("machine_no_label") or "—").strip(),
+        "technician": (rd.get("assigned_to") or "—").strip(),
+    }
+    if technician_wa and values.get("addressed_by") in ("—", ""):
+        exists, ud = get_user_record(technician_wa)
+        if exists and ud:
+            values["addressed_by"] = (ud.get("name") or "Technician").strip()
+    fields = _user_close_template_body_fields()
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _notify_supervisor_close_request(
+    supervisor_wa: str,
+    rd: dict,
+    request_id: str,
+    technician_wa: str,
+    deps: MaintenanceDeps,
+) -> None:
+    template_name = _user_close_template_name()
+    if not template_name:
+        logger.error(
+            "MAINTENANCE_USER_CLOSE_TEMPLATE_NAME not set request_id=%s",
+            request_id,
+        )
+        return
+    phone = wa_id_to_phone(supervisor_wa)
+    try:
+        ensure_customer(phone, name=(rd.get("employee_name") or "Supervisor"))
+        send_template(
+            phone,
+            template_name,
+            language_code=_user_close_template_language(),
+            body_values=_user_close_template_body_values(rd, technician_wa, deps),
+            callback_data=request_id[:512],
+            ensure_contact=False,
+        )
+        logger.info("maintenance user close template sent request_id=%s", request_id)
+    except Exception:
+        logger.exception(
+            "maintenance user close template failed request_id=%s", request_id
+        )
+
+
 def handle_maintenance_assignee_gate(
     sender: str,
     incoming: str,
@@ -1286,7 +1543,7 @@ def handle_maintenance_assignee_gate(
 ) -> bool:
     request_id = _parse_maintenance_action(incoming, "MMAINT_CLOSED_")
     if not request_id:
-        cb = (callback_request_id or "").strip()
+        cb = _normalize_maint_callback_request_id(callback_request_id)
         if _is_closed_label(incoming) and cb:
             request_id = cb
     if not request_id and _is_closed_label(incoming):
@@ -1294,6 +1551,13 @@ def handle_maintenance_assignee_gate(
             deps.db, sender, deps.same_whatsapp
         )
     if not request_id:
+        if _is_closed_label(incoming):
+            deps.send_to(
+                sender,
+                "Could not identify the ticket.\n"
+                "Use Maintenance - List and open the ticket again.",
+            )
+            return True
         return False
 
     loaded = _load_request(deps.db, request_id)
@@ -1302,17 +1566,69 @@ def handle_maintenance_assignee_gate(
         return True
     ref, rd = loaded
     if not _is_maintenance_assignee(sender, rd, deps.same_whatsapp):
-        deps.send_to(sender, "Not authorized for this request.")
-        return True
+        return False
     if _request_status(rd) != "ASSIGNED":
         deps.send_to(sender, f"Request is already {_request_status(rd).lower()}.")
+        return True
+
+    ref.update({
+        "maintenance_status": "AWAITING_USER_CLOSE",
+        "technician_closed_at": deps.utcnow(),
+        "technician_closed_by": sender,
+    })
+    deps.clear_session(sender)
+    employee = (rd.get("employee") or "").strip()
+    if employee:
+        _notify_supervisor_close_request(employee, rd, request_id, sender, deps)
+    deps.send_to(sender, "Supervisor notified to confirm closure. Thank you.")
+    return True
+
+
+def handle_maintenance_user_close_gate(
+    sender: str,
+    incoming: str,
+    deps: MaintenanceDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    if not _is_user_close_label(incoming) and not _parse_maintenance_action(
+        incoming, "MMAINT_USER_CLOSE_"
+    ):
+        return False
+
+    request_id = _parse_maintenance_action(incoming, "MMAINT_USER_CLOSE_")
+    if not request_id:
+        cb = _normalize_maint_callback_request_id(callback_request_id)
+        if _is_user_close_label(incoming) and cb:
+            request_id = cb
+    if not request_id and _is_user_close_label(incoming):
+        request_id = _find_supervisor_closable_request(
+            deps.db, sender, deps.same_whatsapp
+        )
+    if not request_id:
+        deps.send_to(
+            sender,
+            "Could not identify the ticket.\n"
+            "Open the maintenance close message again and tap Close Ticket.",
+        )
+        return True
+
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "Maintenance request not found.")
+        return True
+    ref, rd = loaded
+    if not deps.same_whatsapp(rd.get("employee"), sender):
+        deps.send_to(sender, "This maintenance request does not belong to you.")
+        return True
+    if _request_status(rd) != "AWAITING_USER_CLOSE":
+        deps.send_to(sender, "This ticket is not awaiting your confirmation.")
         return True
 
     completed_at = deps.utcnow()
     time_taken, time_taken_seconds = _compute_time_taken(
         rd.get("requested_datetime"), completed_at
     )
-
     ref.update({
         "maintenance_status": "COMPLETED",
         "completed_at": completed_at,
@@ -1320,27 +1636,23 @@ def handle_maintenance_assignee_gate(
         "time_taken": time_taken,
         "time_taken_seconds": time_taken_seconds,
     })
-    employee = (rd.get("employee") or "").strip()
-    if employee:
-        msg = "Your maintenance request has been completed."
-        if time_taken:
-            msg += f"\nTime taken: {time_taken}."
-        msg += "\nThank you."
-        deps.send_to(employee, msg)
-    mgr = _manager_wa(rd.get("jmd_route") or "")
-    if mgr:
-        mgr_msg = (
-            f"Maintenance closed: {rd.get('machine_no_label') or '—'} — "
-            f"{rd.get('issue_category_label') or '—'} "
-            f"({rd.get('assigned_to') or 'technician'})"
+    deps.clear_session(sender)
+    tech_wa = (rd.get("assigned_to_wa") or "").strip()
+    msg = "Your maintenance request has been closed. Thank you."
+    if time_taken:
+        msg = (
+            f"Your maintenance request has been closed.\n"
+            f"Time taken: {time_taken}. Thank you."
+        )
+    deps.send_to(sender, msg)
+    if tech_wa:
+        tech_msg = (
+            f"Maintenance ticket from {rd.get('employee_name') or 'supervisor'} "
+            "has been closed."
         )
         if time_taken:
-            mgr_msg += f"\nTime taken: {time_taken}."
-        deps.send_to(mgr, mgr_msg)
-    tech_msg = "Maintenance request marked as closed. Thank you."
-    if time_taken:
-        tech_msg = f"Maintenance request marked as closed.\nTime taken: {time_taken}. Thank you."
-    deps.send_to(sender, tech_msg)
+            tech_msg += f"\nTime taken: {time_taken}."
+        deps.send_to(tech_wa, tech_msg)
     return True
 
 
