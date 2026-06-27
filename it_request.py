@@ -294,7 +294,7 @@ def _is_closed_label(raw: str) -> bool:
 
 def _is_user_close_label(raw: str) -> bool:
     key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
-    return key in ("close_ticket", "close", "closed")
+    return key in ("close_ticket", "close_ticket_request")
 
 
 def _flow_pick(data: dict, *keys: str) -> str:
@@ -1268,6 +1268,26 @@ def handle_it_engineer_list_gate(
     return False
 
 
+def _find_engineer_closable_request(
+    db: object, engineer_wa: str, same_whatsapp: Callable
+) -> str:
+    """Most recent ASSIGNED ticket for this engineer (Closed without callback)."""
+    best_id = ""
+    best_ts = None
+    for snap in query_requests_by_type(db, "IT", limit=300):
+        rd = snap.to_dict() or {}
+        if _request_status(rd) != "ASSIGNED":
+            continue
+        wa = (rd.get("assigned_engineer") or "").strip()
+        if not wa or not same_whatsapp(engineer_wa, wa):
+            continue
+        ts = rd.get("requested_datetime")
+        if best_ts is None or (ts and ts > best_ts):
+            best_ts = ts
+            best_id = snap.id
+    return best_id
+
+
 def handle_it_engineer_close_gate(
     sender: str,
     incoming: str,
@@ -1275,13 +1295,22 @@ def handle_it_engineer_close_gate(
     *,
     callback_request_id: str = "",
 ) -> bool:
-    if not is_it_engineer(sender):
-        return False
-
     request_id = _parse_it_action(incoming, "ITCLOSED_")
-    if not request_id and _is_closed_label(incoming) and callback_request_id:
-        request_id = _normalize_it_callback_request_id(callback_request_id)
     if not request_id:
+        cb = _normalize_it_callback_request_id(callback_request_id)
+        if _is_closed_label(incoming) and cb:
+            request_id = cb
+    if not request_id and _is_closed_label(incoming):
+        request_id = _find_engineer_closable_request(
+            deps.db, sender, deps.same_whatsapp
+        )
+    if not request_id:
+        if _is_closed_label(incoming):
+            deps.send_to(
+                sender,
+                "Could not identify the ticket.\nUse IT - List and open the ticket again.",
+            )
+            return True
         return False
 
     loaded = _load_request(deps.db, request_id)
@@ -1290,8 +1319,7 @@ def handle_it_engineer_close_gate(
         return True
     ref, rd = loaded
     if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
-        deps.send_to(sender, "Not authorized for this ticket.")
-        return True
+        return False
     if _request_status(rd) != "ASSIGNED":
         deps.send_to(sender, f"Ticket is already {_request_status(rd).lower()}.")
         return True
@@ -1301,6 +1329,7 @@ def handle_it_engineer_close_gate(
         "engineer_closed_at": deps.utcnow(),
         "engineer_closed_by": sender,
     })
+    deps.clear_session(sender)
     employee = (rd.get("employee") or "").strip()
     if employee:
         _notify_user_close_request(employee, rd, request_id, sender, deps)
@@ -1324,7 +1353,7 @@ def handle_it_user_close_gate(
 ) -> bool:
     request_id = _parse_it_action(incoming, "ITUSER_CLOSE_")
     if not request_id and _is_user_close_label(incoming) and callback_request_id:
-        request_id = callback_request_id.strip()
+        request_id = _normalize_it_callback_request_id(callback_request_id)
     if not request_id:
         return False
 

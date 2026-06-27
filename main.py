@@ -1165,7 +1165,7 @@ def _process(
     ):
         return
 
-    if it_request.handle_it_user_close_gate(
+    if it_request.handle_it_engineer_close_gate(
         sender,
         incoming,
         IT_DEPS,
@@ -1173,7 +1173,7 @@ def _process(
     ):
         return
 
-    if it_request.handle_it_engineer_close_gate(
+    if it_request.handle_it_user_close_gate(
         sender,
         incoming,
         IT_DEPS,
