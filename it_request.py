@@ -1,4 +1,4 @@
-"""IT support request flow (WhatsApp Form + assignment to IT engineers)."""
+"""IT support request flow — user form, manager assign, engineer resolve."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 from bot_shared import get_user_record, query_requests_by_type, wa_from_10
 from interakt_api import (
     ensure_customer,
-    send_image,
+    send_list_menu,
+    send_reply_buttons,
     send_template,
     send_template_with_image_header,
     wa_id_to_phone,
@@ -29,16 +30,16 @@ IT_ENGINEER_PHONES: tuple[str, ...] = (
     "9498061569",
 )
 
-IT_OPEN_STATUSES = frozenset({"QUEUED", "ASSIGNED"})
-IT_CONFIRM_CLOSE = "IT_CONFIRM_CLOSE"
+SESSION_WAITING_IT_MANAGER_ASSIGN = "WAITING_IT_MANAGER_ASSIGN_PICK"
+SESSION_WAITING_IT_MANAGER_REASSIGN = "WAITING_IT_MANAGER_REASSIGN_PICK"
 
-IT_CLOSE = "IT_CLOSE"
-IT_CANCEL = "IT_CANCEL"
-
-IT_STATES = frozenset({IT_CONFIRM_CLOSE})
-
+IT_MANAGER_CANNOT_RAISE_MSG = (
+    "IT managers cannot raise IT requests.\n"
+    "Use IT - List to view and assign tickets."
+)
 IT_ENGINEER_CANNOT_RAISE_MSG = (
-    "IT support engineers cannot raise IT requests through this form."
+    "IT engineers cannot raise IT requests.\n"
+    "Use IT - List to view assigned tickets."
 )
 
 CATEGORY_LABELS: dict[str, str] = {
@@ -164,8 +165,20 @@ def it_flow_enabled() -> bool:
     return bool(it_flow_template_name())
 
 
-def is_it_state(state: str | None) -> bool:
-    return (state or "") in IT_STATES
+def _manager_wa() -> str:
+    raw = (
+        os.getenv("IT_MANAGER_WHATSAPP_NUMBER")
+        or os.getenv("IT_MANAGER_WHATSAPP")
+        or ""
+    ).strip()
+    if not raw:
+        return ""
+    return wa_from_10(wa_id_to_phone(raw)[-10:])
+
+
+def is_it_manager(sender: str, same_whatsapp: Callable[[str, str], bool]) -> bool:
+    mgr = _manager_wa()
+    return bool(mgr and same_whatsapp(sender, mgr))
 
 
 def is_it_engineer(sender: str) -> bool:
@@ -173,8 +186,42 @@ def is_it_engineer(sender: str) -> bool:
     return phone in IT_ENGINEER_PHONES
 
 
+def show_it_form_for_user(
+    user_data: dict | None, wa_id: str, same_whatsapp: Callable[[str, str], bool]
+) -> bool:
+    if not it_flow_enabled():
+        return False
+    if is_it_manager(wa_id, same_whatsapp):
+        return False
+    if is_it_engineer(wa_id):
+        return False
+    return True
+
+
+def show_it_list_menu(wa_id: str, same_whatsapp: Callable[[str, str], bool]) -> bool:
+    if not it_flow_enabled():
+        return False
+    return is_it_manager(wa_id, same_whatsapp) or is_it_engineer(wa_id)
+
+
+def is_it_manager_assign_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_IT_MANAGER_ASSIGN
+
+
+def is_it_manager_reassign_state(state: str | None) -> bool:
+    return (state or "").strip() == SESSION_WAITING_IT_MANAGER_REASSIGN
+
+
 def _engineer_wa_ids() -> list[str]:
     return [wa_from_10(p) for p in IT_ENGINEER_PHONES if wa_from_10(p)]
+
+
+def _engineer_slot_for_wa(wa_id: str, same_whatsapp: Callable) -> int:
+    for slot, phone in enumerate(IT_ENGINEER_PHONES, start=1):
+        candidate = wa_from_10(phone)
+        if candidate and same_whatsapp(candidate, wa_id):
+            return slot
+    return 0
 
 
 def _engineer_name(wa_id: str, db: object) -> str:
@@ -184,12 +231,6 @@ def _engineer_name(wa_id: str, db: object) -> str:
     return "IT Engineer"
 
 
-def _employee_assigned_message(engineer_wa: str, deps: ItDeps) -> str:
-    name = _engineer_name(engineer_wa, deps.db)
-    mobile = wa_id_to_phone(engineer_wa)
-    return f"Your request has been assigned to {name} ({mobile})."
-
-
 def _format_ist(dt) -> str:
     if not dt:
         return ""
@@ -197,44 +238,58 @@ def _format_ist(dt) -> str:
         dt = datetime.fromtimestamp(dt.timestamp(), tz=timezone.utc)
     elif isinstance(dt, datetime) and not dt.tzinfo:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(_IST).strftime("%d-%m-%Y %I:%M %p")
+    return dt.astimezone(_IST).strftime("%d-%b-%Y %I:%M %p")
 
 
-def _engineer_assigned_count(db: object, engineer_wa: str, same_whatsapp: Callable) -> int:
-    count = 0
-    for snap in query_requests_by_type(db, "IT", limit=300):
-        d = snap.to_dict() or {}
-        if (d.get("it_status") or "").strip().upper() != "ASSIGNED":
-            continue
-        if same_whatsapp(d.get("assigned_engineer"), engineer_wa):
-            count += 1
-    return count
+def _request_status(rd: dict) -> str:
+    raw = (rd.get("it_status") or "PENDING").strip().upper()
+    if raw == "QUEUED":
+        return "PENDING"
+    return raw
 
 
-def _pick_available_engineer(db: object, same_whatsapp: Callable) -> tuple[int, str] | None:
-    for slot, phone in enumerate(IT_ENGINEER_PHONES, start=1):
-        wa_id = wa_from_10(phone)
-        if wa_id and _engineer_assigned_count(db, wa_id, same_whatsapp) == 0:
-            return slot, wa_id
-    return None
+def _load_request(db: object, request_id: str) -> tuple[object, dict] | None:
+    rid = (request_id or "").strip()
+    if not rid:
+        return None
+    ref = db.collection("requests").document(rid)
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    rd = snap.to_dict() or {}
+    if (rd.get("type") or "").strip().upper() != "IT":
+        return None
+    return ref, rd
 
 
-def _oldest_queued(db: object) -> tuple[str, dict] | None:
-    best_id = None
-    best_data = None
-    best_dt = None
-    for snap in query_requests_by_type(db, "IT", limit=300):
-        d = snap.to_dict() or {}
-        if (d.get("it_status") or "").strip().upper() != "QUEUED":
-            continue
-        dt = d.get("requested_datetime")
-        if best_dt is None or (dt and dt < best_dt):
-            best_id = snap.id
-            best_data = d
-            best_dt = dt
-    if best_id and best_data:
-        return best_id, best_data
-    return None
+def _parse_it_action(incoming: str, prefix: str) -> str | None:
+    raw = (incoming or "").strip()
+    upper = raw.upper()
+    p = prefix.upper()
+    if not upper.startswith(p):
+        return None
+    rid = raw[len(prefix) :].strip()
+    return rid or None
+
+
+def _is_assign_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("assign", "assign_request")
+
+
+def _is_reassign_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("re_assign", "reassign", "re_assign_request")
+
+
+def _is_closed_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("closed", "close", "done")
+
+
+def _is_user_close_label(raw: str) -> bool:
+    key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return key in ("close_ticket", "close", "closed")
 
 
 def _flow_pick(data: dict, *keys: str) -> str:
@@ -370,55 +425,139 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
     return out
 
 
-def _engineer_assignment_message(rd: dict) -> str:
-    desc = (rd.get("description") or "").strip()
-    desc_line = f"Description: {desc}" if desc else "Description: —"
+def _user_issue_photo_url(rd: dict) -> str:
+    photo = (rd.get("issue_photo_url") or "").strip()
+    if photo.lower().startswith("https://"):
+        return photo
+    return ""
+
+
+def _ticket_row_title(rd: dict) -> str:
+    issue = (rd.get("issue_type_label") or "—").strip()
+    name = (rd.get("employee_name") or "—").strip()
+    return f"{issue} ({name})"
+
+
+def _ticket_detail(rd: dict) -> str:
     machine_line = ""
     machine_label = (rd.get("machine_no_label") or "").strip()
     if machine_label:
         machine_line = f"Machine: {machine_label}\n"
+    desc = (rd.get("description") or "").strip() or "—"
     return (
-        "You have been assigned the below ticket\n\n"
         f"Name: {rd.get('employee_name') or 'Employee'}\n"
         f"Department: {rd.get('department') or '—'}\n"
         f"Category: {rd.get('it_category_label') or '—'}\n"
         f"{machine_line}"
         f"Issue: {rd.get('issue_type_label') or '—'}\n"
-        f"{desc_line}\n"
+        f"Description: {desc}\n"
         f"Priority: {rd.get('priority_label') or '—'}\n"
-        f"Requested at: {_format_ist(rd.get('requested_datetime'))}"
+        f"Requested at: {_format_ist(rd.get('requested_datetime')) or '—'}"
     )
 
 
-def _engineer_assign_template_name() -> str:
-    """Template with Image header — used when the user attached an issue photo."""
+def _manager_template_name(rd: dict) -> str:
+    if _user_issue_photo_url(rd):
+        return (
+            os.getenv("IT_MANAGER_WITH_PHOTO_TEMPLATE_NAME")
+            or "it_manager_wit_photo_v01"
+        ).strip()
     return (
-        os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME")
-        or os.getenv("IT_TICKET_NOTIFICATION_TEMPLATE_NAME")
-        or "it_ticket_notification"
+        os.getenv("IT_MANAGER_NO_PHOTO_TEMPLATE_NAME")
+        or "it_manager_no_photo_v02"
     ).strip()
 
 
-def _engineer_assign_body_only_template_name() -> str:
-    """Template with no header — used when the user did not attach a photo."""
+def _manager_template_language() -> str:
+    return (os.getenv("IT_MANAGER_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+
+
+def _manager_template_body_fields() -> list[str]:
+    raw = (
+        os.getenv("IT_MANAGER_TEMPLATE_BODY_FIELDS")
+        or "name,department,category,machine,issue,description,requested_at"
+    ).strip()
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def _manager_template_body_values(rd: dict) -> list[str]:
+    values = {
+        "name": (rd.get("employee_name") or "Employee").strip(),
+        "employee": (rd.get("employee_name") or "Employee").strip(),
+        "department": (rd.get("department") or "—").strip(),
+        "category": (rd.get("it_category_label") or "—").strip(),
+        "machine": (rd.get("machine_no_label") or "—").strip() or "—",
+        "issue": (rd.get("issue_type_label") or "—").strip(),
+        "description": (rd.get("description") or "—").strip() or "—",
+        "requested_at": _format_ist(rd.get("requested_datetime")) or "—",
+    }
+    fields = _manager_template_body_fields()
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _notify_it_manager(deps: ItDeps, rd: dict, request_id: str) -> None:
+    mgr = _manager_wa()
+    if not mgr:
+        logger.warning("IT_MANAGER_WHATSAPP_NUMBER not set request_id=%s", request_id)
+        return
+
+    template_name = _manager_template_name(rd)
+    if not template_name:
+        logger.warning("IT manager template not configured request_id=%s", request_id)
+        return
+
+    body_values = _manager_template_body_values(rd)
+    photo_url = _user_issue_photo_url(rd)
+    phone = wa_id_to_phone(mgr)
+
+    try:
+        ensure_customer(phone, name="IT Manager")
+        if photo_url:
+            send_template_with_image_header(
+                phone,
+                template_name,
+                photo_url,
+                language_code=_manager_template_language(),
+                body_values=body_values,
+                callback_data=request_id[:512],
+                ensure_contact=False,
+            )
+        else:
+            send_template(
+                phone,
+                template_name,
+                language_code=_manager_template_language(),
+                body_values=body_values,
+                callback_data=request_id[:512],
+                ensure_contact=False,
+            )
+        deps.session_merge(
+            mgr,
+            state="WAITING_IT_MANAGER_NOTIFY",
+            it_manager_request_id=request_id,
+        )
+        logger.info(
+            "IT manager template sent request_id=%s template=%s photo=%s",
+            request_id,
+            template_name,
+            bool(photo_url),
+        )
+    except Exception:
+        logger.exception(
+            "IT manager template failed request_id=%s template=%s", request_id, template_name
+        )
+
+
+def _engineer_assign_template_name(rd: dict) -> str:
+    if _user_issue_photo_url(rd):
+        return (
+            os.getenv("IT_ENGINEER_ASSIGN_TEMPLATE_NAME")
+            or "it_ticket_with_photo_v01"
+        ).strip()
     return (
         os.getenv("IT_ENGINEER_ASSIGN_BODY_TEMPLATE_NAME")
-        or os.getenv("IT_TICKET_NOTIFICATION_BODY_TEMPLATE_NAME")
-        or "it_ticket_notification_no_image"
+        or "it_ticket_no_photo_v01"
     ).strip()
-
-
-def _user_issue_photo_url(rd: dict) -> str:
-    photo = (rd.get("issue_photo_url") or "").strip()
-    if photo.lower().startswith("https://"):
-        return photo
-    status = (rd.get("issue_photo_status") or "").strip().lower()
-    if status == "uploaded":
-        logger.error(
-            "IT issue photo uploaded but issue_photo_url missing request_id=%s",
-            rd.get("request_id") or "—",
-        )
-    return ""
 
 
 def _engineer_assign_template_language() -> str:
@@ -433,8 +572,8 @@ def _engineer_assign_template_body_fields() -> list[str]:
     return [k.strip().lower() for k in raw.split(",") if k.strip()]
 
 
-def _engineer_assign_template_values(rd: dict) -> dict[str, str]:
-    return {
+def _engineer_assign_template_body_values(rd: dict) -> list[str]:
+    values = {
         "employee": (rd.get("employee_name") or "Employee").strip(),
         "department": (rd.get("department") or "—").strip(),
         "category": (rd.get("it_category_label") or "—").strip(),
@@ -444,97 +583,8 @@ def _engineer_assign_template_values(rd: dict) -> dict[str, str]:
         "priority": (rd.get("priority_label") or "—").strip(),
         "requested_at": _format_ist(rd.get("requested_datetime")) or "—",
     }
-
-
-def _engineer_assign_template_body_values(rd: dict) -> list[str]:
-    values = _engineer_assign_template_values(rd)
     fields = _engineer_assign_template_body_fields()
-    if len(fields) != 8:
-        logger.warning(
-            "IT_ENGINEER_ASSIGN_TEMPLATE_BODY_FIELDS should list exactly 8 fields; got %s",
-            len(fields),
-        )
     return [values.get(key, "—")[:1024] for key in fields]
-
-
-def _send_engineer_assign_template(
-    engineer_wa: str,
-    rd: dict,
-    db: object,
-    *,
-    request_id: str = "",
-) -> bool:
-    phone = wa_id_to_phone(engineer_wa)
-    engineer_name = _engineer_name(engineer_wa, db)
-    body_values = _engineer_assign_template_body_values(rd)
-    callback = (request_id or rd.get("request_id") or "").strip()[:512]
-    user_photo = _user_issue_photo_url(rd)
-
-    if user_photo:
-        template_name = _engineer_assign_template_name()
-        if not template_name:
-            return False
-        try:
-            ensure_customer(phone, name=engineer_name)
-            send_template_with_image_header(
-                phone,
-                template_name,
-                user_photo,
-                language_code=_engineer_assign_template_language(),
-                body_values=body_values,
-                callback_data=callback,
-                ensure_contact=False,
-            )
-            logger.info(
-                "IT engineer assign template sent engineer=%s request_id=%s "
-                "template=%s header=user_photo",
-                engineer_wa,
-                callback,
-                template_name,
-            )
-            return True
-        except Exception:
-            logger.exception(
-                "IT engineer image template failed engineer=%s request_id=%s template=%s",
-                engineer_wa,
-                callback,
-                template_name,
-            )
-            return False
-
-    template_name = _engineer_assign_body_only_template_name()
-    if not template_name:
-        logger.error(
-            "IT ticket has no photo — set IT_ENGINEER_ASSIGN_BODY_TEMPLATE_NAME "
-            "(Utility template with no header)"
-        )
-        return False
-    try:
-        ensure_customer(phone, name=engineer_name)
-        send_template(
-            phone,
-            template_name,
-            language_code=_engineer_assign_template_language(),
-            body_values=body_values,
-            callback_data=callback,
-            ensure_contact=False,
-        )
-        logger.info(
-            "IT engineer assign template sent engineer=%s request_id=%s "
-            "template=%s header=none",
-            engineer_wa,
-            callback,
-            template_name,
-        )
-        return True
-    except Exception:
-        logger.exception(
-            "IT engineer body template failed engineer=%s request_id=%s template=%s",
-            engineer_wa,
-            callback,
-            template_name,
-        )
-        return False
 
 
 def _notify_engineer_assigned(
@@ -544,101 +594,597 @@ def _notify_engineer_assigned(
     *,
     request_id: str = "",
 ) -> None:
-    if _send_engineer_assign_template(
-        engineer_wa, rd, deps.db, request_id=request_id
-    ):
+    template_name = _engineer_assign_template_name(rd)
+    if not template_name:
+        logger.error("IT engineer assign template not configured request_id=%s", request_id)
         return
 
-    ticket_text = _engineer_assignment_message(rd)
-    photo_url = (rd.get("issue_photo_url") or "").strip()
     phone = wa_id_to_phone(engineer_wa)
     engineer_name = _engineer_name(engineer_wa, deps.db)
+    body_values = _engineer_assign_template_body_values(rd)
+    callback = (request_id or rd.get("request_id") or "").strip()[:512]
+    photo_url = _user_issue_photo_url(rd)
 
-    if photo_url:
-        try:
-            send_image(
+    try:
+        ensure_customer(phone, name=engineer_name)
+        if photo_url:
+            send_template_with_image_header(
                 phone,
+                template_name,
                 photo_url,
-                caption=ticket_text,
-                ensure_contact=True,
-                contact_name=engineer_name,
+                language_code=_engineer_assign_template_language(),
+                body_values=body_values,
+                callback_data=callback,
+                ensure_contact=False,
             )
-            return
-        except Exception:
-            logger.exception("IT engineer session image failed engineer=%s", engineer_wa)
-
-        try:
-            send_image(
+        else:
+            send_template(
                 phone,
-                photo_url,
-                ensure_contact=True,
-                contact_name=engineer_name,
+                template_name,
+                language_code=_engineer_assign_template_language(),
+                body_values=body_values,
+                callback_data=callback,
+                ensure_contact=False,
             )
-            deps.send_to(engineer_wa, ticket_text)
-            return
-        except Exception:
-            logger.exception("IT engineer image-only send failed engineer=%s", engineer_wa)
+        logger.info(
+            "IT engineer assign template sent engineer=%s request_id=%s template=%s",
+            engineer_wa,
+            callback,
+            template_name,
+        )
+    except Exception:
+        logger.exception(
+            "IT engineer assign template failed engineer=%s request_id=%s",
+            engineer_wa,
+            callback,
+        )
 
-    deps.send_to(engineer_wa, ticket_text)
+
+def _user_close_template_name() -> str:
+    return (os.getenv("IT_USER_CLOSE_TEMPLATE_NAME") or "it_ticket_close").strip()
 
 
-def _assign_request(
+def _user_close_template_language() -> str:
+    return (os.getenv("IT_USER_CLOSE_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+
+
+def _user_close_template_body_values(rd: dict, engineer_wa: str, deps: ItDeps) -> list[str]:
+    values = {
+        "issue": (rd.get("issue_type_label") or "—").strip(),
+        "description": (rd.get("description") or "—").strip() or "—",
+        "addressed_by": _engineer_name(engineer_wa, deps.db),
+    }
+    raw = (
+        os.getenv("IT_USER_CLOSE_TEMPLATE_BODY_FIELDS")
+        or "issue,description,addressed_by"
+    ).strip()
+    fields = [k.strip().lower() for k in raw.split(",") if k.strip()]
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _notify_user_close_request(
+    employee_wa: str, rd: dict, request_id: str, engineer_wa: str, deps: ItDeps
+) -> None:
+    template_name = _user_close_template_name()
+    if not template_name:
+        logger.error("IT_USER_CLOSE_TEMPLATE_NAME not set request_id=%s", request_id)
+        return
+    phone = wa_id_to_phone(employee_wa)
+    try:
+        ensure_customer(phone, name=(rd.get("employee_name") or "Employee"))
+        send_template(
+            phone,
+            template_name,
+            language_code=_user_close_template_language(),
+            body_values=_user_close_template_body_values(rd, engineer_wa, deps),
+            callback_data=request_id[:512],
+            ensure_contact=False,
+        )
+        logger.info("IT user close template sent request_id=%s", request_id)
+    except Exception:
+        logger.exception("IT user close template failed request_id=%s", request_id)
+
+
+def _employee_assigned_message(engineer_wa: str, deps: ItDeps) -> str:
+    name = _engineer_name(engineer_wa, deps.db)
+    mobile = wa_id_to_phone(engineer_wa)
+    return f"Your IT request has been assigned to {name} ({mobile})."
+
+
+def _complete_it_assignment(
+    sender: str,
     request_id: str,
     rd: dict,
-    engineer_slot: int,
+    ref: object,
     engineer_wa: str,
+    engineer_slot: int,
     deps: ItDeps,
+    *,
+    reassign: bool = False,
 ) -> None:
     engineer_name = _engineer_name(engineer_wa, deps.db)
-    deps.db.collection("requests").document(request_id).set(
-        {
-            "it_status": "ASSIGNED",
-            "assigned_engineer": engineer_wa,
-            "assigned_engineer_name": engineer_name,
-            "assigned_engineer_slot": engineer_slot,
-            "assigned_datetime": deps.utcnow(),
-        },
-        merge=True,
-    )
-    snap = deps.db.collection("requests").document(request_id).get()
-    rd = dict(snap.to_dict() or rd)
-    rd.update({
+    update = {
         "it_status": "ASSIGNED",
         "assigned_engineer": engineer_wa,
         "assigned_engineer_name": engineer_name,
         "assigned_engineer_slot": engineer_slot,
-        "request_id": request_id,
-    })
-    _notify_engineer_assigned(engineer_wa, rd, deps, request_id=request_id)
+        "assigned_datetime": deps.utcnow(),
+        "assigned_by": sender,
+    }
+    if reassign:
+        update["previous_engineer"] = rd.get("assigned_engineer") or ""
+        update["previous_engineer_name"] = rd.get("assigned_engineer_name") or ""
+        update["reassigned_at"] = deps.utcnow()
+    ref.update(update)
+    updated = ref.get().to_dict() or {**rd, **update}
+    updated["request_id"] = request_id
+    _notify_engineer_assigned(engineer_wa, updated, deps, request_id=request_id)
     employee = (rd.get("employee") or "").strip()
     if employee:
         deps.send_to(employee, _employee_assigned_message(engineer_wa, deps))
+    if reassign:
+        old_wa = (rd.get("assigned_engineer") or "").strip()
+        if old_wa and not deps.same_whatsapp(old_wa, engineer_wa):
+            deps.send_to(
+                old_wa,
+                f"The IT ticket has been re-assigned to {engineer_name}. Thanks.",
+            )
+        deps.send_to(sender, f"Re-assigned to {engineer_name}.")
+    else:
+        deps.send_to(sender, f"Assigned to {engineer_name}.")
+    deps.clear_session(sender)
 
 
-def process_it_queue(deps: ItDeps, *, preferred_engineer: str | None = None) -> None:
-    queued = _oldest_queued(deps.db)
-    if not queued:
+def _engineer_options(
+    deps: ItDeps, *, exclude_wa: str = ""
+) -> list[tuple[int, str, str]]:
+    out: list[tuple[int, str, str]] = []
+    for slot, phone in enumerate(IT_ENGINEER_PHONES, start=1):
+        wa_id = wa_from_10(phone)
+        if not wa_id:
+            continue
+        if exclude_wa and deps.same_whatsapp(wa_id, exclude_wa):
+            continue
+        out.append((slot, wa_id, _engineer_name(wa_id, deps.db)))
+    return out
+
+
+def _show_engineer_list(
+    sender: str,
+    request_id: str,
+    deps: ItDeps,
+    *,
+    reassign: bool = False,
+    exclude_wa: str = "",
+) -> None:
+    options = _engineer_options(deps, exclude_wa=exclude_wa)
+    if not options:
+        deps.send_to(sender, "No engineers available to assign.")
         return
-    request_id, rd = queued
+    state = SESSION_WAITING_IT_MANAGER_REASSIGN if reassign else SESSION_WAITING_IT_MANAGER_ASSIGN
+    session_key = "it_reassign_request_id" if reassign else "it_assign_request_id"
+    list_rows = [
+        {"id": f"ITASSIGN_{request_id}_{slot}"[:256], "title": label[:24]}
+        for slot, _wa, label in options
+    ]
+    deps.session_merge(sender, state=state, **{session_key: request_id})
+    try:
+        send_list_menu(
+            wa_id_to_phone(sender),
+            "Select engineer:",
+            list_rows,
+            button_label="Assign",
+            section_title="Engineers",
+            callback_data=request_id,
+        )
+    except Exception:
+        logger.exception("IT engineer list failed request_id=%s", request_id)
+        lines = "\n".join(f"{idx}. {label}" for idx, (_s, _w, label) in enumerate(options, 1))
+        deps.send_to(sender, "Select engineer — reply with the number:\n" + lines)
 
-    pick = None
-    if preferred_engineer:
-        if _engineer_assigned_count(deps.db, preferred_engineer, deps.same_whatsapp) == 0:
-            for slot, phone in enumerate(IT_ENGINEER_PHONES, start=1):
-                if deps.same_whatsapp(wa_from_10(phone), preferred_engineer):
-                    pick = (slot, preferred_engineer)
-                    break
-    if not pick:
-        pick = _pick_available_engineer(deps.db, deps.same_whatsapp)
-    if not pick:
+
+def _send_manager_list_action(sender: str, deps: ItDeps, request_id: str, rd: dict) -> None:
+    status = _request_status(rd)
+    detail = _ticket_detail(rd)
+    if status == "PENDING":
+        assign_id = f"ITMGR_ASSIGN_{request_id}"[:256]
+        try:
+            send_reply_buttons(
+                wa_id_to_phone(sender),
+                detail,
+                [(assign_id, "Assign")],
+                callback_data=request_id,
+            )
+        except Exception:
+            deps.send_to(sender, detail + "\n\nReply Assign to continue.")
+        return
+    if status == "ASSIGNED":
+        reassign_id = f"ITMGR_REASSIGN_{request_id}"[:256]
+        try:
+            send_reply_buttons(
+                wa_id_to_phone(sender),
+                detail,
+                [(reassign_id, "Re Assign")],
+                callback_data=request_id,
+            )
+        except Exception:
+            deps.send_to(sender, detail + "\n\nReply Re Assign to continue.")
+        return
+    deps.send_to(sender, f"Ticket status: {status.lower()}.")
+
+
+def _fetch_manager_list(db: object) -> list[tuple[str, dict]]:
+    rows: list[tuple[str, dict]] = []
+    for snap in query_requests_by_type(db, "IT", limit=300):
+        rd = snap.to_dict() or {}
+        if _request_status(rd) not in ("PENDING", "ASSIGNED"):
+            continue
+        rows.append((snap.id, rd))
+    rows.sort(key=lambda item: item[1].get("requested_datetime") or "", reverse=True)
+    return rows[:15]
+
+
+def try_start_it_list(sender: str, deps: ItDeps) -> None:
+    if is_it_manager(sender, deps.same_whatsapp):
+        rows = _fetch_manager_list(deps.db)
+        if not rows:
+            deps.send_to(sender, "No pending or assigned IT requests.")
+            return
+        list_rows = [
+            {"id": f"ITLIST_{rid}"[:256], "title": _ticket_row_title(rd)[:24]}
+            for rid, rd in rows
+        ]
+        try:
+            send_list_menu(
+                wa_id_to_phone(sender),
+                "IT requests (pending & assigned):",
+                list_rows,
+                button_label="Open",
+                section_title="Tickets",
+                callback_data="it-manager-list",
+            )
+        except Exception:
+            lines = "\n".join(f"• {_ticket_row_title(rd)}" for _rid, rd in rows)
+            deps.send_to(sender, "IT requests:\n" + lines)
         return
 
-    slot, engineer_wa = pick
-    _assign_request(request_id, rd, slot, engineer_wa, deps)
-    process_it_queue(deps, preferred_engineer=preferred_engineer)
+    if is_it_engineer(sender):
+        rows: list[tuple[str, dict]] = []
+        for snap in query_requests_by_type(deps.db, "IT", limit=300):
+            rd = snap.to_dict() or {}
+            if _request_status(rd) != "ASSIGNED":
+                continue
+            if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
+                continue
+            rows.append((snap.id, rd))
+        rows.sort(key=lambda item: item[1].get("requested_datetime") or "", reverse=True)
+        rows = rows[:15]
+        if not rows:
+            deps.send_to(sender, "No assigned IT tickets.")
+            return
+        list_rows = [
+            {"id": f"ITENG_{rid}"[:256], "title": _ticket_row_title(rd)[:24]}
+            for rid, rd in rows
+        ]
+        try:
+            send_list_menu(
+                wa_id_to_phone(sender),
+                "Your assigned IT tickets:",
+                list_rows,
+                button_label="Open",
+                section_title="Assigned",
+                callback_data="it-engineer-list",
+            )
+        except Exception:
+            lines = "\n".join(f"• {_ticket_row_title(rd)}" for _rid, rd in rows)
+            deps.send_to(sender, "Your assigned tickets:\n" + lines)
+        return
+
+    deps.send_to(sender, "Not authorized.")
+
+
+def _handle_manager_assign_click(sender: str, request_id: str, deps: ItDeps) -> bool:
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "IT request not found.")
+        return True
+    _ref, rd = loaded
+    if _request_status(rd) != "PENDING":
+        deps.send_to(sender, f"Request is already {_request_status(rd).lower()}.")
+        return True
+    _show_engineer_list(sender, request_id, deps, reassign=False)
+    return True
+
+
+def _handle_manager_reassign_click(sender: str, request_id: str, deps: ItDeps) -> bool:
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "IT request not found.")
+        return True
+    _ref, rd = loaded
+    if _request_status(rd) != "ASSIGNED":
+        deps.send_to(sender, "Only assigned tickets can be re-assigned.")
+        return True
+    old_wa = (rd.get("assigned_engineer") or "").strip()
+    _show_engineer_list(sender, request_id, deps, reassign=True, exclude_wa=old_wa)
+    return True
+
+
+def handle_it_manager_gate(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    if not is_it_manager(sender, deps.same_whatsapp):
+        return False
+
+    request_id = _parse_it_action(incoming, "ITM_ASSIGN_")
+    if not request_id and _is_assign_label(incoming) and callback_request_id:
+        request_id = callback_request_id.strip()
+    if request_id:
+        return _handle_manager_assign_click(sender, request_id, deps)
+
+    request_id = _parse_it_action(incoming, "ITMGR_ASSIGN_")
+    if request_id:
+        return _handle_manager_assign_click(sender, request_id, deps)
+
+    request_id = _parse_it_action(incoming, "ITMGR_REASSIGN_")
+    if request_id:
+        return _handle_manager_reassign_click(sender, request_id, deps)
+
+    return False
+
+
+def handle_it_manager_list_gate(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    if not is_it_manager(sender, deps.same_whatsapp):
+        return False
+
+    key = (incoming or "").strip().upper()
+    if key in ("IT_LIST", "IT_LIST_MENU"):
+        try_start_it_list(sender, deps)
+        return True
+
+    request_id = _parse_it_action(incoming, "ITLIST_")
+    if request_id:
+        loaded = _load_request(deps.db, request_id)
+        if not loaded:
+            deps.send_to(sender, "IT request not found.")
+            return True
+        _ref, rd = loaded
+        _send_manager_list_action(sender, deps, request_id, rd)
+        return True
+    return False
+
+
+def _parse_itassign(
+    incoming: str, *, request_id_hint: str = ""
+) -> tuple[str, int] | None:
+    raw = (incoming or "").strip()
+    if not raw.upper().startswith("ITASSIGN_"):
+        return None
+    rid_hint = (request_id_hint or "").strip()
+    if rid_hint:
+        prefix = f"ITASSIGN_{rid_hint}_"
+        if raw.startswith(prefix):
+            try:
+                return rid_hint, int(raw[len(prefix) :].strip())
+            except ValueError:
+                return None
+    rest = raw[9:]
+    for slot in (3, 2, 1):
+        suffix = f"_{slot}"
+        if rest.endswith(suffix):
+            rid = rest[: -len(suffix)]
+            if rid:
+                return rid, slot
+    return None
+
+
+def handle_it_manager_assign_pick(
+    sender: str, incoming: str, session: dict, deps: ItDeps
+) -> None:
+    if not is_it_manager(sender, deps.same_whatsapp):
+        deps.clear_session(sender)
+        return
+
+    reassign = is_it_manager_reassign_state((session or {}).get("state"))
+    session_rid = (
+        (session or {}).get("it_reassign_request_id")
+        if reassign
+        else (session or {}).get("it_assign_request_id")
+    ) or ""
+
+    parsed = _parse_itassign(incoming, request_id_hint=session_rid)
+    if not parsed:
+        deps.send_to(sender, "Invalid selection.")
+        return
+
+    request_id, slot = parsed
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.clear_session(sender)
+        deps.send_to(sender, "IT request not found.")
+        return
+    ref, rd = loaded
+    want = "ASSIGNED" if reassign else "PENDING"
+    if _request_status(rd) != want:
+        deps.clear_session(sender)
+        deps.send_to(sender, f"Request is already {_request_status(rd).lower()}.")
+        return
+
+    engineer_wa = ""
+    for s, phone in enumerate(IT_ENGINEER_PHONES, start=1):
+        if s == slot:
+            engineer_wa = wa_from_10(phone)
+            break
+    if not engineer_wa:
+        deps.send_to(sender, "Invalid engineer.")
+        return
+
+    if reassign and deps.same_whatsapp(engineer_wa, rd.get("assigned_engineer") or ""):
+        deps.send_to(sender, "Choose a different engineer.")
+        return
+
+    _complete_it_assignment(
+        sender,
+        request_id,
+        rd,
+        ref,
+        engineer_wa,
+        slot,
+        deps,
+        reassign=reassign,
+    )
+
+
+def handle_it_engineer_list_gate(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    if not is_it_engineer(sender):
+        return False
+
+    key = (incoming or "").strip().upper()
+    if key in ("IT_LIST", "IT_LIST_MENU"):
+        try_start_it_list(sender, deps)
+        return True
+
+    request_id = _parse_it_action(incoming, "ITENG_")
+    if request_id:
+        loaded = _load_request(deps.db, request_id)
+        if not loaded:
+            deps.send_to(sender, "IT request not found.")
+            return True
+        _ref, rd = loaded
+        if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
+            deps.send_to(sender, "Not authorized for this ticket.")
+            return True
+        if _request_status(rd) != "ASSIGNED":
+            deps.send_to(sender, f"Ticket is already {_request_status(rd).lower()}.")
+            return True
+        closed_id = f"ITCLOSED_{request_id}"[:256]
+        try:
+            send_reply_buttons(
+                wa_id_to_phone(sender),
+                _ticket_detail(rd),
+                [(closed_id, "Closed")],
+                callback_data=request_id,
+            )
+        except Exception:
+            deps.send_to(sender, _ticket_detail(rd) + "\n\nReply Closed when done.")
+        return True
+    return False
+
+
+def handle_it_engineer_close_gate(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    if not is_it_engineer(sender):
+        return False
+
+    request_id = _parse_it_action(incoming, "ITCLOSED_")
+    if not request_id and _is_closed_label(incoming) and callback_request_id:
+        request_id = callback_request_id.strip()
+    if not request_id:
+        return False
+
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "IT request not found.")
+        return True
+    ref, rd = loaded
+    if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
+        deps.send_to(sender, "Not authorized for this ticket.")
+        return True
+    if _request_status(rd) != "ASSIGNED":
+        deps.send_to(sender, f"Ticket is already {_request_status(rd).lower()}.")
+        return True
+
+    ref.update({
+        "it_status": "AWAITING_USER_CLOSE",
+        "engineer_closed_at": deps.utcnow(),
+        "engineer_closed_by": sender,
+    })
+    employee = (rd.get("employee") or "").strip()
+    if employee:
+        _notify_user_close_request(employee, rd, request_id, sender, deps)
+    mgr = _manager_wa()
+    if mgr:
+        deps.send_to(
+            mgr,
+            f"IT ticket closed by engineer — awaiting user confirmation: "
+            f"{rd.get('issue_type_label') or '—'} ({rd.get('employee_name') or '—'})",
+        )
+    deps.send_to(sender, "User notified to confirm closure. Thank you.")
+    return True
+
+
+def handle_it_user_close_gate(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    request_id = _parse_it_action(incoming, "ITUSER_CLOSE_")
+    if not request_id and _is_user_close_label(incoming) and callback_request_id:
+        request_id = callback_request_id.strip()
+    if not request_id:
+        return False
+
+    loaded = _load_request(deps.db, request_id)
+    if not loaded:
+        deps.send_to(sender, "IT request not found.")
+        return True
+    ref, rd = loaded
+    if not deps.same_whatsapp(rd.get("employee"), sender):
+        deps.send_to(sender, "This IT request does not belong to you.")
+        return True
+    if _request_status(rd) != "AWAITING_USER_CLOSE":
+        deps.send_to(sender, "This ticket is not awaiting your confirmation.")
+        return True
+
+    ref.update({
+        "it_status": "CLOSED",
+        "closed_datetime": deps.utcnow(),
+        "closed_by": sender,
+    })
+    engineer_wa = (rd.get("assigned_engineer") or "").strip()
+    deps.send_to(sender, "Your IT request has been closed. Thank you.")
+    if engineer_wa:
+        deps.send_to(
+            engineer_wa,
+            f"IT ticket from {rd.get('employee_name') or 'employee'} has been closed.",
+        )
+    mgr = _manager_wa()
+    if mgr:
+        deps.send_to(
+            mgr,
+            f"IT ticket closed by user: {rd.get('issue_type_label') or '—'} "
+            f"({rd.get('employee_name') or '—'})",
+        )
+    return True
 
 
 def try_start_form(sender: str, deps: ItDeps) -> None:
+    if is_it_manager(sender, deps.same_whatsapp):
+        deps.send_to(sender, IT_MANAGER_CANNOT_RAISE_MSG)
+        return
     if is_it_engineer(sender):
         deps.send_to(sender, IT_ENGINEER_CANNOT_RAISE_MSG)
         return
@@ -671,81 +1217,10 @@ def try_start_form(sender: str, deps: ItDeps) -> None:
     deps.send_to(sender, "Could not open IT form. Please try again or contact admin.")
 
 
-def handle(sender: str, incoming: str, session: dict, deps: ItDeps) -> None:
-    state = (session or {}).get("state")
-    choice = (incoming or "").strip().upper()
-
-    if state != IT_CONFIRM_CLOSE:
-        deps.send_to(sender, "Send Hi and choose IT - Form from the menu.")
-        return
-
-    request_id = (session or {}).get("it_request_id") or ""
-    if not request_id:
-        deps.clear_session(sender)
-        deps.send_to(sender, "Could not find your IT request. Send Hi to start again.")
-        return
-
-    if choice in ("CANCEL", IT_CANCEL):
-        _finish_request(sender, request_id, session, deps, status="CANCELLED", user_msg="Your IT request has been cancelled.")
-        return
-
-    if choice not in (IT_CLOSE, "CLOSE"):
-        deps.send_to(sender, "Reply CLOSE to mark resolved, or CANCEL to cancel the request.")
-        return
-
-    _finish_request(sender, request_id, session, deps, status="CLOSED", user_msg="Your IT request has been closed. Thank you.")
-
-
-def _finish_request(
-    sender: str,
-    request_id: str,
-    session: dict,
-    deps: ItDeps,
-    *,
-    status: str,
-    user_msg: str,
-) -> None:
-    snap = deps.db.collection("requests").document(request_id).get()
-    if not snap.exists:
-        deps.clear_session(sender)
-        deps.send_to(sender, "IT request not found. Send Hi to start again.")
-        return
-
-    rd = snap.to_dict() or {}
-    if not deps.same_whatsapp(rd.get("employee"), sender):
-        deps.clear_session(sender)
-        deps.send_to(sender, "This IT request does not belong to you.")
-        return
-
-    current = (rd.get("it_status") or "").strip().upper()
-    if current not in IT_OPEN_STATUSES:
-        deps.clear_session(sender)
-        deps.send_to(sender, "This IT request is already closed.")
-        return
-
-    engineer_wa = (rd.get("assigned_engineer") or "").strip()
-    deps.db.collection("requests").document(request_id).set(
-        {
-            "it_status": status,
-            "closed_datetime": deps.utcnow(),
-            "closed_by": sender,
-        },
-        merge=True,
-    )
-    deps.clear_session(sender)
-    deps.send_to(sender, user_msg)
-    if engineer_wa:
-        action = "closed" if status == "CLOSED" else "cancelled"
-        deps.send_to(
-            engineer_wa,
-            f"IT ticket from {rd.get('employee_name') or 'employee'} has been {action} by the requester.",
-        )
-        process_it_queue(deps, preferred_engineer=engineer_wa)
-    else:
-        process_it_queue(deps)
-
-
 def handle_flow_submission(sender: str, response_json: dict | str | None, deps: ItDeps) -> None:
+    if is_it_manager(sender, deps.same_whatsapp):
+        deps.send_to(sender, IT_MANAGER_CANNOT_RAISE_MSG)
+        return
     if is_it_engineer(sender):
         deps.send_to(sender, IT_ENGINEER_CANNOT_RAISE_MSG)
         return
@@ -772,8 +1247,37 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
         )
         return
 
+    photo_raw = _issue_photo_from_flow_data(flow_data)
+    from it_flow_media import photo_debug_summary, process_it_issue_photo
+
     ref = deps.db.collection("requests").document()
     request_id = ref.id
+    logger.info(
+        "IT flow submit request_id=%s flow_keys=%s photo=%s",
+        request_id,
+        sorted(flow_data.keys()) if flow_data else [],
+        photo_debug_summary(photo_raw),
+    )
+    if not photo_raw:
+        deps.send_to(
+            sender,
+            "Issue photo is required. Please attach a photo and submit again.",
+        )
+        return
+
+    photo_fields, status_msg = process_it_issue_photo(photo_raw, request_id)
+    if not photo_fields or not (photo_fields.get("issue_photo_url") or "").strip():
+        logger.warning(
+            "IT photo upload failed request_id=%s status=%s",
+            request_id,
+            status_msg,
+        )
+        deps.send_to(
+            sender,
+            "Could not upload the issue photo. Please try again.",
+        )
+        return
+
     now = deps.utcnow()
     reason = f"{parsed['it_category_label']} — {parsed['issue_type_label']}"
     if parsed.get("machine_no_label"):
@@ -796,10 +1300,12 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
         "description": parsed.get("description") or "",
         "priority": parsed["priority"],
         "priority_label": parsed["priority_label"],
-        "issue_photo_url": "",
-        "issue_photo_path": "",
-        "issue_photo_file_name": "",
-        "it_status": "QUEUED",
+        "issue_photo_url": photo_fields.get("issue_photo_url") or "",
+        "issue_photo_path": photo_fields.get("issue_photo_path") or "",
+        "issue_photo_file_name": photo_fields.get("issue_photo_file_name") or "",
+        "issue_photo_status": photo_fields.get("issue_photo_status") or "uploaded",
+        "issue_photo_debug": status_msg,
+        "it_status": "PENDING",
         "assigned_engineer": "",
         "assigned_engineer_name": "",
         "assigned_engineer_slot": 0,
@@ -811,40 +1317,9 @@ def handle_flow_submission(sender: str, response_json: dict | str | None, deps: 
     }
     ref.set(payload)
 
-    photo_raw = _issue_photo_from_flow_data(flow_data)
-    from it_flow_media import photo_debug_summary, process_it_issue_photo
-
-    logger.info(
-        "IT flow submit request_id=%s flow_keys=%s photo=%s",
-        request_id,
-        sorted(flow_data.keys()) if flow_data else [],
-        photo_debug_summary(photo_raw),
+    deps.send_to(
+        sender,
+        "Your IT request has been submitted.\n"
+        "The IT manager will assign an engineer shortly.",
     )
-    if photo_raw:
-        photo_fields, status_msg = process_it_issue_photo(photo_raw, request_id)
-        merge = {"issue_photo_debug": status_msg}
-        if photo_fields:
-            merge.update(photo_fields)
-            payload.update(photo_fields)
-        else:
-            merge["issue_photo_status"] = "failed"
-        ref.set(merge, merge=True)
-    else:
-        ref.set(
-            {
-                "issue_photo_status": "missing",
-                "issue_photo_debug": "no_photo_in_payload",
-            },
-            merge=True,
-        )
-
-    pick = _pick_available_engineer(deps.db, deps.same_whatsapp)
-    if pick:
-        slot, engineer_wa = pick
-        _assign_request(request_id, payload, slot, engineer_wa, deps)
-    else:
-        deps.send_to(
-            sender,
-            "Your IT request has been submitted. "
-            "Our engineers are busy — it will be assigned when one is free.",
-        )
+    _notify_it_manager(deps, payload, request_id)

@@ -161,6 +161,8 @@ _ROW_IDS = {
     "permission_-_form": "PERMISSION_FORM",
     "it_form": "IT_FORM",
     "it_-_form": "IT_FORM",
+    "it_list": "IT_LIST",
+    "it_-_list": "IT_LIST",
     "vehicle_request_form": "VEHICLE_REQUEST_FORM",
     "vehicle_-_request_form": "VEHICLE_REQUEST_FORM",
     "vehicle_manage": "VEHICLE_MANAGE",
@@ -513,8 +515,11 @@ def _request_menu_items(
         ("1", "od_form", "OD - Form"),
         ("2", "visitor_form", "Visitor - Form"),
         ("3", "leave_form", "Leave - Form"),
-        ("4", "it_form", "IT - Form"),
     ]
+    if it_request.show_it_form_for_user(user_data, wa_id, _same_whatsapp):
+        items.append((str(len(items) + 1), "it_form", "IT - Form"))
+    if it_request.show_it_list_menu(wa_id, _same_whatsapp):
+        items.append((str(len(items) + 1), "it_list", "IT - List"))
     if maintenance_request.show_maintenance_menu_for_user(user_data):
         items.append(
             (str(len(items) + 1), "maintenance_form", "Maintenance - Form")
@@ -684,6 +689,8 @@ def _normalize_choice(raw: str) -> str:
         "leave form": "LEAVE_FORM",
         "it - form": "IT_FORM",
         "it form": "IT_FORM",
+        "it - list": "IT_LIST",
+        "it list": "IT_LIST",
         "vehicle - form": "VEHICLE_REQUEST_FORM",
         "vehicle form": "VEHICLE_REQUEST_FORM",
         "vehicle request form": "VEHICLE_REQUEST_FORM",
@@ -885,6 +892,8 @@ def _extract_message(message_field) -> str:
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
                     "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
+                    "ITM_", "ITMGR_", "ITLIST_", "ITASSIGN_", "ITENG_", "ITCLOSED_",
+                    "ITUSER_CLOSE_",
                 )
             ):
                 return bid
@@ -901,6 +910,8 @@ def _extract_message(message_field) -> str:
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
                     "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
+                    "ITM_", "ITMGR_", "ITLIST_", "ITASSIGN_", "ITENG_", "ITCLOSED_",
+                    "ITUSER_CLOSE_",
                 )
             ):
                 return bid
@@ -1154,6 +1165,46 @@ def _process(
     ):
         return
 
+    if it_request.handle_it_user_close_gate(
+        sender,
+        incoming,
+        IT_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if it_request.handle_it_engineer_close_gate(
+        sender,
+        incoming,
+        IT_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if it_request.handle_it_engineer_list_gate(
+        sender,
+        incoming,
+        IT_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if it_request.handle_it_manager_gate(
+        sender,
+        incoming,
+        IT_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if it_request.handle_it_manager_list_gate(
+        sender,
+        incoming,
+        IT_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
     if maintenance_request.handle_team_list_gate(
         sender,
         incoming,
@@ -1247,8 +1298,16 @@ def _process(
         _send_to(sender, REQUEST_CANNOT_BE_RAISED_MSG)
         return
 
-    if it_request.is_it_state(state):
-        it_request.handle(sender, incoming, session or {}, IT_DEPS)
+    if it_request.is_it_manager_reassign_state(state):
+        it_request.handle_it_manager_assign_pick(
+            sender, incoming, session or {}, IT_DEPS
+        )
+        return
+
+    if it_request.is_it_manager_assign_state(state):
+        it_request.handle_it_manager_assign_pick(
+            sender, incoming, session or {}, IT_DEPS
+        )
         return
 
     if maintenance_request.is_maintenance_reassign_state(state):
@@ -1342,6 +1401,8 @@ def _process(
             leave_request.try_start_form(sender, LEAVE_DEPS)
         elif menu_form == "IT_FORM":
             it_request.try_start_form(sender, IT_DEPS)
+        elif menu_form == "IT_LIST":
+            it_request.try_start_it_list(sender, IT_DEPS)
         elif menu_form == "MAINTENANCE_FORM":
             maintenance_request.try_start_form(sender, MAINTENANCE_DEPS)
         elif menu_form == "MAINTENANCE_MANAGE":
