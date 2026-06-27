@@ -289,12 +289,17 @@ def _is_reassign_label(raw: str) -> bool:
 
 def _is_closed_label(raw: str) -> bool:
     key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
-    return key in ("closed", "close", "done")
+    return key in ("closed", "done")
 
 
 def _is_user_close_label(raw: str) -> bool:
     key = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
-    return key in ("close_ticket", "close_ticket_request")
+    return key in (
+        "close_ticket",
+        "close_ticket_request",
+        "close",
+        "confirm_close",
+    )
 
 
 def _flow_pick(data: dict, *keys: str) -> str:
@@ -497,6 +502,8 @@ def _engineer_list_row_line(rd: dict) -> str:
     """Engineer IT - List: Requester - Issue - description snippet."""
     requester = (rd.get("employee_name") or "—").strip()
     issue = (rd.get("issue_type_label") or "—").strip()
+    if _request_status(rd) == "AWAITING_USER_CLOSE":
+        return f"{requester} - {issue} - Awaiting user close"
     desc = " ".join(((rd.get("description") or "").strip() or "—").split())
     return f"{requester} - {issue} - {desc}"
 
@@ -979,7 +986,7 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
         rows: list[tuple[str, dict]] = []
         for snap in query_requests_by_type(deps.db, "IT", limit=300):
             rd = snap.to_dict() or {}
-            if _request_status(rd) != "ASSIGNED":
+            if _request_status(rd) not in ("ASSIGNED", "AWAITING_USER_CLOSE"):
                 continue
             if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
                 continue
@@ -987,7 +994,7 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
         rows.sort(key=lambda item: item[1].get("requested_datetime") or "", reverse=True)
         rows = rows[:15]
         if not rows:
-            deps.send_to(sender, "No assigned IT tickets.")
+            deps.send_to(sender, "No active IT tickets.")
             return
         list_rows = [
             _engineer_list_row_fields(rid, rd) for rid, rd in rows
@@ -995,10 +1002,10 @@ def try_start_it_list(sender: str, deps: ItDeps) -> None:
         try:
             send_list_menu_paged(
                 wa_id_to_phone(sender),
-                "Your assigned IT tickets:",
+                "Your IT tickets (tap to open or request user close):",
                 list_rows,
                 button_label="Open",
-                section_title="Assigned",
+                section_title="Tickets",
                 callback_data="it-engineer-list",
             )
         except Exception:
@@ -1257,8 +1264,20 @@ def handle_it_engineer_list_gate(
         if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
             deps.send_to(sender, "Not authorized for this ticket.")
             return True
-        if _request_status(rd) != "ASSIGNED":
-            deps.send_to(sender, f"Ticket is already {_request_status(rd).lower()}.")
+        status = _request_status(rd)
+        if status == "AWAITING_USER_CLOSE":
+            employee = (rd.get("employee") or "").strip()
+            if employee:
+                _notify_user_close_request(employee, rd, request_id, sender, deps)
+                deps.send_to(
+                    sender,
+                    "Close request sent to the user again. Thank you.",
+                )
+            else:
+                deps.send_to(sender, "No employee contact on this ticket.")
+            return True
+        if status != "ASSIGNED":
+            deps.send_to(sender, f"Ticket is already {status.lower()}.")
             return True
         if not _notify_engineer_assigned(
             sender, rd, deps, request_id=request_id, context="list"
@@ -1282,6 +1301,26 @@ def _find_engineer_closable_request(
         if not wa or not same_whatsapp(engineer_wa, wa):
             continue
         ts = rd.get("requested_datetime")
+        if best_ts is None or (ts and ts > best_ts):
+            best_ts = ts
+            best_id = snap.id
+    return best_id
+
+
+def _find_user_closable_request(
+    db: object, employee_wa: str, same_whatsapp: Callable
+) -> str:
+    """Most recent AWAITING_USER_CLOSE ticket for this employee (Close Ticket without callback)."""
+    best_id = ""
+    best_ts = None
+    for snap in query_requests_by_type(db, "IT", limit=300):
+        rd = snap.to_dict() or {}
+        if _request_status(rd) != "AWAITING_USER_CLOSE":
+            continue
+        wa = (rd.get("employee") or "").strip()
+        if not wa or not same_whatsapp(employee_wa, wa):
+            continue
+        ts = rd.get("engineer_closed_at") or rd.get("requested_datetime")
         if best_ts is None or (ts and ts > best_ts):
             best_ts = ts
             best_id = snap.id
@@ -1333,13 +1372,6 @@ def handle_it_engineer_close_gate(
     employee = (rd.get("employee") or "").strip()
     if employee:
         _notify_user_close_request(employee, rd, request_id, sender, deps)
-    mgr = _manager_wa()
-    if mgr:
-        deps.send_to(
-            mgr,
-            f"IT ticket closed by engineer — awaiting user confirmation: "
-            f"{rd.get('issue_type_label') or '—'} ({rd.get('employee_name') or '—'})",
-        )
     deps.send_to(sender, "User notified to confirm closure. Thank you.")
     return True
 
@@ -1351,11 +1383,27 @@ def handle_it_user_close_gate(
     *,
     callback_request_id: str = "",
 ) -> bool:
-    request_id = _parse_it_action(incoming, "ITUSER_CLOSE_")
-    if not request_id and _is_user_close_label(incoming) and callback_request_id:
-        request_id = _normalize_it_callback_request_id(callback_request_id)
-    if not request_id:
+    if not _is_user_close_label(incoming) and not _parse_it_action(
+        incoming, "ITUSER_CLOSE_"
+    ):
         return False
+
+    request_id = _parse_it_action(incoming, "ITUSER_CLOSE_")
+    if not request_id:
+        cb = _normalize_it_callback_request_id(callback_request_id)
+        if _is_user_close_label(incoming) and cb:
+            request_id = cb
+    if not request_id and _is_user_close_label(incoming):
+        request_id = _find_user_closable_request(
+            deps.db, sender, deps.same_whatsapp
+        )
+    if not request_id:
+        deps.send_to(
+            sender,
+            "Could not identify the ticket.\n"
+            "Open the IT close message again and tap Close Ticket.",
+        )
+        return True
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
@@ -1374,19 +1422,13 @@ def handle_it_user_close_gate(
         "closed_datetime": deps.utcnow(),
         "closed_by": sender,
     })
+    deps.clear_session(sender)
     engineer_wa = (rd.get("assigned_engineer") or "").strip()
     deps.send_to(sender, "Your IT request has been closed. Thank you.")
     if engineer_wa:
         deps.send_to(
             engineer_wa,
             f"IT ticket from {rd.get('employee_name') or 'employee'} has been closed.",
-        )
-    mgr = _manager_wa()
-    if mgr:
-        deps.send_to(
-            mgr,
-            f"IT ticket closed by user: {rd.get('issue_type_label') or '—'} "
-            f"({rd.get('employee_name') or '—'})",
         )
     return True
 

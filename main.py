@@ -959,11 +959,35 @@ def _callback_from_meta(meta: object) -> str:
     return ""
 
 
+def _deep_find_callback_data(obj: object, *, depth: int = 0) -> str:
+    if depth > 10:
+        return ""
+    if isinstance(obj, dict):
+        for key in ("callbackData", "callback_data"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for val in obj.values():
+            found = _deep_find_callback_data(val, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _deep_find_callback_data(item, depth=depth + 1)
+            if found:
+                return found
+    return ""
+
+
 def _extract_webhook_callback_request_id(body: dict) -> str:
     """Request id echoed when approver taps a template quick-reply (callbackData)."""
     data = body.get("data") or {}
     msg_obj = data.get("message") or {}
-    for candidate in (body, data, msg_obj):
+    raw_msg = msg_obj.get("message")
+    candidates: list[object] = [body, data, msg_obj]
+    if isinstance(raw_msg, dict):
+        candidates.append(raw_msg)
+    for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
         for key in ("callbackData", "callback_data"):
@@ -973,7 +997,7 @@ def _extract_webhook_callback_request_id(body: dict) -> str:
         rid = _callback_from_meta(candidate.get("meta_data"))
         if rid:
             return rid
-    return ""
+    return _deep_find_callback_data(body)
 
 
 def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
