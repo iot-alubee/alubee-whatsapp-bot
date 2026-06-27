@@ -563,38 +563,12 @@ def _notify_maintenance_manager(
         return
 
     body_values = _manager_template_body_values(rd)
-    assign_id = f"MMAINT_ASSIGN_{request_id}"[:256]
-    session_body = (
-        "New maintenance request\n\n"
-        f"Employee: {rd.get('employee_name') or '—'}\n"
-        f"Unit: {_unit_label(route)}\n"
-        f"Department: {rd.get('department') or '—'}\n"
-        f"Machine: {rd.get('machine_no_label') or '—'}\n"
-        f"Issue: {rd.get('issue_category_label') or '—'}\n"
-        f"Requested at: {_format_ist(rd.get('requested_datetime')) or '—'}"
-    )
-
-    if deps.has_active_whatsapp_session(mgr):
-        try:
-            send_reply_buttons(
-                wa_id_to_phone(mgr),
-                session_body,
-                [(assign_id, "Assign")],
-                callback_data=request_id,
-                ensure_contact=True,
-                contact_name="Maintenance Manager",
-            )
-            _set_pending_manager_notify(deps, mgr, request_id)
-            return
-        except Exception:
-            logger.exception(
-                "maintenance manager session buttons failed request_id=%s", request_id
-            )
 
     try:
-        ensure_customer(wa_id_to_phone(mgr), name="Maintenance Manager")
+        phone = wa_id_to_phone(mgr)
+        ensure_customer(phone, name="Maintenance Manager")
         send_template_with_image_header(
-            wa_id_to_phone(mgr),
+            phone,
             template_name,
             photo_url,
             language_code=_manager_template_language(),
@@ -604,61 +578,70 @@ def _notify_maintenance_manager(
         )
         _set_pending_manager_notify(deps, mgr, request_id)
         logger.info(
-            "maintenance manager template sent route=%s request_id=%s template=%s",
+            "maintenance manager image template sent route=%s request_id=%s "
+            "template=%s photo=%s",
             route,
             request_id,
             template_name,
+            photo_url[:80],
         )
     except Exception:
         logger.exception(
-            "maintenance manager template failed request_id=%s template=%s",
+            "maintenance manager template failed request_id=%s template=%s photo=%s",
             request_id,
             template_name,
+            photo_url[:80],
         )
 
 
 def _notify_assignee(
     deps: MaintenanceDeps, rd: dict, request_id: str, assignee_wa: str
 ) -> None:
+    """Notify technician via approved image-header template (issue photo in header)."""
     if not assignee_wa:
         return
-    template_name = _team_notify_template_name()
-    photo_url = _issue_photo_url(rd)
-    body_fields = _team_notify_template_body_fields()
-    body_values = (
-        _team_notify_template_body_values(rd, request_id) if body_fields else None
-    )
-    from interakt_api import send_image
 
+    photo_url = _issue_photo_url(rd)
+    if not photo_url:
+        logger.error(
+            "maintenance assignee notify skipped — no photo request_id=%s",
+            request_id,
+        )
+        return
+
+    template_name = _team_notify_template_name()
+    if not template_name:
+        logger.warning(
+            "maintenance team template not configured request_id=%s", request_id
+        )
+        return
+
+    body_values = _team_notify_template_body_values(rd, request_id)
     phone = wa_id_to_phone(assignee_wa)
-    if template_name and photo_url:
-        try:
-            ensure_customer(phone, name=(rd.get("assigned_to") or "Maintenance"))
-            send_template_with_image_header(
-                phone,
-                template_name,
-                photo_url,
-                language_code=_team_notify_template_language(),
-                body_values=body_values,
-                callback_data=request_id[:512],
-                ensure_contact=False,
-            )
-            return
-        except Exception:
-            logger.exception(
-                "maintenance assignee template failed request_id=%s", request_id
-            )
-    caption = (
-        f"Maintenance assigned\n"
-        f"{rd.get('machine_no_label') or '—'} — {rd.get('issue_category_label') or '—'}"
-    )
-    if photo_url:
-        try:
-            send_image(phone, photo_url, caption=caption, ensure_contact=True)
-            return
-        except Exception:
-            logger.exception("maintenance assignee image failed request_id=%s", request_id)
-    deps.send_to(assignee_wa, caption)
+    try:
+        ensure_customer(phone, name=(rd.get("assigned_to") or "Maintenance"))
+        send_template_with_image_header(
+            phone,
+            template_name,
+            photo_url,
+            language_code=_team_notify_template_language(),
+            body_values=body_values,
+            callback_data=request_id[:512],
+            ensure_contact=False,
+        )
+        logger.info(
+            "maintenance team image template sent request_id=%s template=%s photo=%s",
+            request_id,
+            template_name,
+            photo_url[:80],
+        )
+    except Exception:
+        logger.exception(
+            "maintenance team template failed request_id=%s template=%s photo=%s",
+            request_id,
+            template_name,
+            photo_url[:80],
+        )
 
 
 def _complete_maintenance_assignment(
