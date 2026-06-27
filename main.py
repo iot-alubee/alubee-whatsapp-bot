@@ -167,6 +167,10 @@ _ROW_IDS = {
     "vehicle_-_manage": "VEHICLE_MANAGE",
     "maintenance_form": "MAINTENANCE_FORM",
     "maintenance_-_form": "MAINTENANCE_FORM",
+    "maintenance_manage": "MAINTENANCE_MANAGE",
+    "maintenance_-_manage": "MAINTENANCE_MANAGE",
+    "maintenance_list": "MAINTENANCE_LIST",
+    "maintenance_-_list": "MAINTENANCE_LIST",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -496,6 +500,8 @@ MAINTENANCE_DEPS = maintenance_request.MaintenanceDeps(
     utcnow=_utcnow,
     clear_session=lambda sender: _session_ref(sender).delete(),
     go_main_menu=_go_main_menu_for_employee,
+    same_whatsapp=_same_whatsapp,
+    has_active_whatsapp_session=_has_active_whatsapp_session,
 )
 
 
@@ -512,6 +518,14 @@ def _request_menu_items(
     if maintenance_request.show_maintenance_menu_for_user(user_data):
         items.append(
             (str(len(items) + 1), "maintenance_form", "Maintenance - Form")
+        )
+    if maintenance_request.show_maintenance_team_list_menu(user_data):
+        items.append(
+            (str(len(items) + 1), "maintenance_list", "Maintenance - List")
+        )
+    if maintenance_request.show_maintenance_manager_menu(wa_id, _same_whatsapp):
+        items.append(
+            (str(len(items) + 1), "maintenance_manage", "Maintenance - Manage")
         )
     if vehicle_request.show_vehicle_menu_for_user(
         user_data, wa_id, _same_whatsapp
@@ -675,6 +689,10 @@ def _normalize_choice(raw: str) -> str:
         "vehicle request form": "VEHICLE_REQUEST_FORM",
         "maintenance - form": "MAINTENANCE_FORM",
         "maintenance form": "MAINTENANCE_FORM",
+        "maintenance - manage": "MAINTENANCE_MANAGE",
+        "maintenance manage": "MAINTENANCE_MANAGE",
+        "maintenance - list": "MAINTENANCE_LIST",
+        "maintenance list": "MAINTENANCE_LIST",
     }
     return titles.get(s.lower(), s)
 
@@ -866,6 +884,7 @@ def _extract_message(message_field) -> str:
                 (
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
+                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
                 )
             ):
                 return bid
@@ -881,6 +900,7 @@ def _extract_message(message_field) -> str:
                 (
                     "APPROVE_", "DENY_", "MANAGE_", "CLARITY_", "VEHICLE_", "VMANAGE_",
                     "VMREASSIGN_", "VMCANCEL_", "VREASSIGN_", "VASSIGN_",
+                    "MMAINT_", "MTEAM_", "MMANAGE_", "MASSIGN_",
                 )
             ):
                 return bid
@@ -1134,7 +1154,39 @@ def _process(
     ):
         return
 
+    if maintenance_request.handle_team_list_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if maintenance_request.handle_maintenance_assignee_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
     if vehicle_request.handle_assignee_gate(sender, incoming, VEHICLE_REQUEST_DEPS):
+        return
+
+    if maintenance_request.handle_manager_manage_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if maintenance_request.handle_maintenance_manager_gate(
+        sender,
+        incoming,
+        MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
         return
 
     if vehicle_request.handle_manager_manage_gate(
@@ -1197,6 +1249,28 @@ def _process(
 
     if it_request.is_it_state(state):
         it_request.handle(sender, incoming, session or {}, IT_DEPS)
+        return
+
+    if maintenance_request.is_maintenance_reassign_state(state):
+        maintenance_request.handle_maintenance_reassign_pick(
+            sender, incoming, session or {}, MAINTENANCE_DEPS
+        )
+        return
+
+    if maintenance_request.is_maintenance_manage_action_state(state):
+        maintenance_request.handle_manager_manage_action(
+            sender,
+            incoming,
+            session or {},
+            MAINTENANCE_DEPS,
+            callback_request_id=callback_request_id,
+        )
+        return
+
+    if maintenance_request.is_maintenance_assign_state(state):
+        maintenance_request.handle_maintenance_assign_pick(
+            sender, incoming, session or {}, MAINTENANCE_DEPS
+        )
         return
 
     if vehicle_request.is_vehicle_reassign_state(state):
@@ -1270,6 +1344,10 @@ def _process(
             it_request.try_start_form(sender, IT_DEPS)
         elif menu_form == "MAINTENANCE_FORM":
             maintenance_request.try_start_form(sender, MAINTENANCE_DEPS)
+        elif menu_form == "MAINTENANCE_MANAGE":
+            maintenance_request.try_start_manage(sender, MAINTENANCE_DEPS)
+        elif menu_form == "MAINTENANCE_LIST":
+            maintenance_request.try_start_team_list(sender, MAINTENANCE_DEPS)
         elif menu_form == "VEHICLE_MANAGE":
             vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
         elif menu_form == "VEHICLE_REQUEST_FORM":
