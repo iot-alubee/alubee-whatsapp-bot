@@ -240,6 +240,7 @@ _SUPPLIER_DESTINATIONS: frozenset[str] = frozenset({
     "madhumitha",
     "rashi",
     "rajeshwari_layout",
+    "kamal",
     "local_hosur",
     "ayyappa_gas_agency",
     "md_office",
