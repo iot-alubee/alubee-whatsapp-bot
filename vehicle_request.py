@@ -1006,7 +1006,9 @@ def _assign_option_map(db: object, vehicle_type: str) -> dict[str, str]:
 
 
 def _fleet_vehicle_map() -> dict[str, str]:
-    return dict(INTERNAL_FLEET_VEHICLES)
+    fleet = dict(INTERNAL_FLEET_VEHICLES)
+    fleet["dost_3371"] = fleet["dost_3271"]
+    return fleet
 
 
 def _show_fleet_vehicle_list(
