@@ -46,6 +46,7 @@ SESSION_WAITING_VEHICLE_REASSIGN_FLEET = "WAITING_VEHICLE_REASSIGN_FLEET_PICK"
 REQUEST_TYPE_LABELS = {
     "delivery": "Delivery",
     "pickup": "Pickup",
+    "delivery_and_pickup": "Delivery and Pickup",
 }
 
 DESTINATION_CATEGORY_LABELS = {
@@ -159,12 +160,40 @@ _FROM_UNIT_ALIASES: dict[str, str] = {
     "unit_2": "unit_ii",
 }
 
-_VEHICLE_REQUIRED_TIME_SLOTS: frozenset[str] = frozenset({
+_VEHICLE_ALL_TIME_SLOTS: tuple[str, ...] = (
     "08:30", "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
     "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00",
     "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30",
     "19:00", "19:30", "20:00",
-})
+)
+
+_VEHICLE_REQUIRED_TIME_SLOTS: frozenset[str] = frozenset(_VEHICLE_ALL_TIME_SLOTS)
+
+
+def _time_slot_minutes(hhmm: str) -> int:
+    hour, minute = map(int, hhmm.split(":"))
+    return hour * 60 + minute
+
+
+def _normalize_required_time_hhmm(raw: str) -> str:
+    time_norm = (raw or "").strip().replace(".", ":").upper()
+    if ":" in time_norm and time_norm in _VEHICLE_REQUIRED_TIME_SLOTS:
+        return time_norm
+    norm = _normalize_id(time_norm).replace("_", ":")
+    if norm in _VEHICLE_REQUIRED_TIME_SLOTS:
+        return norm
+    return ""
+
+
+def _allowed_required_time_slots(now: datetime | None = None) -> frozenset[str]:
+    """Slots strictly after current IST time, through 8:00 PM."""
+    current = now or _ist_now()
+    now_minutes = current.hour * 60 + current.minute
+    return frozenset(
+        slot
+        for slot in _VEHICLE_ALL_TIME_SLOTS
+        if _time_slot_minutes(slot) > now_minutes
+    )
 
 EXTERNAL_VENDORS: list[tuple[str, str]] = [
     ("annai_transport", "Annai Transport"),
@@ -694,9 +723,7 @@ def _build_required_at(data: dict) -> str:
     if not req_time_raw:
         return "—"
 
-    time_norm = req_time_raw.replace(".", ":").upper()
-    if ":" in time_norm and time_norm not in _VEHICLE_REQUIRED_TIME_SLOTS:
-        time_norm = _normalize_id(time_norm).replace("_", ":")
+    time_norm = _normalize_required_time_hhmm(req_time_raw)
     if time_norm in _VEHICLE_REQUIRED_TIME_SLOTS:
         return _format_time_12h(time_norm)
     return _format_time_12h(req_time_raw)
@@ -840,8 +867,17 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         )
         return None
 
-    required_at = _build_required_at(data)
-    required_time = _flow_pick(data, "required_time")
+    required_time_raw = _flow_pick(data, "required_time")
+    required_time = _normalize_required_time_hhmm(required_time_raw)
+    if not required_time or required_time not in _allowed_required_time_slots():
+        logger.warning(
+            "vehicle request parse failed: required_time=%r keys=%s",
+            required_time_raw,
+            list(data.keys()),
+        )
+        return None
+
+    required_at = _build_required_at({**data, "required_time": required_time})
 
     km = _estimated_distance_km(category, destination)
     return {
