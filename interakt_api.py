@@ -691,7 +691,13 @@ def send_maintenance_flow_form(
     dept_key = (department or "").strip().upper()
     if dept_key == "FET":
         dept_key = "FETTLING"
-    route_key = (jmd_route or "").strip().lower()
+    route_raw = (jmd_route or "").strip().upper()
+    if route_raw in ("JMD1", "UNIT_I", "UNIT1", "UNIT-1", "UNIT 1"):
+        route_key = "jmd1"
+    elif route_raw in ("JMD2", "UNIT_II", "UNIT2", "UNIT-2", "UNIT 2"):
+        route_key = "jmd2"
+    else:
+        route_key = route_raw.lower()
     if dept_key in ("PDC", "CNC", "FETTLING", "SECONDARY") and route_key in ("jmd1", "jmd2"):
         flow_token = f"maintenance_{phone_10}_{dept_key.lower()}_{route_key}"[:256]
     else:
