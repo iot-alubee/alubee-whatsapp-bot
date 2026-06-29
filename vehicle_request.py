@@ -513,7 +513,7 @@ def _assignee_notify_template_name() -> str:
     return (
         os.getenv("VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME")
         or os.getenv("VEHICLE_INTERNAL_ASSIGNEE_TEMPLATE_NAME")
-        or ""
+        or "vehicle_assignee_message"
     ).strip()
 
 
