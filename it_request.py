@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from bot_shared import get_user_record, query_requests_by_type, wa_from_10
+from bot_shared import (
+    get_user_record,
+    normalize_callback_request_id,
+    query_requests_by_type,
+    request_type_for_id,
+    wa_from_10,
+)
 from interakt_api import (
     ensure_customer,
     send_list_menu,
@@ -265,20 +271,6 @@ def _load_request(db: object, request_id: str) -> tuple[object, dict] | None:
     if (rd.get("type") or "").strip().upper() != "IT":
         return None
     return ref, rd
-
-
-def _request_type_for_id(db: object, request_id: str) -> str:
-    rid = (request_id or "").strip()
-    if not rid:
-        return ""
-    try:
-        snap = db.collection("requests").document(rid).get()
-    except Exception:
-        logger.exception("request type lookup failed request_id=%s", rid)
-        return ""
-    if not snap.exists:
-        return ""
-    return ((snap.to_dict() or {}).get("type") or "").strip().upper()
 
 
 def _parse_it_action(incoming: str, prefix: str) -> str | None:
@@ -560,11 +552,9 @@ def _pending_it_manager_notify_request_id(sender: str, deps: ItDeps) -> str:
 
 
 def _normalize_it_callback_request_id(callback_request_id: str) -> str:
-    raw = (callback_request_id or "").strip()
-    if not raw:
+    raw = normalize_callback_request_id(callback_request_id)
+    if raw in ("it-manager-list", "it-engineer-list"):
         return ""
-    if "-p" in raw:
-        return raw.split("-p", 1)[0].strip()
     return raw
 
 
@@ -1036,7 +1026,7 @@ def _handle_manager_template_assign_click(
     """Assign from manager template (new ticket or IT - List). Re-assign when already assigned."""
     loaded = _load_request(deps.db, request_id)
     if not loaded:
-        other_type = _request_type_for_id(deps.db, request_id)
+        other_type = request_type_for_id(deps.db, request_id)
         if other_type and other_type != "IT":
             return False
         deps.send_to(sender, "IT request not found.")
@@ -1060,7 +1050,7 @@ def _handle_manager_assign_click(sender: str, request_id: str, deps: ItDeps) -> 
 def _handle_manager_reassign_click(sender: str, request_id: str, deps: ItDeps) -> bool:
     loaded = _load_request(deps.db, request_id)
     if not loaded:
-        other_type = _request_type_for_id(deps.db, request_id)
+        other_type = request_type_for_id(deps.db, request_id)
         if other_type and other_type != "IT":
             return False
         deps.send_to(sender, "IT request not found.")
@@ -1401,9 +1391,6 @@ def handle_it_engineer_close_gate(
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
-        other_type = _request_type_for_id(deps.db, request_id)
-        if other_type and other_type != "IT":
-            return False
         deps.send_to(sender, "IT request not found.")
         return True
     ref, rd = loaded
@@ -1451,18 +1438,17 @@ def handle_it_user_close_gate(
             deps.db, sender, deps.same_whatsapp
         )
     if not request_id:
-        deps.send_to(
-            sender,
-            "Could not identify the ticket.\n"
-            "Open the IT close message again and tap Close Ticket.",
-        )
-        return True
+        if _is_user_close_label(incoming):
+            deps.send_to(
+                sender,
+                "Could not identify the ticket.\n"
+                "Open the close message again and tap Close Ticket.",
+            )
+            return True
+        return False
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
-        other_type = _request_type_for_id(deps.db, request_id)
-        if other_type and other_type != "IT":
-            return False
         deps.send_to(sender, "IT request not found.")
         return True
     ref, rd = loaded
@@ -1487,6 +1473,41 @@ def handle_it_user_close_gate(
             f"IT ticket from {rd.get('employee_name') or 'employee'} has been closed.",
         )
     return True
+
+
+def _is_it_close_incoming(incoming: str) -> bool:
+    return (
+        _is_closed_label(incoming)
+        or _is_user_close_label(incoming)
+        or bool(_parse_it_action(incoming, "ITCLOSED_"))
+        or bool(_parse_it_action(incoming, "ITUSER_CLOSE_"))
+    )
+
+
+def handle_it_close_gates(
+    sender: str,
+    incoming: str,
+    deps: ItDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    """IT-only close actions (engineer Closed, user Close Ticket)."""
+    if not _is_it_close_incoming(incoming):
+        return False
+    cb_rid = _normalize_it_callback_request_id(callback_request_id)
+    if cb_rid:
+        rtype = request_type_for_id(deps.db, cb_rid)
+        if rtype and rtype != "IT":
+            return False
+    if handle_it_engineer_close_gate(
+        sender, incoming, deps, callback_request_id=callback_request_id
+    ):
+        return True
+    if handle_it_user_close_gate(
+        sender, incoming, deps, callback_request_id=callback_request_id
+    ):
+        return True
+    return False
 
 
 def try_start_form(sender: str, deps: ItDeps) -> None:

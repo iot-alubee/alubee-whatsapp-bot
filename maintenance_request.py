@@ -14,7 +14,12 @@ try:
 except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
-from bot_shared import get_user_record, wa_from_10
+from bot_shared import (
+    get_user_record,
+    normalize_callback_request_id,
+    request_type_for_id,
+    wa_from_10,
+)
 from interakt_api import (
     ensure_customer,
     send_list_menu,
@@ -544,12 +549,12 @@ def _resolve_manage_action_request_id(
 
 
 def _normalize_maint_callback_request_id(callback_request_id: str) -> str:
-    raw = (callback_request_id or "").strip()
-    if not raw:
-        return ""
-    if "-p" in raw:
-        return raw.split("-p", 1)[0].strip()
-    if raw in ("maintenance-manage", "maintenance-team-list", "maintenance-manager-list"):
+    raw = normalize_callback_request_id(callback_request_id)
+    if raw in (
+        "maintenance-manage",
+        "maintenance-team-list",
+        "maintenance-manager-list",
+    ):
         return ""
     return raw
 
@@ -1659,12 +1664,7 @@ def handle_maintenance_user_close_gate(
             deps.db, sender, deps.same_whatsapp
         )
     if not request_id:
-        deps.send_to(
-            sender,
-            "Could not identify the ticket.\n"
-            "Open the maintenance close message again and tap Close Ticket.",
-        )
-        return True
+        return False
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
@@ -1707,6 +1707,41 @@ def handle_maintenance_user_close_gate(
             tech_msg += f"\nTime taken: {time_taken}."
         deps.send_to(tech_wa, tech_msg)
     return True
+
+
+def _is_maintenance_close_incoming(incoming: str) -> bool:
+    return (
+        _is_closed_label(incoming)
+        or _is_user_close_label(incoming)
+        or bool(_parse_maintenance_action(incoming, "MMAINT_CLOSED_"))
+        or bool(_parse_maintenance_action(incoming, "MMAINT_USER_CLOSE_"))
+    )
+
+
+def handle_maintenance_close_gates(
+    sender: str,
+    incoming: str,
+    deps: MaintenanceDeps,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    """Maintenance-only close actions (technician Closed, supervisor Close Ticket)."""
+    if not _is_maintenance_close_incoming(incoming):
+        return False
+    cb_rid = _normalize_maint_callback_request_id(callback_request_id)
+    if cb_rid:
+        rtype = request_type_for_id(deps.db, cb_rid)
+        if rtype and rtype != "MAINTENANCE":
+            return False
+    if handle_maintenance_assignee_gate(
+        sender, incoming, deps, callback_request_id=callback_request_id
+    ):
+        return True
+    if handle_maintenance_user_close_gate(
+        sender, incoming, deps, callback_request_id=callback_request_id
+    ):
+        return True
+    return False
 
 
 def _team_notify_template_name() -> str:

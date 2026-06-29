@@ -1185,7 +1185,7 @@ def _process(
     ):
         return
 
-    if maintenance_request.handle_maintenance_assignee_gate(
+    if maintenance_request.handle_maintenance_close_gates(
         sender,
         incoming,
         MAINTENANCE_DEPS,
@@ -1193,26 +1193,10 @@ def _process(
     ):
         return
 
-    if it_request.handle_it_engineer_close_gate(
+    if it_request.handle_it_close_gates(
         sender,
         incoming,
         IT_DEPS,
-        callback_request_id=callback_request_id,
-    ):
-        return
-
-    if it_request.handle_it_user_close_gate(
-        sender,
-        incoming,
-        IT_DEPS,
-        callback_request_id=callback_request_id,
-    ):
-        return
-
-    if maintenance_request.handle_maintenance_user_close_gate(
-        sender,
-        incoming,
-        MAINTENANCE_DEPS,
         callback_request_id=callback_request_id,
     ):
         return

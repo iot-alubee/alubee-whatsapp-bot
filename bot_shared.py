@@ -75,6 +75,31 @@ def wa_from_env(*env_keys: str) -> str:
     return ""
 
 
+def normalize_callback_request_id(callback_request_id: str) -> str:
+    """Strip paging suffixes from Interakt template callbackData."""
+    raw = (callback_request_id or "").strip()
+    if not raw:
+        return ""
+    if "-p" in raw:
+        return raw.split("-p", 1)[0].strip()
+    return raw
+
+
+def request_type_for_id(firestore_db, request_id: str) -> str:
+    """Return request document type (IT, MAINTENANCE, …) or empty string."""
+    rid = (request_id or "").strip()
+    if not rid or not firestore_db:
+        return ""
+    try:
+        snap = firestore_db.collection("requests").document(rid).get()
+    except Exception:
+        logger.exception("request type lookup failed request_id=%s", rid)
+        return ""
+    if not snap.exists:
+        return ""
+    return ((snap.to_dict() or {}).get("type") or "").strip().upper()
+
+
 def query_requests_by_type(firestore_db, req_type: str, *, limit: int | None = None):
     """Recent requests of one type (avoids streaming the whole collection)."""
     cap = limit or _REQUESTS_QUERY_LIMIT
