@@ -1549,14 +1549,14 @@ def _notify_supervisor_close_request(
     request_id: str,
     technician_wa: str,
     deps: MaintenanceDeps,
-) -> None:
+) -> bool:
     template_name = _user_close_template_name()
     if not template_name:
         logger.error(
             "MAINTENANCE_USER_CLOSE_TEMPLATE_NAME not set request_id=%s",
             request_id,
         )
-        return
+        return False
     phone = wa_id_to_phone(supervisor_wa)
     try:
         ensure_customer(phone, name=(rd.get("employee_name") or "Supervisor"))
@@ -1569,10 +1569,12 @@ def _notify_supervisor_close_request(
             ensure_contact=False,
         )
         logger.info("maintenance user close template sent request_id=%s", request_id)
+        return True
     except Exception:
         logger.exception(
             "maintenance user close template failed request_id=%s", request_id
         )
+        return False
 
 
 def handle_maintenance_assignee_gate(
@@ -1593,12 +1595,7 @@ def handle_maintenance_assignee_gate(
         )
     if not request_id:
         if _is_closed_label(incoming):
-            deps.send_to(
-                sender,
-                "Could not identify the ticket.\n"
-                "Use Maintenance - List and open the ticket again.",
-            )
-            return True
+            return False
         return False
 
     loaded = _load_request(deps.db, request_id)
@@ -1623,8 +1620,20 @@ def handle_maintenance_assignee_gate(
     deps.clear_session(sender)
     employee = (rd.get("employee") or "").strip()
     if employee:
-        _notify_supervisor_close_request(employee, rd, request_id, sender, deps)
-    deps.send_to(sender, "Supervisor notified to confirm closure. Thank you.")
+        if _notify_supervisor_close_request(
+            employee, rd, request_id, sender, deps
+        ):
+            deps.send_to(
+                sender, "Supervisor notified to confirm closure. Thank you."
+            )
+        else:
+            deps.send_to(
+                sender,
+                "Could not send the close request to the supervisor. "
+                "Please try again or contact admin.",
+            )
+    else:
+        deps.send_to(sender, "No supervisor contact on this request.")
     return True
 
 

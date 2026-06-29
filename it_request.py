@@ -267,6 +267,20 @@ def _load_request(db: object, request_id: str) -> tuple[object, dict] | None:
     return ref, rd
 
 
+def _request_type_for_id(db: object, request_id: str) -> str:
+    rid = (request_id or "").strip()
+    if not rid:
+        return ""
+    try:
+        snap = db.collection("requests").document(rid).get()
+    except Exception:
+        logger.exception("request type lookup failed request_id=%s", rid)
+        return ""
+    if not snap.exists:
+        return ""
+    return ((snap.to_dict() or {}).get("type") or "").strip().upper()
+
+
 def _parse_it_action(incoming: str, prefix: str) -> str | None:
     raw = (incoming or "").strip()
     upper = raw.upper()
@@ -1022,6 +1036,9 @@ def _handle_manager_template_assign_click(
     """Assign from manager template (new ticket or IT - List). Re-assign when already assigned."""
     loaded = _load_request(deps.db, request_id)
     if not loaded:
+        other_type = _request_type_for_id(deps.db, request_id)
+        if other_type and other_type != "IT":
+            return False
         deps.send_to(sender, "IT request not found.")
         return True
     _ref, rd = loaded
@@ -1043,6 +1060,9 @@ def _handle_manager_assign_click(sender: str, request_id: str, deps: ItDeps) -> 
 def _handle_manager_reassign_click(sender: str, request_id: str, deps: ItDeps) -> bool:
     loaded = _load_request(deps.db, request_id)
     if not loaded:
+        other_type = _request_type_for_id(deps.db, request_id)
+        if other_type and other_type != "IT":
+            return False
         deps.send_to(sender, "IT request not found.")
         return True
     _ref, rd = loaded
@@ -1381,6 +1401,9 @@ def handle_it_engineer_close_gate(
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
+        other_type = _request_type_for_id(deps.db, request_id)
+        if other_type and other_type != "IT":
+            return False
         deps.send_to(sender, "IT request not found.")
         return True
     ref, rd = loaded
@@ -1437,6 +1460,9 @@ def handle_it_user_close_gate(
 
     loaded = _load_request(deps.db, request_id)
     if not loaded:
+        other_type = _request_type_for_id(deps.db, request_id)
+        if other_type and other_type != "IT":
+            return False
         deps.send_to(sender, "IT request not found.")
         return True
     ref, rd = loaded
