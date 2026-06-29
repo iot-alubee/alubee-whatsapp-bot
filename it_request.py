@@ -1262,7 +1262,7 @@ def handle_it_engineer_list_gate(
             return True
         _ref, rd = loaded
         if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
-            deps.send_to(sender, "Not authorized for this ticket.")
+            deps.send_to(sender, _engineer_close_denied_message(rd, sender, deps))
             return True
         status = _request_status(rd)
         if status == "AWAITING_USER_CLOSE":
@@ -1285,6 +1285,33 @@ def handle_it_engineer_list_gate(
             deps.send_to(sender, "Could not load ticket details. Please try IT - List again.")
         return True
     return False
+
+
+def _engineer_close_denied_message(rd: dict, sender: str, deps: ItDeps) -> str:
+    current_name = (rd.get("assigned_engineer_name") or "another engineer").strip()
+    prev = (rd.get("previous_engineer") or "").strip()
+    status = _request_status(rd)
+    if prev and deps.same_whatsapp(prev, sender):
+        if status == "CLOSED":
+            return (
+                f"This ticket has already been re-assigned to {current_name} and is now closed. "
+                "You cannot close this ticket."
+            )
+        if status == "AWAITING_USER_CLOSE":
+            return (
+                f"This ticket has already been re-assigned to {current_name} and is awaiting "
+                "user confirmation. You cannot close this ticket."
+            )
+        return (
+            f"This ticket has already been re-assigned to {current_name}. "
+            "You cannot close this ticket."
+        )
+    if is_it_engineer(sender):
+        return (
+            f"This ticket is assigned to {current_name}. "
+            "You are not authorized to close it."
+        )
+    return "You are not authorized to close this ticket."
 
 
 def _find_engineer_closable_request(
@@ -1358,6 +1385,9 @@ def handle_it_engineer_close_gate(
         return True
     ref, rd = loaded
     if not deps.same_whatsapp(rd.get("assigned_engineer"), sender):
+        if _is_closed_label(incoming) or request_id:
+            deps.send_to(sender, _engineer_close_denied_message(rd, sender, deps))
+            return True
         return False
     if _request_status(rd) != "ASSIGNED":
         deps.send_to(sender, f"Ticket is already {_request_status(rd).lower()}.")
