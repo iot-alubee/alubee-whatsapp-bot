@@ -19,6 +19,7 @@ from bot_shared import (
     normalize_callback_request_id,
     request_type_for_id,
     wa_from_10,
+    wa_from_env,
 )
 from interakt_api import (
     ensure_customer,
@@ -271,6 +272,30 @@ def _normalize_route(route: str) -> str:
 
 def _unit_label(route: str) -> str:
     return "Unit II" if _normalize_route(route) == "JMD2" else "Unit I"
+
+
+def _jmd_wa_for_unit(route: str) -> str:
+    if _normalize_route(route) == "JMD2":
+        return wa_from_env("JMD_II_WHATSAPP_NUMBER")
+    return wa_from_env("JMD_I_WHATSAPP_NUMBER", "JMD_WHATSAPP_NUMBER")
+
+
+def _md_wa_for_closure_notify() -> str:
+    return wa_from_env("MD_WHATSAPP_NUMBER")
+
+
+def _closure_notify_recipients(
+    route: str, same_whatsapp: Callable[[str, str], bool]
+) -> list[str]:
+    out: list[str] = []
+    for wa in (_jmd_wa_for_unit(route), _md_wa_for_closure_notify()):
+        candidate = (wa or "").strip()
+        if not candidate:
+            continue
+        if any(same_whatsapp(candidate, existing) for existing in out):
+            continue
+        out.append(candidate)
+    return out
 
 
 def _manager_wa(route: str) -> str:
@@ -1582,6 +1607,92 @@ def _notify_supervisor_close_request(
         return False
 
 
+def _jmd_md_close_template_name() -> str:
+    return (
+        os.getenv("MAINTENANCE_JMD_MD_CLOSE_TEMPLATE_NAME")
+        or "maintenance_jmd_md_notification"
+    ).strip()
+
+
+def _jmd_md_close_template_language() -> str:
+    return (
+        os.getenv("MAINTENANCE_JMD_MD_CLOSE_TEMPLATE_LANGUAGE_CODE") or "en"
+    ).strip()
+
+
+def _jmd_md_close_template_body_fields() -> list[str]:
+    raw = (
+        os.getenv("MAINTENANCE_JMD_MD_CLOSE_TEMPLATE_BODY_FIELDS")
+        or "requester,unit,department,machine,issue,addressed_by,time_taken"
+    ).strip()
+    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+
+
+def _jmd_md_close_template_body_values(rd: dict, time_taken: str) -> list[str]:
+    values = {
+        "requester": (rd.get("employee_name") or "—").strip(),
+        "unit": _unit_label(rd.get("jmd_route") or ""),
+        "department": (rd.get("department") or "—").strip(),
+        "machine": (rd.get("machine_no_label") or "—").strip(),
+        "machine_no": (rd.get("machine_no_label") or "—").strip(),
+        "issue": (rd.get("issue_category_label") or "—").strip(),
+        "addressed_by": (rd.get("assigned_to") or "—").strip(),
+        "time_taken": (time_taken or "—").strip() or "—",
+    }
+    fields = _jmd_md_close_template_body_fields()
+    return [values.get(key, "—")[:1024] for key in fields]
+
+
+def _notify_jmd_md_closure(
+    rd: dict,
+    request_id: str,
+    time_taken: str,
+    deps: MaintenanceDeps,
+) -> None:
+    """Notify unit JMD + MD when a maintenance request is completed (not IT)."""
+    template_name = _jmd_md_close_template_name()
+    if not template_name:
+        logger.error(
+            "MAINTENANCE_JMD_MD_CLOSE_TEMPLATE_NAME not set request_id=%s",
+            request_id,
+        )
+        return
+    route = rd.get("jmd_route") or ""
+    recipients = _closure_notify_recipients(route, deps.same_whatsapp)
+    if not recipients:
+        logger.warning(
+            "maintenance JMD/MD close notify skipped — no recipients "
+            "request_id=%s route=%s",
+            request_id,
+            route,
+        )
+        return
+    body_values = _jmd_md_close_template_body_values(rd, time_taken)
+    for wa in recipients:
+        phone = wa_id_to_phone(wa)
+        try:
+            ensure_customer(phone, name="Approver")
+            send_template(
+                phone,
+                template_name,
+                language_code=_jmd_md_close_template_language(),
+                body_values=body_values,
+                callback_data=request_id[:512],
+                ensure_contact=False,
+            )
+            logger.info(
+                "maintenance JMD/MD close template sent wa=%s request_id=%s",
+                wa,
+                request_id,
+            )
+        except Exception:
+            logger.exception(
+                "maintenance JMD/MD close template failed wa=%s request_id=%s",
+                wa,
+                request_id,
+            )
+
+
 def handle_maintenance_assignee_gate(
     sender: str,
     incoming: str,
@@ -1689,6 +1800,12 @@ def handle_maintenance_user_close_gate(
         "time_taken": time_taken,
         "time_taken_seconds": time_taken_seconds,
     })
+    notify_rd = {
+        **rd,
+        "time_taken": time_taken,
+        "completed_at": completed_at,
+    }
+    _notify_jmd_md_closure(notify_rd, request_id, time_taken or "", deps)
     deps.clear_session(sender)
     tech_wa = (rd.get("assigned_to_wa") or "").strip()
     msg = "Your maintenance request has been closed. Thank you."
