@@ -14,7 +14,7 @@ try:
 except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
-from bot_shared import get_user_record, query_requests_for_employee, wa_from_10
+from bot_shared import get_user_record, wa_from_10
 from interakt_api import (
     ensure_customer,
     send_list_menu,
@@ -38,13 +38,6 @@ from maintenance_data import (
 
 logger = logging.getLogger(__name__)
 
-MAINTENANCE_OPEN_STATUSES = frozenset({
-    "PENDING",
-    "ASSIGNED",
-    "IN_PROGRESS",
-    "AWAITING_USER_CLOSE",
-})
-
 SESSION_WAITING_MAINTENANCE_ASSIGN = "WAITING_MAINTENANCE_ASSIGN_PICK"
 SESSION_WAITING_MAINTENANCE_MANAGER_NOTIFY = "WAITING_MAINTENANCE_MANAGER_NOTIFY"
 SESSION_WAITING_MAINTENANCE_MANAGE_ACTION = "WAITING_MAINTENANCE_MANAGE_ACTION"
@@ -59,6 +52,7 @@ _PDC_ASSIGNEES: tuple[tuple[str, str], ...] = (
 _CNC_FET_SEC_ASSIGNEES: tuple[tuple[str, str], ...] = (
     ("adc012", "MURUGESAN"),
     ("adc093", "KANDAN"),
+    ("sri079", "MANIKANDAN C"),
 )
 
 UNSUPPORTED_DEPT_MSG = (
@@ -80,6 +74,18 @@ def is_maintenance_team_user(user_data: dict | None) -> bool:
 def show_maintenance_team_list_menu(user_data: dict | None) -> bool:
     if not maintenance_flow_enabled():
         return False
+    return is_maintenance_team_user(user_data)
+
+
+def show_maintenance_list_menu(
+    wa_id: str,
+    same_whatsapp: Callable[[str, str], bool],
+    user_data: dict | None = None,
+) -> bool:
+    if not maintenance_flow_enabled():
+        return False
+    if is_maintenance_manager(wa_id, same_whatsapp):
+        return True
     return is_maintenance_team_user(user_data)
 
 
@@ -140,15 +146,6 @@ def _normalize_id(raw: str) -> str:
 _MAINTENANCE_TEAM_CODES: frozenset[str] = frozenset(
     _normalize_id(code) for code, _ in (*_PDC_ASSIGNEES, *_CNC_FET_SEC_ASSIGNEES)
 )
-
-
-def find_open_maintenance_request(employee: str, db: object) -> tuple[str, dict] | None:
-    for snap in query_requests_for_employee(db, "MAINTENANCE", employee):
-        rd = snap.to_dict() or {}
-        status = (rd.get("maintenance_status") or "PENDING").strip().upper()
-        if status in MAINTENANCE_OPEN_STATUSES:
-            return snap.id, rd
-    return None
 
 
 def _issue_photo_from_flow_data(data: dict) -> object | None:
@@ -967,7 +964,7 @@ def handle_maintenance_manager_gate(
         deps.send_to(
             sender,
             "Could not identify which ticket to manage.\n"
-            "Use Maintenance - Manage and open the request again.",
+            "Use Maintenance - List and open the request again.",
         )
         return True
     return False
@@ -1001,7 +998,7 @@ def handle_maintenance_manager_notify_input(
         deps.send_to(
             sender,
             "Could not identify which ticket to manage.\n"
-            "Use Maintenance - Manage and open the request again.",
+            "Use Maintenance - List and open the request again.",
         )
         return True
     if _is_reassign_label(incoming):
@@ -1065,6 +1062,17 @@ def try_start_manage(sender: str, deps: MaintenanceDeps) -> None:
         logger.exception("maintenance manage list failed sender=%s", sender)
         lines = "\n".join(f"• {_manager_list_row_line(rd)}" for _rid, rd in rows)
         deps.send_to(sender, f"Maintenance requests:\n{lines}")
+
+
+def try_start_maintenance_list(sender: str, deps: MaintenanceDeps) -> None:
+    if is_maintenance_manager(sender, deps.same_whatsapp):
+        try_start_manage(sender, deps)
+        return
+    exists, ud = get_user_record(sender)
+    if exists and is_maintenance_team_user(ud):
+        try_start_team_list(sender, deps)
+        return
+    deps.send_to(sender, "Not authorized.")
 
 
 def _team_list_row_title(rd: dict) -> str:
@@ -1143,7 +1151,7 @@ def _send_team_ticket_template(
     sender: str, deps: MaintenanceDeps, request_id: str, rd: dict
 ) -> bool:
     if not _is_maintenance_assignee(sender, rd, deps.same_whatsapp):
-        deps.send_to(sender, "Not authorized for this request.")
+        deps.send_to(sender, _assignee_close_denied_message(rd, sender, deps))
         return True
     status = _request_status(rd)
     if status == "AWAITING_USER_CLOSE":
@@ -1179,7 +1187,7 @@ def handle_team_list_gate(
 
     key = (incoming or "").strip().upper()
     if key in ("MAINTENANCE_LIST", "MAINTENANCE_LIST_MENU"):
-        try_start_team_list(sender, deps)
+        try_start_maintenance_list(sender, deps)
         return True
 
     request_id = _parse_maintenance_action(incoming, "MTEAM_")
@@ -1208,7 +1216,7 @@ def _send_manage_actions(
     if not _send_manager_ticket_template_to(sender, rd, request_id, deps, context="list"):
         deps.send_to(
             sender,
-            "Could not load ticket details. Please try Maintenance - Manage again.",
+            "Could not load ticket details. Please try Maintenance - List again.",
         )
 
 
@@ -1222,8 +1230,13 @@ def handle_manager_manage_gate(
     if not is_maintenance_manager(sender, deps.same_whatsapp):
         return False
 
-    if incoming.strip().upper() in ("MAINTENANCE_MANAGE", "MAINTENANCE_MANAGE_MENU"):
-        try_start_manage(sender, deps)
+    if incoming.strip().upper() in (
+        "MAINTENANCE_MANAGE",
+        "MAINTENANCE_MANAGE_MENU",
+        "MAINTENANCE_LIST",
+        "MAINTENANCE_LIST_MENU",
+    ):
+        try_start_maintenance_list(sender, deps)
         return True
 
     request_id = _parse_maintenance_action(incoming, "MMANAGE_")
@@ -1413,6 +1426,34 @@ def _is_maintenance_assignee(sender: str, rd: dict, same_whatsapp: Callable) -> 
     return bool(assignee_wa and same_whatsapp(sender, assignee_wa))
 
 
+def _assignee_close_denied_message(rd: dict, sender: str, deps: MaintenanceDeps) -> str:
+    current_name = (rd.get("assigned_to") or "another technician").strip().title()
+    prev_wa = (rd.get("previous_assignee_wa") or "").strip()
+    status = _request_status(rd)
+    if prev_wa and deps.same_whatsapp(prev_wa, sender):
+        if status == "COMPLETED":
+            return (
+                f"This request has already been re-assigned to {current_name} and is now closed. "
+                "You cannot close this request."
+            )
+        if status == "AWAITING_USER_CLOSE":
+            return (
+                f"This request has already been re-assigned to {current_name} and is awaiting "
+                "supervisor confirmation. You cannot close this request."
+            )
+        return (
+            f"This request has already been re-assigned to {current_name}. "
+            "You cannot close this request."
+        )
+    exists, ud = get_user_record(sender)
+    if exists and is_maintenance_team_user(ud):
+        return (
+            f"This request is assigned to {current_name}. "
+            "You are not authorized to close it."
+        )
+    return "You are not authorized to close this request."
+
+
 def _find_assignee_closable_request(
     db: object, assignee_wa: str, same_whatsapp: Callable[[str, str], bool]
 ) -> str:
@@ -1566,6 +1607,9 @@ def handle_maintenance_assignee_gate(
         return True
     ref, rd = loaded
     if not _is_maintenance_assignee(sender, rd, deps.same_whatsapp):
+        if _is_closed_label(incoming) or request_id:
+            deps.send_to(sender, _assignee_close_denied_message(rd, sender, deps))
+            return True
         return False
     if _request_status(rd) != "ASSIGNED":
         deps.send_to(sender, f"Request is already {_request_status(rd).lower()}.")
@@ -1714,7 +1758,7 @@ def _employee_confirmation(rd: dict) -> str:
 
 def try_start_form(sender: str, deps: MaintenanceDeps) -> None:
     if is_maintenance_manager(sender, deps.same_whatsapp):
-        try_start_manage(sender, deps)
+        try_start_maintenance_list(sender, deps)
         return
 
     exists, ud = get_user_record(sender)
@@ -1726,13 +1770,6 @@ def try_start_form(sender: str, deps: MaintenanceDeps) -> None:
         )
         return
 
-    if find_open_maintenance_request(sender, deps.db):
-        deps.send_to(
-            sender,
-            "You already have an open maintenance request.\n"
-            "Please wait until it is completed before raising another.",
-        )
-        return
     if not maintenance_flow_enabled():
         deps.send_to(
             sender,
@@ -1797,14 +1834,6 @@ def handle_flow_submission(
             sender,
             "Could not read the Maintenance form. "
             "Ensure machine, issue category, and photo are filled, then submit again.",
-        )
-        return
-
-    if find_open_maintenance_request(sender, deps.db):
-        deps.send_to(
-            sender,
-            "You already have an open maintenance request.\n"
-            "Please wait until it is completed before raising another.",
         )
         return
 

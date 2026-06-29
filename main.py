@@ -524,13 +524,9 @@ def _request_menu_items(
         items.append(
             (str(len(items) + 1), "maintenance_form", "Maintenance - Form")
         )
-    if maintenance_request.show_maintenance_team_list_menu(user_data):
+    if maintenance_request.show_maintenance_list_menu(wa_id, _same_whatsapp, user_data):
         items.append(
             (str(len(items) + 1), "maintenance_list", "Maintenance - List")
-        )
-    if maintenance_request.show_maintenance_manager_menu(wa_id, _same_whatsapp):
-        items.append(
-            (str(len(items) + 1), "maintenance_manage", "Maintenance - Manage")
         )
     if vehicle_request.show_vehicle_menu_for_user(
         user_data, wa_id, _same_whatsapp
@@ -1356,7 +1352,7 @@ def _process(
             return
         _send_to(
             sender,
-            "Tap Assign on the maintenance ticket, or use Maintenance - Manage.",
+            "Tap Assign on the maintenance ticket, or use Maintenance - List.",
         )
         return
 
@@ -1468,9 +1464,9 @@ def _process(
         elif menu_form == "MAINTENANCE_FORM":
             maintenance_request.try_start_form(sender, MAINTENANCE_DEPS)
         elif menu_form == "MAINTENANCE_MANAGE":
-            maintenance_request.try_start_manage(sender, MAINTENANCE_DEPS)
+            maintenance_request.try_start_maintenance_list(sender, MAINTENANCE_DEPS)
         elif menu_form == "MAINTENANCE_LIST":
-            maintenance_request.try_start_team_list(sender, MAINTENANCE_DEPS)
+            maintenance_request.try_start_maintenance_list(sender, MAINTENANCE_DEPS)
         elif menu_form == "VEHICLE_MANAGE":
             vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
         elif menu_form == "VEHICLE_REQUEST_FORM":
