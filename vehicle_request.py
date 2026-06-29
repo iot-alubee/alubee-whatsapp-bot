@@ -534,6 +534,15 @@ def _assignee_notify_template_body_fields() -> list[str]:
     return [k.strip().lower() for k in raw.split(",") if k.strip()]
 
 
+def _assignee_time_label(rd: dict) -> str:
+    raw = rd.get("required_at")
+    if raw is None or raw == "":
+        return "—"
+    if isinstance(raw, str):
+        return raw.strip() or "—"
+    return str(raw).strip() or "—"
+
+
 def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, str]:
     vehicle = (
         (rd.get("fleet_vehicle_label") or "").strip()
@@ -548,7 +557,7 @@ def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, 
         "category": rd.get("destination_category_label") or "—",
         "destination": rd.get("destination_label") or "—",
         "vehicle": vehicle,
-        "time": rd.get("required_at") or "—",
+        "time": _assignee_time_label(rd),
     }
 
 
@@ -574,7 +583,7 @@ def _assignee_notify_template_body_values(rd: dict, assignee_name: str) -> list[
     if len(fields) != 8:
         logger.warning(
             "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_BODY_FIELDS should list exactly 8 "
-            "fields for Utility template; got %s",
+            "fields for vehicle_assignee_message; got %s",
             len(fields),
         )
     return [values.get(key, "—")[:1024] for key in fields]
