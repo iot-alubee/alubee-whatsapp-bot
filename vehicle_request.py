@@ -2,7 +2,7 @@
 
 Access vs assignment (do not conflate):
   - is_logistics_requester  → may open the Vehicle Request form (any department)
-  - department == LOGISTICS → staff listed when manager assigns Internal vehicles
+  - INTERNAL_VEHICLE_ASSIGNEES → staff listed when manager assigns Internal vehicles
 """
 
 from __future__ import annotations
@@ -200,6 +200,12 @@ EXTERNAL_VENDORS: list[tuple[str, str]] = [
     ("challa_transport", "Challa Transport"),
     ("sridhar_transport", "Sridhar Transport"),
     ("chella_transport", "Chella Transport"),
+]
+
+INTERNAL_VEHICLE_ASSIGNEES: list[tuple[str, str]] = [
+    ("adc239", "Arun Selvam"),
+    ("adc324", "Pandiarajan"),
+    ("sri079", "Manikandan C"),
 ]
 
 INTERNAL_FLEET_VEHICLES: list[tuple[str, str]] = [
@@ -405,24 +411,9 @@ def _logistics_department_name() -> str:
 
 
 def _logistics_department_staff(db: object) -> list[tuple[str, str]]:
-    """Active employees in the Logistics department (Internal assign list)."""
-    dept = _logistics_department_name()
-    staff: list[tuple[str, str]] = []
-    try:
-        snaps = db.collection("users").where("department", "==", dept).stream()
-    except Exception:
-        logger.exception("logistics department user query failed dept=%s", dept)
-        return staff
-    for snap in snaps:
-        ud = snap.to_dict() or {}
-        emp_id = (ud.get("employee_id") or "").strip()
-        name = (ud.get("name") or emp_id or "Staff").strip()
-        if not emp_id:
-            continue
-        code = _normalize_id(emp_id)
-        staff.append((code, name))
-    staff.sort(key=lambda item: item[1].lower())
-    return staff
+    """Internal vehicle assignees (fixed list; WA resolved from Firestore by employee_id)."""
+    del db  # list is static; WA lookup uses employee_id at assign/notify time
+    return list(INTERNAL_VEHICLE_ASSIGNEES)
 
 
 def _staff_wa_for_assignee_code(
@@ -432,20 +423,18 @@ def _staff_wa_for_assignee_code(
     code = _normalize_id(assignee_code)
     if not code:
         return None
-    dept = _logistics_department_name()
     try:
-        snaps = db.collection("users").where("department", "==", dept).stream()
+        for snap in db.collection("users").stream():
+            ud = snap.to_dict() or {}
+            emp_id = _normalize_id(ud.get("employee_id") or "")
+            if emp_id == code:
+                name = (ud.get("name") or assignee_code).strip()
+                return snap.id, name
     except Exception:
         logger.exception(
-            "staff wa lookup failed dept=%s code=%s", dept, assignee_code
+            "staff wa lookup failed code=%s", assignee_code
         )
         return None
-    for snap in snaps:
-        ud = snap.to_dict() or {}
-        emp_id = _normalize_id(ud.get("employee_id") or "")
-        if emp_id == code:
-            name = (ud.get("name") or assignee_code).strip()
-            return snap.id, name
     return None
 
 
@@ -619,6 +608,33 @@ def _notify_internal_assignee(
     can_start = rd.get("assignee_can_start") is not False
     body = _assignee_notify_body(rd, display_name)
     start_buttons = [(start_id, "Start")] if can_start else []
+    body_values = _assignee_notify_template_body_values(rd, display_name)
+
+    if template_name:
+        try:
+            ensure_customer(phone, name=display_name)
+            send_template(
+                phone,
+                template_name,
+                language_code=_assignee_notify_template_language(),
+                body_values=body_values,
+                callback_data=rid,
+                ensure_contact=False,
+            )
+            logger.info(
+                "vehicle assignee template sent assignee=%s request_id=%s template=%s fields=%s",
+                assignee_wa,
+                request_id,
+                template_name,
+                len(body_values),
+            )
+            return
+        except Exception:
+            logger.exception(
+                "vehicle assignee template failed assignee=%s request_id=%s",
+                assignee_wa,
+                request_id,
+            )
 
     if deps.has_active_whatsapp_session(assignee_wa):
         try:
@@ -633,44 +649,35 @@ def _notify_internal_assignee(
                 )
             else:
                 deps.send_to(assignee_wa, body)
-            return
-        except Exception:
-            logger.exception(
-                "vehicle assignee notify with Start failed assignee=%s request_id=%s",
-                assignee_wa,
-                request_id,
-            )
-
-    if template_name:
-        try:
-            ensure_customer(phone, name=display_name)
-            send_template(
-                phone,
-                template_name,
-                language_code=_assignee_notify_template_language(),
-                body_values=_assignee_notify_template_body_values(rd, display_name),
-                callback_data=rid,
-                ensure_contact=False,
-            )
             logger.info(
-                "vehicle assignee template sent assignee=%s request_id=%s "
-                "(add Quick Reply Start button on template in Meta)",
+                "vehicle assignee session fallback sent assignee=%s request_id=%s",
                 assignee_wa,
                 request_id,
             )
             return
         except Exception:
             logger.exception(
-                "vehicle assignee template failed assignee=%s request_id=%s",
+                "vehicle assignee session fallback failed assignee=%s request_id=%s",
                 assignee_wa,
                 request_id,
             )
 
-    logger.info(
-        "skip vehicle assignee notify assignee=%s (set "
-        "VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME or open WhatsApp session)",
-        assignee_wa,
-    )
+    try:
+        deps.send_to(
+            assignee_wa,
+            body + "\n\nReply *Start* when you are ready.",
+        )
+        logger.info(
+            "vehicle assignee plain-text fallback sent assignee=%s request_id=%s",
+            assignee_wa,
+            request_id,
+        )
+    except Exception:
+        logger.exception(
+            "vehicle assignee notify failed all channels assignee=%s request_id=%s",
+            assignee_wa,
+            request_id,
+        )
 
 
 def _flow_pick(data: dict, *keys: str) -> str:
