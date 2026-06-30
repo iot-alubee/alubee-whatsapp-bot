@@ -93,18 +93,30 @@ def approver_role_for_sender(
     jmd_i: str,
     jmd_ii: str,
     same_whatsapp: Callable[[str, str], bool],
-    test_md: str = "",
 ) -> str | None:
-    """Approver menu role, or None. ``test_md`` gets Online/Offline; leave test approvals only."""
+    """Online/Offline menu role — JMD I (JMD1), JMD II (JMD2), and MD only."""
     if md and same_whatsapp(sender, md):
         return "md"
     if jmd_i and same_whatsapp(sender, jmd_i):
         return "jmd_i"
     if jmd_ii and same_whatsapp(sender, jmd_ii):
         return "jmd_ii"
-    if test_md and same_whatsapp(sender, test_md):
-        return "test_md"
     return None
+
+
+def is_availability_approver_wa(
+    wa_id: str,
+    *,
+    md: str,
+    jmd_i: str,
+    jmd_ii: str,
+    same_whatsapp: Callable[[str, str], bool],
+) -> bool:
+    """True only for configured JMD1 / JMD2 / MD WhatsApp numbers."""
+    for configured in (md, jmd_i, jmd_ii):
+        if configured and same_whatsapp(wa_id, configured):
+            return True
+    return False
 
 
 def is_test_md_sender(
@@ -123,8 +135,6 @@ def offline_blocked_message(
 ) -> str | None:
     """If going offline is not allowed, return a polite message; else None."""
     r = (role or "").strip().lower()
-    if r == "test_md":
-        return None
     if r == "md":
         if _any_jmd_offline(db, jmd_i=jmd_i, jmd_ii=jmd_ii):
             return "JMD is already offline, so please be online."

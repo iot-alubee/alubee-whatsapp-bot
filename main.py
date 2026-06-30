@@ -592,11 +592,18 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
                 jmd_i=JMD_I_WHATSAPP_NUMBER,
                 jmd_ii=JMD_II_WHATSAPP_NUMBER,
                 same_whatsapp=_same_whatsapp,
-                test_md=TEST_MD_WHATSAPP_NUMBER,
             )
             or ""
         )
     if not role:
+        return False
+    if not approver_availability.is_availability_approver_wa(
+        sender,
+        md=MD_WHATSAPP_NUMBER,
+        jmd_i=JMD_I_WHATSAPP_NUMBER,
+        jmd_ii=JMD_II_WHATSAPP_NUMBER,
+        same_whatsapp=_same_whatsapp,
+    ):
         return False
     availability = "offline" if upper == "OFFLINE" else "online"
     blocked = approver_availability.set_availability(
@@ -1113,7 +1120,6 @@ def _is_configured_approver(sender: str) -> bool:
             jmd_i=JMD_I_WHATSAPP_NUMBER,
             jmd_ii=JMD_II_WHATSAPP_NUMBER,
             same_whatsapp=_same_whatsapp,
-            test_md=TEST_MD_WHATSAPP_NUMBER,
         )
     )
 
@@ -1145,7 +1151,6 @@ def _process(
             jmd_i=JMD_I_WHATSAPP_NUMBER,
             jmd_ii=JMD_II_WHATSAPP_NUMBER,
             same_whatsapp=_same_whatsapp,
-            test_md=TEST_MD_WHATSAPP_NUMBER,
         )
         if approver_role:
             approver_availability.ensure_online_default(
