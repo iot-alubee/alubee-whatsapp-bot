@@ -41,8 +41,41 @@ def is_offline(db, wa_id: str) -> bool:
     return get_availability(db, wa_id) == "offline"
 
 
-def set_availability(db, wa_id: str, availability: str, *, role: str = "") -> None:
+def _any_jmd_offline(db, *, jmd_i: str, jmd_ii: str) -> bool:
+    seen: set[str] = set()
+    for wa in (jmd_i, jmd_ii):
+        key = (wa or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if is_offline(db, wa):
+            return True
+    return False
+
+
+def set_availability(
+    db,
+    wa_id: str,
+    availability: str,
+    *,
+    role: str = "",
+    enforce_pair_rule: bool = False,
+    md: str = "",
+    jmd_i: str = "",
+    jmd_ii: str = "",
+) -> str | None:
+    """Persist availability. Returns error message when offline is blocked, else None."""
     av = "offline" if str(availability).strip().lower() == "offline" else "online"
+    if av == "offline" and enforce_pair_rule:
+        blocked = offline_blocked_message(
+            db,
+            role,
+            md=md,
+            jmd_i=jmd_i,
+            jmd_ii=jmd_ii,
+        )
+        if blocked:
+            return blocked
     payload: dict = {
         "availability": av,
         "updated_at": datetime.now(timezone.utc),
@@ -50,6 +83,7 @@ def set_availability(db, wa_id: str, availability: str, *, role: str = "") -> No
     if role:
         payload["role"] = role
     status_ref(db, wa_id).set(payload, merge=True)
+    return None
 
 
 def approver_role_for_sender(
@@ -92,11 +126,11 @@ def offline_blocked_message(
     if r == "test_md":
         return None
     if r == "md":
-        if (jmd_i and is_offline(db, jmd_i)) or (jmd_ii and is_offline(db, jmd_ii)):
-            return "JMD is already offline. Please be Online."
+        if _any_jmd_offline(db, jmd_i=jmd_i, jmd_ii=jmd_ii):
+            return "JMD is already offline, so please be online."
         return None
-    if r in ("jmd_i", "jmd_ii"):
+    if r in ("jmd", "jmd_i", "jmd_ii"):
         if md and is_offline(db, md):
-            return "MD is already offline. Please be Online."
+            return "MD is already offline, so please be online."
         return None
     return None

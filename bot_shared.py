@@ -17,6 +17,15 @@ from firebase_admin import firestore
 
 logger = logging.getLogger(__name__)
 
+STATUS_AUTO_APPROVE = "AUTO_APPROVE"
+_APPROVAL_DONE = frozenset({"APPROVED", STATUS_AUTO_APPROVE})
+
+
+def approval_step_done(status: str) -> bool:
+    """True when an approval step was completed (manual or offline auto-approve)."""
+    return (status or "").strip().upper() in _APPROVAL_DONE
+
+
 _REQUESTS_QUERY_LIMIT = 200
 _USER_CACHE_TTL_SEC = 300
 _user_cache: dict[str, tuple[float, bool, dict | None]] = {}
@@ -181,7 +190,7 @@ def request_still_pending_approval(d: dict) -> bool:
     if d.get("md_offline_bypass"):
         return False
     md = (d.get("md_status") or "").strip().upper()
-    if md in ("APPROVED", "OFFLINE"):
+    if approval_step_done(md) or md == "OFFLINE":
         return False
     jmd = (d.get("jmd_status") or "").strip().upper()
     if jmd in ("PENDING", "AWAITING_MANAGER", "AWAITING_JMD"):

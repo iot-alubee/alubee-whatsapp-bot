@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from bot_shared import (
+    STATUS_AUTO_APPROVE,
+    approval_step_done,
     get_employee_leave_counts,
     get_employee_permission_counts,
     get_user_record,
@@ -1388,7 +1390,7 @@ def _od_clarity_allowed(sender: str, rd: dict) -> bool:
         return False
     if _approval_role(sender, rd) != "md":
         return False
-    if (rd.get("jmd_status") or "").strip().upper() != "APPROVED":
+    if not approval_step_done(rd.get("jmd_status")):
         return False
     if (rd.get("md_status") or "").strip().upper() != "PENDING":
         return False
@@ -1696,8 +1698,8 @@ def _approval_role(sender: str, rd: dict) -> str | None:
             return None
         if (
             d.same_whatsapp(sender, md_wa)
-            and jmd_i_st == "APPROVED"
-            and jmd_ii_st == "APPROVED"
+            and approval_step_done(jmd_i_st)
+            and approval_step_done(jmd_ii_st)
             and md_st == "PENDING"
         ):
             return "md"
@@ -1710,7 +1712,11 @@ def _approval_role(sender: str, rd: dict) -> str | None:
     md_wa = request_md_whatsapp(rd)
     if _md_offline_closed(rd):
         return None
-    if d.same_whatsapp(sender, md_wa) and jmd_st == "APPROVED" and md_st == "PENDING":
+    if (
+        d.same_whatsapp(sender, md_wa)
+        and approval_step_done(jmd_st)
+        and md_st == "PENDING"
+    ):
         return "md"
 
     return None
@@ -1737,31 +1743,46 @@ def _is_single_jmd_approver_sender(sender: str, rd: dict) -> bool:
 
 
 def _dual_jmd_both_approved(rd: dict) -> bool:
-    return (
-        (rd.get("jmd_i_status") or "").strip().upper() == "APPROVED"
-        and (rd.get("jmd_ii_status") or "").strip().upper() == "APPROVED"
-    )
+    i = (rd.get("jmd_i_status") or "").strip().upper()
+    ii = (rd.get("jmd_ii_status") or "").strip().upper()
+    return approval_step_done(i) and approval_step_done(ii)
 
 
 def _visitor_jmd_fully_approved(rd: dict) -> bool:
     if rd.get("visitor_dual_jmd"):
         return _dual_jmd_both_approved(rd)
-    return (rd.get("jmd_status") or "").strip().upper() == "APPROVED"
+    return approval_step_done(rd.get("jmd_status"))
 
 
 def _md_is_offline_now(d: ApprovalDeps, md_wa: str) -> bool:
     return bool(md_wa and approver_availability.is_offline(d.db, md_wa))
 
 
+def _jmd_is_offline_now(d: ApprovalDeps, jmd_wa: str) -> bool:
+    return bool(jmd_wa and approver_availability.is_offline(d.db, jmd_wa))
+
+
+def _is_leave_request(rd: dict) -> bool:
+    return (rd.get("type") or "").strip().upper() == "LEAVE"
+
+
+def _md_offline_applies_bypass(d: ApprovalDeps, rd: dict, md_wa: str) -> bool:
+    """MD offline → JMD approval is final. Leave always requires MD approval."""
+    if _is_leave_request(rd):
+        return False
+    return _md_is_offline_now(d, md_wa)
+
+
 def _md_offline_closed(rd: dict) -> bool:
     """MD step finished via offline bypass — must not ask MD again when back online."""
     if rd.get("md_offline_bypass"):
         return True
-    return (rd.get("md_status") or "").strip().upper() == "OFFLINE"
+    md_st = (rd.get("md_status") or "").strip().upper()
+    return md_st in (STATUS_AUTO_APPROVE, "OFFLINE")
 
 
 def _md_status_after_jmd(md_offline: bool) -> str:
-    return "OFFLINE" if md_offline else "PENDING"
+    return STATUS_AUTO_APPROVE if md_offline else "PENDING"
 
 
 def _md_offline_bypass_fields(d: ApprovalDeps, md_offline: bool) -> dict:
@@ -1792,47 +1813,249 @@ def _after_jmd_when_md_offline(
     else:
         d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
     logger.info(
-        "md offline bypass request_id=%s type=%s (md_status=OFFLINE)",
+        "md offline bypass request_id=%s type=%s (md_status=%s)",
         request_id,
         req_label,
+        STATUS_AUTO_APPROVE,
     )
 
 
-def notify_visitor_on_submit(rd: dict, request_id: str, chain: dict) -> bool:
-    """Notify host-unit JMD(s) when a visitor request is submitted."""
+def _notify_md(wa_id: str, rd: dict, request_id: str) -> bool:
+    if not wa_id:
+        return False
+    if send_approval_buttons(
+        wa_id,
+        employee_name=rd.get("employee_name"),
+        department=rd.get("department"),
+        reason=rd.get("reason"),
+        request_id=request_id,
+        request_rd=rd,
+    ):
+        _set_pending_approval(wa_id, request_id)
+        return True
+    return False
+
+
+def _promote_to_md_after_jmd_approved(
+    ref,
+    rd: dict,
+    request_id: str,
+    chain: dict,
+    *,
+    jmd_offline_bypass: bool = False,
+) -> bool:
+    """JMD step complete — notify MD or MD-offline bypass (not for leave)."""
     d = _require()
-    if chain.get("mode") == "dual":
-        jmd_i = (chain.get("jmd_i") or "").strip()
-        jmd_ii = (chain.get("jmd_ii") or "").strip()
-        ok_i = notify_jmd(jmd_i, rd, request_id) if jmd_i else False
-        ok_ii = False
-        if jmd_ii and not d.same_whatsapp(jmd_i, jmd_ii):
-            ok_ii = notify_jmd(jmd_ii, rd, request_id)
-        elif jmd_ii:
-            logger.warning(
-                "visitor dual notify: JMD II same as JMD I request_id=%s", request_id
-            )
-        if not ok_i:
-            logger.error(
-                "visitor JMD I notify failed request_id=%s jmd_i=%s",
-                request_id,
-                jmd_i,
-            )
-        if not ok_ii:
-            logger.error(
-                "visitor JMD II notify failed request_id=%s jmd_ii=%s",
-                request_id,
-                jmd_ii,
+    md_wa = (chain.get("md") or rd.get("md") or "").strip()
+    req_label = _request_type_label(rd)
+    employee = rd.get("employee") or ""
+
+    update: dict = {
+        "md": md_wa,
+        "manager_status": "N/A",
+    }
+    if jmd_offline_bypass:
+        update["jmd_status"] = STATUS_AUTO_APPROVE
+        update["jmd_offline_bypass"] = True
+    md_off = _md_offline_applies_bypass(d, rd, md_wa)
+    update["md_status"] = _md_status_after_jmd(md_off)
+    if md_off:
+        update.update(_md_offline_bypass_fields(d, True))
+    ref.update(update)
+    rd = ref.get().to_dict() or rd
+
+    if md_off:
+        if employee:
+            _after_jmd_when_md_offline(
+                d,
+                ref,
+                rd,
+                md_wa,
+                employee=employee,
+                req_label=req_label,
+                request_id=request_id,
             )
         logger.info(
-            "visitor dual notify request_id=%s jmd_i_ok=%s jmd_ii_ok=%s",
+            "md offline bypass at submit request_id=%s type=%s",
             request_id,
-            ok_i,
-            ok_ii,
+            req_label,
         )
-        return ok_i and ok_ii
-    jmd = chain.get("jmd") or ""
-    return notify_jmd(jmd, rd, request_id) if jmd else False
+        return True
+
+    ok = _notify_md(md_wa, rd, request_id)
+    if ok:
+        logger.info("routed to md request_id=%s type=%s", request_id, req_label)
+    return ok
+
+
+def notify_approval_on_submit(
+    ref,
+    rd: dict,
+    request_id: str,
+    chain: dict,
+) -> bool:
+    """
+    First approval notification on submit.
+    Leave: always notify JMD (even if offline); both JMD and MD must approve.
+    Other types: JMD offline → skip JMD, route to MD; MD offline → JMD approval final.
+    """
+    d = _require()
+    jmd_wa = (chain.get("jmd") or rd.get("jmd") or "").strip()
+
+    if _is_leave_request(rd):
+        return notify_jmd(jmd_wa, rd, request_id) if jmd_wa else False
+
+    if not _jmd_is_offline_now(d, jmd_wa):
+        return notify_jmd(jmd_wa, rd, request_id) if jmd_wa else False
+
+    logger.info(
+        "jmd offline at submit — routing to md request_id=%s type=%s",
+        request_id,
+        _request_type_label(rd),
+    )
+    ref.update({
+        "jmd": jmd_wa,
+        "jmd_route": (chain.get("jmd_route") or rd.get("jmd_route") or "JMD1").strip().upper(),
+    })
+    rd = ref.get().to_dict() or rd
+    return _promote_to_md_after_jmd_approved(
+        ref, rd, request_id, chain, jmd_offline_bypass=True
+    )
+
+
+def submit_notify_user_hint(rd: dict, chain: dict, notify_ok: bool) -> str:
+    """Extra employee message after submit when offline routing applied."""
+    route = (chain.get("jmd_route") or "JMD").strip().upper()
+    approver_label = "PPC" if route == "PPC" else f"JMD ({route})"
+
+    if _is_leave_request(rd):
+        if notify_ok:
+            return ""
+        return (
+            f"\n\n{approver_label} could not be notified on WhatsApp. "
+            "Ask them to send Hi to this Alubee number once, then contact admin."
+        )
+
+    if rd.get("jmd_offline_bypass") and rd.get("md_offline_bypass"):
+        return ""
+    if rd.get("jmd_offline_bypass"):
+        if notify_ok:
+            return f"\nSent to MD for approval ({approver_label} is offline)."
+        return (
+            "\n\nMD could not be notified on WhatsApp. "
+            "Ask them to send Hi to this Alubee number once, then contact admin."
+        )
+    if notify_ok:
+        return ""
+    return (
+        f"\n\n{approver_label} could not be notified on WhatsApp. "
+        "Ask them to send Hi to this Alubee number once, then contact admin."
+    )
+
+
+def visitor_submit_notify_hint(rd: dict, chain: dict, notify_ok: bool) -> str:
+    """Employee hint after visitor submit with offline JMD routing."""
+    jmd_st = (rd.get("jmd_status") or "").strip().upper()
+    md_st = (rd.get("md_status") or "").strip().upper()
+    if approval_step_done(jmd_st) and md_st == "PENDING":
+        if notify_ok:
+            if chain.get("mode") == "dual":
+                return "\nSent to MD for approval (offline JMD(s) bypassed)."
+            return "\nSent to MD for approval (JMD is offline)."
+        return (
+            "\n\nMD could not be notified on WhatsApp. "
+            "Ask them to send Hi to this Alubee number once, then contact admin."
+        )
+    if rd.get("md_offline_bypass"):
+        return ""
+    if notify_ok:
+        return ""
+    if chain.get("mode") == "dual":
+        return (
+            "\n\nUnit I and Unit II JMD must both be notified on WhatsApp. "
+            "Ask each JMD to send Hi to this Alubee number once, then contact admin."
+        )
+    route = chain.get("jmd_route") or "JMD"
+    return (
+        f"\n\nJMD ({route}) could not be notified on WhatsApp. "
+        "Ask them to send Hi to this Alubee number once, then contact admin."
+    )
+
+
+def notify_visitor_on_submit(
+    ref,
+    rd: dict,
+    request_id: str,
+    chain: dict,
+) -> bool:
+    """Notify host-unit JMD(s) when a visitor request is submitted."""
+    d = _require()
+    if chain.get("mode") != "dual":
+        return notify_approval_on_submit(ref, rd, request_id, chain)
+
+    jmd_i = (chain.get("jmd_i") or "").strip()
+    jmd_ii = (chain.get("jmd_ii") or "").strip()
+    same_ii = bool(jmd_ii and d.same_whatsapp(jmd_i, jmd_ii))
+
+    i_off = _jmd_is_offline_now(d, jmd_i)
+    ii_off = _jmd_is_offline_now(d, jmd_ii) if jmd_ii and not same_ii else i_off if same_ii else False
+
+    patch: dict = {}
+    if i_off:
+        patch["jmd_i_status"] = STATUS_AUTO_APPROVE
+    if ii_off and jmd_ii:
+        patch["jmd_ii_status"] = STATUS_AUTO_APPROVE
+    if patch:
+        ref.update(patch)
+        rd = ref.get().to_dict() or rd
+
+    ok_i = True if i_off else (notify_jmd(jmd_i, rd, request_id) if jmd_i else False)
+    ok_ii = True
+    if jmd_ii and not same_ii:
+        ok_ii = True if ii_off else notify_jmd(jmd_ii, rd, request_id)
+    elif jmd_ii and same_ii:
+        ok_ii = ok_i
+
+    rd = ref.get().to_dict() or rd
+    if _dual_jmd_both_approved(rd):
+        i_st = (rd.get("jmd_i_status") or "").strip().upper()
+        ii_st = (rd.get("jmd_ii_status") or "").strip().upper()
+        jmd_agg = (
+            STATUS_AUTO_APPROVE
+            if i_st == STATUS_AUTO_APPROVE and ii_st == STATUS_AUTO_APPROVE
+            else "APPROVED"
+        )
+        ref.update({"jmd_status": jmd_agg})
+        rd = ref.get().to_dict() or rd
+        return _promote_to_md_after_jmd_approved(
+            ref,
+            rd,
+            request_id,
+            chain,
+            jmd_offline_bypass=bool(i_off or ii_off),
+        )
+
+    if not ok_i:
+        logger.error(
+            "visitor JMD I notify failed request_id=%s jmd_i=%s",
+            request_id,
+            jmd_i,
+        )
+    if not ok_ii:
+        logger.error(
+            "visitor JMD II notify failed request_id=%s jmd_ii=%s",
+            request_id,
+            jmd_ii,
+        )
+    logger.info(
+        "visitor dual notify request_id=%s jmd_i_ok=%s jmd_ii_ok=%s i_off=%s ii_off=%s",
+        request_id,
+        ok_i,
+        ok_ii,
+        i_off,
+        ii_off,
+    )
+    return ok_i and ok_ii
 
 
 def notify_jmd(jmd_wa: str, rd: dict, request_id: str) -> bool:
@@ -1852,17 +2075,7 @@ def notify_jmd(jmd_wa: str, rd: dict, request_id: str) -> bool:
 
 
 def notify_approver(wa_id: str, rd: dict, request_id: str) -> None:
-    if not wa_id:
-        return
-    if send_approval_buttons(
-        wa_id,
-        employee_name=rd.get("employee_name"),
-        department=rd.get("department"),
-        reason=rd.get("reason"),
-        request_id=request_id,
-        request_rd=rd,
-    ):
-        _set_pending_approval(wa_id, request_id)
+    _notify_md(wa_id, rd, request_id)
 
 
 def _employee_final_approval_message(req_label: str, rd: dict | None = None) -> str:
@@ -1955,7 +2168,7 @@ def handle_approval_gate(
             rd = ref.get().to_dict() or {}
             if _dual_jmd_both_approved(rd):
                 md_wa = request_md_whatsapp(rd)
-                md_off = _md_is_offline_now(d, md_wa)
+                md_off = _md_offline_applies_bypass(d, rd, md_wa)
                 ref.update({
                     "jmd_status": "APPROVED",
                     "md_status": _md_status_after_jmd(md_off),
@@ -2022,22 +2235,36 @@ def handle_approval_gate(
         elif is_approve:
             md_wa = request_md_whatsapp(rd)
             if _cl_permission_chain(rd):
+                md_off = _md_offline_applies_bypass(d, rd, md_wa)
                 ref.update({
                     "jmd": request_jmd_whatsapp(rd),
                     "jmd_route": (rd.get("jmd_route") or "PPC").strip().upper(),
                     "md": md_wa,
                     "manager_status": "N/A",
                     "jmd_status": "APPROVED",
-                    "md_status": "PENDING",
+                    "md_status": _md_status_after_jmd(md_off),
+                    **_md_offline_bypass_fields(d, md_off),
                 })
                 rd = ref.get().to_dict() or rd
-                notify_approver(md_wa, rd, request_id)
+                if md_off:
+                    _after_jmd_when_md_offline(
+                        d,
+                        ref,
+                        rd,
+                        md_wa,
+                        employee=employee,
+                        req_label=req_label,
+                        request_id=request_id,
+                    )
+                else:
+                    notify_approver(md_wa, rd, request_id)
                 logger.info(
-                    "ppc approved CL permission request_id=%s → hr",
+                    "ppc approved CL permission request_id=%s → hr md_off=%s",
                     request_id,
+                    md_off,
                 )
             else:
-                md_off = _md_is_offline_now(d, md_wa)
+                md_off = _md_offline_applies_bypass(d, rd, md_wa)
                 ref.update({
                     "jmd": request_jmd_whatsapp(rd),
                     "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),

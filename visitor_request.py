@@ -104,7 +104,7 @@ class VisitorDeps:
     session_ref: Callable[[str], object]
     utcnow: Callable
     build_approval_chain: Callable[..., dict | None]
-    notify_visitor_on_submit: Callable[[dict, str, dict], bool]
+    notify_visitor_on_submit: Callable[..., bool]
     clear_session: Callable[[str], None]
     go_main_menu: Callable[[str], None]
     already_pending_msg: str
@@ -1031,22 +1031,14 @@ def _submit_payload(
     )
 
     rd = ref.get().to_dict()
-    jmd_ok = deps.notify_visitor_on_submit(rd, request_id, chain)
+    ok = deps.notify_visitor_on_submit(ref, rd, request_id, chain)
+    rd = ref.get().to_dict() or rd
 
     deps.clear_session(sender)
     msg = "Visitor request is submitted."
     if chain.get("approval_test"):
         msg += " (pilot test JMD/MD — OD approvers unchanged)."
-    if not jmd_ok:
-        if chain.get("mode") == "dual":
-            msg += (
-                "\n\nUnit I and Unit II JMD must both be notified on WhatsApp. "
-                "Ask each JMD to send Hi to this Alubee number once, then contact admin."
-            )
-        else:
-            route = chain.get("jmd_route") or "JMD"
-            msg += (
-                f"\n\nJMD ({route}) could not be notified on WhatsApp. "
-                "Ask them to send Hi to this Alubee number once, then contact admin."
-            )
+    from approval import visitor_submit_notify_hint
+
+    msg += visitor_submit_notify_hint(rd, chain, ok)
     deps.send_to(sender, msg)

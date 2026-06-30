@@ -62,7 +62,7 @@ class PermissionDeps:
     utcnow: Callable
     chat_name: Callable[[str], str]
     build_approval_chain: Callable[..., dict | None]
-    notify_jmd: Callable[[str, dict, str], bool]
+    notify_on_submit: Callable[..., bool]
     go_main_menu: Callable[[str], None]
 
 
@@ -648,17 +648,15 @@ def _submit(sender: str, session: dict, deps: PermissionDeps, *, reason: str) ->
     )
 
     rd = ref.get().to_dict()
-    jmd_ok = deps.notify_jmd(chain["jmd"], rd, request_id)
+    ok = deps.notify_on_submit(ref, rd, request_id, chain)
+    rd = ref.get().to_dict() or rd
 
     deps.session_ref(sender).delete()
     msg = "Your permission request has been submitted for approval."
-    if not jmd_ok:
-        route = chain["jmd_route"]
-        approver = "PPC" if permission_for == "cl" else f"JMD ({route})"
-        msg += (
-            f"\n\n{approver} could not be notified on WhatsApp. "
-            "Ask them to send Hi to this Alubee number once, then contact admin."
-        )
+    from approval import submit_notify_user_hint
+
+    hint = submit_notify_user_hint(rd, chain, ok)
+    msg += hint
     deps.send_to(sender, msg)
 
 

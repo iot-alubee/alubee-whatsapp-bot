@@ -428,7 +428,7 @@ OD_DEPS = od_request.OdDeps(
     chat_name=_chat_name,
     same_whatsapp=_same_whatsapp,
     build_approval_chain=approval.build_approval_chain,
-    notify_jmd=approval.notify_jmd,
+    notify_on_submit=approval.notify_approval_on_submit,
     go_main_menu=_go_main_menu_for_employee,
     awaiting_hi_state=SESSION_AWAITING_HI,
     already_pending_msg=od_request.OD_ALREADY_PENDING_MSG,
@@ -442,7 +442,7 @@ LEAVE_DEPS = leave_request.LeaveDeps(
     utcnow=_utcnow,
     chat_name=_chat_name,
     build_approval_chain=approval.build_leave_approval_chain,
-    notify_jmd=approval.notify_jmd,
+    notify_on_submit=approval.notify_approval_on_submit,
     go_main_menu=_go_main_menu_for_employee,
 )
 
@@ -454,7 +454,7 @@ PERMISSION_DEPS = permission_request.PermissionDeps(
     utcnow=_utcnow,
     chat_name=_chat_name,
     build_approval_chain=_build_permission_approval_chain,
-    notify_jmd=approval.notify_jmd,
+    notify_on_submit=approval.notify_approval_on_submit,
     go_main_menu=_go_main_menu_for_employee,
 )
 
@@ -584,32 +584,41 @@ def _try_handle_approver_availability(sender: str, incoming: str) -> bool:
     snap = _session_ref(sender).get()
     data = snap.to_dict() if snap.exists else {}
     role = (data.get("approver_role") or "").strip()
-    if data.get("state") != SESSION_APPROVER_AVAILABILITY and not role:
-        role = approver_availability.approver_role_for_sender(
-            sender,
-            md=MD_WHATSAPP_NUMBER,
-            jmd_i=JMD_I_WHATSAPP_NUMBER,
-            jmd_ii=JMD_II_WHATSAPP_NUMBER,
-            same_whatsapp=_same_whatsapp,
-            test_md=TEST_MD_WHATSAPP_NUMBER,
+    if not role:
+        role = (
+            approver_availability.approver_role_for_sender(
+                sender,
+                md=MD_WHATSAPP_NUMBER,
+                jmd_i=JMD_I_WHATSAPP_NUMBER,
+                jmd_ii=JMD_II_WHATSAPP_NUMBER,
+                same_whatsapp=_same_whatsapp,
+                test_md=TEST_MD_WHATSAPP_NUMBER,
+            )
+            or ""
         )
-        if not role:
-            return False
+    if not role:
+        return False
     availability = "offline" if upper == "OFFLINE" else "online"
-    if availability == "offline":
-        blocked = approver_availability.offline_blocked_message(
-            db,
-            role,
-            md=MD_WHATSAPP_NUMBER,
-            jmd_i=JMD_I_WHATSAPP_NUMBER,
-            jmd_ii=JMD_II_WHATSAPP_NUMBER,
-        )
-        if blocked:
-            _send_to(sender, blocked)
-            return True
-    approver_availability.set_availability(
-        db, sender, availability, role=role or "approver"
+    blocked = approver_availability.set_availability(
+        db,
+        sender,
+        availability,
+        role=role,
+        enforce_pair_rule=True,
+        md=MD_WHATSAPP_NUMBER,
+        jmd_i=JMD_I_WHATSAPP_NUMBER,
+        jmd_ii=JMD_II_WHATSAPP_NUMBER,
     )
+    if blocked:
+        _send_to(sender, blocked)
+        current = approver_availability.get_availability(db, sender)
+        _send_approver_availability_menu(sender, current)
+        _session_merge(
+            sender,
+            state=SESSION_APPROVER_AVAILABILITY,
+            approver_role=role,
+        )
+        return True
     _send_to(sender, f"You are now {availability.title()}.")
     exists, ud = bot_shared.get_user_record(sender)
     if exists and ud:

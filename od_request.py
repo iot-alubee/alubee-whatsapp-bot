@@ -16,6 +16,7 @@ try:
 except ImportError:
     ZoneInfo = None  # type: ignore[misc, assignment]
 
+from bot_shared import approval_step_done
 from interakt_api import send_list_menu, send_reply_buttons, wa_id_to_phone
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class OdDeps:
     chat_name: Callable[[str], str]
     same_whatsapp: Callable[[str, str], bool]
     build_approval_chain: Callable[[dict], dict | None]
-    notify_jmd: Callable[[str, dict, str], bool]
+    notify_on_submit: Callable[..., bool]
     go_main_menu: Callable[[str], None]
     awaiting_hi_state: str
     already_pending_msg: str = OD_ALREADY_PENDING_MSG
@@ -272,7 +273,7 @@ def _od_approval_still_pending(d: dict) -> bool:
     if _od_request_is_closed(d):
         return False
     md = (d.get("md_status") or "").strip().upper()
-    if md in ("APPROVED", "OFFLINE"):
+    if approval_step_done(md) or md == "OFFLINE":
         return False
     if d.get("md_offline_bypass"):
         return False
@@ -562,18 +563,16 @@ def _submit(
     logger.info("OD created %s jmd_route=%s", request_id, chain["jmd_route"])
 
     rd = ref.get().to_dict()
-    jmd_ok = deps.notify_jmd(chain["jmd"], rd, request_id)
+    ok = deps.notify_on_submit(ref, rd, request_id, chain)
+    rd = ref.get().to_dict() or rd
 
     deps.session_ref(sender).delete()
     msg = "OD is Submitted."
     if uses_company_vehicle and company_vehicle_description:
         msg += f"\nVehicle: {company_vehicle_description}."
-    if not jmd_ok:
-        route = chain["jmd_route"]
-        msg += (
-            f"\n\nJMD ({route}) could not be notified on WhatsApp. "
-            "Ask them to send Hi to this Alubee number once, then try again or contact admin."
-        )
+    from approval import submit_notify_user_hint
+
+    msg += submit_notify_user_hint(rd, chain, ok)
     deps.send_to(sender, msg)
 
 
