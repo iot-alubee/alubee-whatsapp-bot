@@ -205,7 +205,6 @@ EXTERNAL_VENDORS: list[tuple[str, str]] = [
 INTERNAL_VEHICLE_ASSIGNEES: list[tuple[str, str]] = [
     ("adc239", "Arun Selvam"),
     ("adc324", "Pandiarajan"),
-    ("sri079", "Manikandan C"),
 ]
 
 INTERNAL_FLEET_VEHICLES: list[tuple[str, str]] = [
