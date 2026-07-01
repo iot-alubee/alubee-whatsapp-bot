@@ -501,7 +501,7 @@ def _assignee_notify_template_name() -> str:
     return (
         os.getenv("VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME")
         or os.getenv("VEHICLE_INTERNAL_ASSIGNEE_TEMPLATE_NAME")
-        or "vehicle_assignee_message"
+        or "vehicle_assignee_v02"
     ).strip()
 
 
@@ -549,22 +549,6 @@ def _assignee_notify_template_values(rd: dict, assignee_name: str) -> dict[str, 
     }
 
 
-def _assignee_notify_body(rd: dict, assignee_name: str) -> str:
-    v = _assignee_notify_template_values(rd, assignee_name)
-    first = (assignee_name or "there").strip().split()[0] if assignee_name else "there"
-    return (
-        f"Hi {first}, new request has been assigned to you. Please refer below.\n\n"
-        f"Requester: {v['requester']}\n"
-        f"From: {v['from']}\n"
-        f"Request Type: {v['request_type']}\n"
-        f"Category: {v['category']}\n"
-        f"Destination: {v['destination']}\n"
-        f"Vehicle: {v['vehicle']}\n"
-        f"Time: {v['time']}\n\n"
-        "Click 'Start' once you are ready!"
-    )
-
-
 def _assignee_notify_template_body_values(rd: dict, assignee_name: str) -> list[str]:
     values = _assignee_notify_template_values(rd, assignee_name)
     fields = _assignee_notify_template_body_fields()
@@ -585,7 +569,7 @@ def _notify_internal_assignee(
     assignee_label: str,
     request_id: str,
 ) -> None:
-    """Notify logistics department staff when an Internal request is assigned."""
+    """Notify internal assignee via WhatsApp template only (vehicle_assignee_v02)."""
     if _normalize_vehicle_type(rd.get("vehicle_type") or "") != "in_house":
         return
 
@@ -601,81 +585,40 @@ def _notify_internal_assignee(
     assignee_wa, assignee_name = found
     display_name = _sentence_case_name(assignee_label or assignee_name)
     template_name = _assignee_notify_template_name()
+    if not template_name:
+        logger.error(
+            "vehicle assignee notify skipped — VEHICLE_ASSIGNEE_NOTIFY_TEMPLATE_NAME not set request_id=%s",
+            request_id,
+        )
+        return
+
     phone = wa_id_to_phone(assignee_wa)
     rid = (request_id or "").strip()
-    start_id = f"VEHICLE_START_{rid}"[:256]
-    can_start = rd.get("assignee_can_start") is not False
-    body = _assignee_notify_body(rd, display_name)
-    start_buttons = [(start_id, "Start")] if can_start else []
     body_values = _assignee_notify_template_body_values(rd, display_name)
 
-    if template_name:
-        try:
-            ensure_customer(phone, name=display_name)
-            send_template(
-                phone,
-                template_name,
-                language_code=_assignee_notify_template_language(),
-                body_values=body_values,
-                callback_data=rid,
-                ensure_contact=False,
-            )
-            logger.info(
-                "vehicle assignee template sent assignee=%s request_id=%s template=%s fields=%s",
-                assignee_wa,
-                request_id,
-                template_name,
-                len(body_values),
-            )
-            return
-        except Exception:
-            logger.exception(
-                "vehicle assignee template failed assignee=%s request_id=%s",
-                assignee_wa,
-                request_id,
-            )
-
-    if deps.has_active_whatsapp_session(assignee_wa):
-        try:
-            if start_buttons:
-                send_reply_buttons(
-                    phone,
-                    body,
-                    start_buttons,
-                    callback_data=rid,
-                    ensure_contact=True,
-                    contact_name=display_name,
-                )
-            else:
-                deps.send_to(assignee_wa, body)
-            logger.info(
-                "vehicle assignee session fallback sent assignee=%s request_id=%s",
-                assignee_wa,
-                request_id,
-            )
-            return
-        except Exception:
-            logger.exception(
-                "vehicle assignee session fallback failed assignee=%s request_id=%s",
-                assignee_wa,
-                request_id,
-            )
-
     try:
-        deps.send_to(
-            assignee_wa,
-            body + "\n\nReply *Start* when you are ready.",
+        ensure_customer(phone, name=display_name)
+        send_template(
+            phone,
+            template_name,
+            language_code=_assignee_notify_template_language(),
+            body_values=body_values,
+            callback_data=rid,
+            ensure_contact=False,
         )
         logger.info(
-            "vehicle assignee plain-text fallback sent assignee=%s request_id=%s",
+            "vehicle assignee template sent assignee=%s request_id=%s template=%s fields=%s",
             assignee_wa,
             request_id,
+            template_name,
+            len(body_values),
         )
     except Exception:
         logger.exception(
-            "vehicle assignee notify failed all channels assignee=%s request_id=%s",
+            "vehicle assignee template failed assignee=%s request_id=%s template=%s",
             assignee_wa,
             request_id,
+            template_name,
         )
 
 

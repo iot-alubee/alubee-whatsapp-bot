@@ -510,7 +510,8 @@ def _submit(
     visiting_to: str = "",
     visiting_to_label: str = "",
     purpose: str = "",
-    time_required_hours: int | None = None,
+    time_required: str = "",
+    time_required_label: str = "",
 ) -> None:
     if _find_open_od_for_employee(deps, sender):
         deps.session_ref(sender).delete()
@@ -557,8 +558,10 @@ def _submit(
         payload["od_visiting_to"] = visiting_to
         payload["od_visiting_to_label"] = visiting_to_label or display_reason
         payload["od_purpose"] = (purpose or "").strip()
-    if time_required_hours is not None:
-        payload["od_time_required_hours"] = time_required_hours
+    if time_required:
+        payload["od_time_required"] = time_required
+    if time_required_label:
+        payload["od_time_required_label"] = time_required_label
     ref.set(payload)
     logger.info("OD created %s jmd_route=%s", request_id, chain["jmd_route"])
 
@@ -734,6 +737,32 @@ def _resolve_od_reason_from_flow(data: dict) -> str:
     return _flow_pick(data, "other_reason") or raw.replace("_", " ").title()
 
 
+OD_TIME_REQUIRED_LABELS: dict[str, str] = {
+    "15_mins": "15 mins",
+    "30_mins": "30 mins",
+    "1_hour": "1 Hour",
+    "2_hours": "2 Hours",
+    "3_hours": "3 Hours",
+    "over_3_hours": "> 3 Hours",
+}
+
+
+def od_time_required_display(rd: dict | None) -> str:
+    """Human label for OD duration (form selection or legacy hours)."""
+    if not rd:
+        return "—"
+    label = (rd.get("od_time_required_label") or "").strip()
+    if label:
+        return label
+    code = (rd.get("od_time_required") or "").strip().lower()
+    if code in OD_TIME_REQUIRED_LABELS:
+        return OD_TIME_REQUIRED_LABELS[code]
+    hours = rd.get("od_time_required_hours")
+    if hours is not None and str(hours).strip() not in ("", "None"):
+        return f"{hours} hour(s)"
+    return "—"
+
+
 OD_VISITING_TO_LABELS: dict[str, str] = {
     "unit_i": "Unit I",
     "unit_ii": "Unit II",
@@ -759,16 +788,49 @@ def _resolve_visiting_to_from_flow(data: dict) -> tuple[str, str]:
     return code, label
 
 
-def _parse_time_required_hours(data: dict) -> int | None:
+def _parse_time_required_selection(data: dict) -> tuple[str, str] | None:
     raw = _flow_pick(data, "time_required", "time_required_hours", "od_time_required")
     if not raw:
         return None
-    if not raw.isdigit():
-        return None
-    hours = int(raw)
-    if hours < 1 or hours > 12:
-        return None
-    return hours
+    code = raw.lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "15min": "15_mins",
+        "15_mins": "15_mins",
+        "15mins": "15_mins",
+        "30min": "30_mins",
+        "30_mins": "30_mins",
+        "30mins": "30_mins",
+        "1hour": "1_hour",
+        "1_hour": "1_hour",
+        "1hr": "1_hour",
+        "2hours": "2_hours",
+        "2_hours": "2_hours",
+        "2hrs": "2_hours",
+        "3hours": "3_hours",
+        "3_hours": "3_hours",
+        "3hrs": "3_hours",
+        "over_3_hours": "over_3_hours",
+        ">3hours": "over_3_hours",
+        "gt_3_hours": "over_3_hours",
+    }
+    code = aliases.get(code, code)
+    if code in OD_TIME_REQUIRED_LABELS:
+        return code, OD_TIME_REQUIRED_LABELS[code]
+    raw_lower = raw.strip().lower()
+    for option_code, label in OD_TIME_REQUIRED_LABELS.items():
+        if raw_lower == label.lower():
+            return option_code, label
+    # Legacy numeric hours from older form versions
+    if raw.isdigit():
+        legacy_map = {
+            "1": "1_hour",
+            "2": "2_hours",
+            "3": "3_hours",
+        }
+        mapped = legacy_map.get(raw)
+        if mapped:
+            return mapped, OD_TIME_REQUIRED_LABELS[mapped]
+    return None
 
 
 def parse_flow_response(response_json: dict | str | None) -> dict | None:
@@ -792,9 +854,10 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
         purpose = _flow_pick(data, "purpose", "od_purpose")
         if visiting_code != "md_home" and not purpose:
             return None
-        hours = _parse_time_required_hours(data)
-        if hours is None:
+        time_sel = _parse_time_required_selection(data)
+        if time_sel is None:
             return None
+        time_required, time_required_label = time_sel
 
         cv_raw = _flow_pick(data, "company_vehicle", "uses_company_vehicle").lower()
         if cv_raw not in ("yes", "no", "y", "n"):
@@ -814,7 +877,8 @@ def parse_flow_response(response_json: dict | str | None) -> dict | None:
             "visiting_to": visiting_code,
             "visiting_to_label": visiting_label,
             "purpose": purpose if visiting_code != "md_home" else "",
-            "time_required_hours": hours,
+            "time_required": time_required,
+            "time_required_label": time_required_label,
             "uses_company_vehicle": uses_cv,
             "company_vehicle_id": vehicle_id,
         }
@@ -871,5 +935,6 @@ def handle_flow_submission(
         visiting_to=(parsed.get("visiting_to") or "").strip(),
         visiting_to_label=(parsed.get("visiting_to_label") or "").strip(),
         purpose=(parsed.get("purpose") or "").strip(),
-        time_required_hours=parsed.get("time_required_hours"),
+        time_required=(parsed.get("time_required") or "").strip(),
+        time_required_label=(parsed.get("time_required_label") or "").strip(),
     )

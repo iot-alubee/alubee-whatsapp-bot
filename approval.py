@@ -23,6 +23,7 @@ from bot_shared import (
 import approver_availability
 
 from interakt_api import ensure_customer, send_reply_buttons, send_template, wa_id_to_phone
+from od_request import od_time_required_display
 
 logger = logging.getLogger(__name__)
 
@@ -580,7 +581,7 @@ def _approval_message_body(
         f"Date: {_format_od_approval_date((request_rd or {}).get('requested_datetime'))}\n"
         f"Visiting To: {(request_rd or {}).get('od_visiting_to_label') or reason or '—'}\n"
         f"Purpose: {((request_rd or {}).get('od_purpose') or '').strip() or '—'}\n"
-        f"Time Required: {(request_rd or {}).get('od_time_required_hours') or '—'}\n\n"
+        f"Time Required: {od_time_required_display(request_rd)}\n\n"
         f"{clarity_block}"
         f"{footer}"
     )
@@ -805,7 +806,7 @@ def _approval_template_values(
         "date": _format_od_approval_date(rd.get("requested_datetime")),
         "visiting_to": (rd.get("od_visiting_to_label") or reason or "—"),
         "purpose": ((rd.get("od_purpose") or "").strip() or "—"),
-        "time_required": str(rd.get("od_time_required_hours") or "—"),
+        "time_required": od_time_required_display(rd),
     }
 
 
