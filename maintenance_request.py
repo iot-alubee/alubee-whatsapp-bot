@@ -1732,9 +1732,11 @@ def handle_maintenance_assignee_gate(
         deps.send_to(sender, f"Request is already {_request_status(rd).lower()}.")
         return True
 
+    first_closed_at = rd.get("technician_first_closed_at") or rd.get("technician_closed_at")
     ref.update({
         "maintenance_status": "AWAITING_USER_CLOSE",
         "technician_closed_at": deps.utcnow(),
+        "technician_first_closed_at": first_closed_at or deps.utcnow(),
         "technician_closed_by": sender,
     })
     deps.clear_session(sender)
