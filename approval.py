@@ -2335,3 +2335,134 @@ def handle_approval_gate(
                 d.session_ref(sender).delete()
 
     return True
+
+
+def portal_admin_approve(request_id: str, step: str) -> tuple[bool, str | None]:
+    """Admin portal override for stuck approvals. step: 'jmd' or 'md'."""
+    d = _require()
+    rid = (request_id or "").strip()
+    step_key = (step or "").strip().lower()
+    if not rid:
+        return False, "Missing request id."
+    if step_key not in ("jmd", "md"):
+        return False, "Invalid approval step."
+
+    ref = d.db.collection("requests").document(rid)
+    snap = ref.get()
+    if not snap.exists:
+        return False, "Request not found."
+    rd = snap.to_dict() or {}
+    employee = rd.get("employee")
+    req_label = _request_type_label(rd)
+    req_type = (rd.get("type") or "").strip().upper()
+
+    if step_key == "jmd":
+        if rd.get("visitor_dual_jmd"):
+            jmd_i_st = (rd.get("jmd_i_status") or "").strip().upper()
+            jmd_ii_st = (rd.get("jmd_ii_status") or "").strip().upper()
+            if not approval_step_done(jmd_i_st):
+                ref.update({"jmd_i_status": "APPROVED"})
+            elif not approval_step_done(jmd_ii_st):
+                ref.update({"jmd_ii_status": "APPROVED"})
+            else:
+                return False, "JMD approval is already complete."
+            rd = ref.get().to_dict() or rd
+            if _dual_jmd_both_approved(rd):
+                md_wa = request_md_whatsapp(rd)
+                md_off = _md_offline_applies_bypass(d, rd, md_wa)
+                ref.update({
+                    "jmd_status": "APPROVED",
+                    "md_status": _md_status_after_jmd(md_off),
+                    "md": md_wa,
+                    "manager_status": "N/A",
+                    **_md_offline_bypass_fields(d, md_off),
+                })
+                rd = ref.get().to_dict() or rd
+                if md_off:
+                    _after_jmd_when_md_offline(
+                        d,
+                        ref,
+                        rd,
+                        md_wa,
+                        employee=employee,
+                        req_label=req_label,
+                        request_id=rid,
+                    )
+                else:
+                    notify_approver(md_wa, rd, rid)
+            return True, None
+
+        jmd_st = (rd.get("jmd_status") or "").strip().upper()
+        if jmd_st in ("APPROVED", "AUTO_APPROVE"):
+            return False, "JMD has already approved this request."
+        if jmd_st in ("DENIED", "N/A"):
+            return False, "JMD approval is not pending."
+
+        if req_type in ("LEAVE", "PERMISSION") and _uses_legacy_test_single_approver(rd):
+            label = "leave" if req_type == "LEAVE" else "permission"
+            ref.update({
+                "jmd": request_jmd_whatsapp(rd),
+                "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+                "manager_status": "N/A",
+                "jmd_status": "APPROVED",
+                "md_status": "N/A",
+                "approved_datetime": d.utcnow(),
+            })
+            if employee:
+                d.send_to(employee, _employee_final_approval_message(label, rd))
+            return True, None
+
+        md_wa = request_md_whatsapp(rd)
+        md_off = _md_offline_applies_bypass(d, rd, md_wa)
+        ref.update({
+            "jmd": request_jmd_whatsapp(rd),
+            "jmd_route": (rd.get("jmd_route") or "JMD1").strip().upper(),
+            "md": md_wa,
+            "manager_status": "N/A",
+            "jmd_status": "APPROVED",
+            "md_status": _md_status_after_jmd(md_off),
+            **_md_offline_bypass_fields(d, md_off),
+        })
+        rd = ref.get().to_dict() or rd
+        if md_off:
+            _after_jmd_when_md_offline(
+                d,
+                ref,
+                rd,
+                md_wa,
+                employee=employee,
+                req_label=req_label,
+                request_id=rid,
+            )
+        else:
+            notify_approver(md_wa, rd, rid)
+        return True, None
+
+    md_st = (rd.get("md_status") or "").strip().upper()
+    if md_st in ("APPROVED", "AUTO_APPROVE"):
+        return False, "MD has already approved this request."
+    if _md_offline_closed(rd):
+        return False, "MD approval was already bypassed (offline)."
+
+    if rd.get("visitor_dual_jmd"):
+        if not _visitor_jmd_fully_approved(rd):
+            return False, "Both JMD approvals must be completed first."
+    else:
+        jmd_st = (rd.get("jmd_status") or "").strip().upper()
+        if jmd_st not in ("APPROVED", "AUTO_APPROVE") and not rd.get("jmd_offline_bypass"):
+            return False, "JMD approval must be completed first."
+
+    patch = {
+        "md_status": "APPROVED",
+        "approved_datetime": d.utcnow(),
+    }
+    if (rd.get("jmd_status") or "").strip().upper() in ("PENDING", "AWAITING_MANAGER"):
+        patch["jmd_status"] = "APPROVED"
+    ref.update(patch)
+    fresh = ref.get()
+    rd_fresh = fresh.to_dict() if fresh.exists else rd
+    if req_type == "VISITOR":
+        d.on_visitor_md_approved(ref, rd_fresh)
+    elif employee:
+        d.send_to(employee, _employee_final_approval_message(req_label, rd_fresh))
+    return True, None
