@@ -22,6 +22,7 @@ from bot_shared import (
     wa_from_env,
 )
 from interakt_api import (
+    _env_flag,
     ensure_customer,
     send_list_menu,
     send_list_menu_paged,
@@ -1654,6 +1655,13 @@ def _notify_jmd_md_assignment(
     deps: MaintenanceDeps,
 ) -> None:
     """Notify unit JMD + MD when a maintenance request is assigned to a technician."""
+    if not _env_flag("ENABLE_JMD_MD_MAINTENANCE_NOTIFY", default=False):
+        logger.info(
+            "maintenance JMD/MD assign notify disabled "
+            "(ENABLE_JMD_MD_MAINTENANCE_NOTIFY) request_id=%s",
+            request_id,
+        )
+        return
     template_name = _jmd_md_assign_template_name()
     if not template_name:
         logger.error(
