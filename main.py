@@ -32,7 +32,7 @@ from bot_config import bootstrap_env
 import approval
 import approver_availability
 import bot_shared
-from bot_shared import wa_from_env
+from bot_shared import normalize_callback_request_id, wa_from_env
 import it_request
 import leave_request
 import vehicle_request
@@ -996,20 +996,51 @@ def _extract_webhook_callback_request_id(body: dict) -> str:
     data = body.get("data") or {}
     msg_obj = data.get("message") or {}
     raw_msg = msg_obj.get("message")
-    candidates: list[object] = [body, data, msg_obj]
-    if isinstance(raw_msg, dict):
-        candidates.append(raw_msg)
-    for candidate in candidates:
+
+    def _norm(val: str) -> str:
+        return normalize_callback_request_id((val or "").strip())
+
+    # Prefer callback on the inbound message payload (per-message, not account-wide).
+    for candidate in (msg_obj, data):
         if not isinstance(candidate, dict):
             continue
         for key in ("callbackData", "callback_data"):
-            val = (candidate.get(key) or "").strip()
+            val = _norm(candidate.get(key) or "")
             if val:
                 return val
         rid = _callback_from_meta(candidate.get("meta_data"))
         if rid:
-            return rid
-    return _deep_find_callback_data(body)
+            return _norm(rid)
+
+    # WhatsApp reply context: map quoted outbound message id → request id.
+    if isinstance(raw_msg, dict):
+        ctx = raw_msg.get("context")
+        if not isinstance(ctx, dict):
+            ctx = msg_obj.get("context") if isinstance(msg_obj.get("context"), dict) else {}
+        replied_id = (
+            (ctx.get("id") or ctx.get("message_id") or ctx.get("messageId") or "")
+            if isinstance(ctx, dict)
+            else ""
+        )
+        if replied_id:
+            rid = approval.lookup_approval_request_from_message_id(str(replied_id).strip())
+            if rid:
+                return rid
+        for key in ("callbackData", "callback_data"):
+            val = _norm(raw_msg.get(key) or "")
+            if val:
+                return val
+
+    if isinstance(body, dict):
+        for key in ("callbackData", "callback_data"):
+            val = _norm(body.get(key) or "")
+            if val:
+                return val
+
+    found = _deep_find_callback_data(msg_obj if isinstance(msg_obj, dict) else {})
+    if found:
+        return _norm(found)
+    return ""
 
 
 def _flow_response_from_message(msg_obj: dict) -> dict | str | None:
@@ -1283,6 +1314,11 @@ def _process(
         return
 
     if approval.handle_approval_gate(
+        sender, incoming, callback_request_id=callback_request_id
+    ):
+        return
+
+    if approval.try_notify_ambiguous_approval(
         sender, incoming, callback_request_id=callback_request_id
     ):
         return

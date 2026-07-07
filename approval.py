@@ -17,6 +17,7 @@ from bot_shared import (
     get_employee_leave_counts,
     get_employee_permission_counts,
     get_user_record,
+    normalize_callback_request_id,
     wa_from_env,
 )
 
@@ -843,7 +844,7 @@ def _send_approval_template(
     req_type = _approval_request_type(request_rd)
     try:
         ensure_customer(wa_id_to_phone(wa_id), name="Approver")
-        send_template(
+        resp = send_template(
             wa_id_to_phone(wa_id),
             template_name,
             language_code=_approval_template_language(),
@@ -856,6 +857,7 @@ def _send_approval_template(
             callback_data=rid,
             ensure_contact=False,
         )
+        _store_approval_message_ref(wa_id, rid, resp)
         logger.info(
             "approval template sent type=%s to=%s request_id=%s template=%s",
             req_type,
@@ -900,7 +902,7 @@ def _send_session_approval_buttons(
         md_clarity=md_od_clarity,
     )
     try:
-        send_reply_buttons(
+        resp = send_reply_buttons(
             wa_id_to_phone(wa_id),
             body,
             buttons,
@@ -908,17 +910,19 @@ def _send_session_approval_buttons(
             ensure_contact=True,
             contact_name=d.chat_name(employee_name),
         )
+        _store_approval_message_ref(wa_id, rid, resp)
         return True
     except Exception:
         logger.exception("session approval buttons failed to=%s", wa_id)
         try:
             ensure_customer(wa_id_to_phone(wa_id), name="Approver")
-            send_reply_buttons(
+            resp = send_reply_buttons(
                 wa_id_to_phone(wa_id),
                 body,
                 buttons,
                 callback_data=request_id,
             )
+            _store_approval_message_ref(wa_id, rid, resp)
             return True
         except Exception:
             logger.exception("session approval retry failed to=%s", wa_id)
@@ -939,7 +943,8 @@ def send_approval_buttons(
     req_type = _approval_request_type(request_rd)
     md_od_clarity = _od_md_clarity_enabled(wa_id, request_rd)
 
-    if md_od_clarity and d.has_active_whatsapp_session(wa_id):
+    # Session buttons embed APPROVE_<request_id> on each message (safe for multiple pending).
+    if d.has_active_whatsapp_session(wa_id):
         if _send_session_approval_buttons(
             wa_id,
             employee_name=employee_name,
@@ -947,8 +952,9 @@ def send_approval_buttons(
             reason=reason,
             request_id=rid,
             request_rd=request_rd,
-            md_od_clarity=True,
+            md_od_clarity=md_od_clarity,
         ):
+            _register_pending_approval(wa_id, rid)
             return True
 
     if _approval_uses_template(request_rd):
@@ -960,9 +966,8 @@ def send_approval_buttons(
             request_id=rid,
             request_rd=request_rd,
         ):
+            _register_pending_approval(wa_id, rid)
             return True
-
-    if _approval_uses_template(request_rd):
         logger.warning(
             "approval template failed for %s request_id=%s to=%s — trying session buttons",
             req_type,
@@ -982,24 +987,97 @@ def send_approval_buttons(
         )
         return False
 
-    return _send_session_approval_buttons(
+    if _send_session_approval_buttons(
         wa_id,
         employee_name=employee_name,
         department=department,
         reason=reason,
         request_id=rid,
         request_rd=request_rd,
-        md_od_clarity=False,
+        md_od_clarity=md_od_clarity,
+    ):
+        _register_pending_approval(wa_id, rid)
+        return True
+    return False
+
+
+_MAX_PENDING_APPROVALS = 40
+_APPROVAL_MSG_REF_COLLECTION = "approval_message_refs"
+
+
+def _extract_api_message_id(resp: object) -> str:
+    if not isinstance(resp, dict):
+        return ""
+    for key in ("id", "message_id", "messageId", "wamid"):
+        val = resp.get(key)
+        if val:
+            return str(val).strip()
+    for container_key in ("data", "message", "result"):
+        nested = resp.get(container_key)
+        if isinstance(nested, dict):
+            mid = _extract_api_message_id(nested)
+            if mid:
+                return mid
+    return ""
+
+
+def _store_approval_message_ref(approver_wa: str, request_id: str, api_response: object) -> None:
+    """Map outbound WhatsApp message id → request id (for template button replies)."""
+    d = _require()
+    rid = (request_id or "").strip()
+    mid = _extract_api_message_id(api_response)
+    if not rid or not mid:
+        return
+    try:
+        d.db.collection(_APPROVAL_MSG_REF_COLLECTION).document(mid[:1500]).set({
+            "request_id": rid,
+            "approver": approver_wa,
+            "created_at": d.utcnow(),
+        })
+    except Exception:
+        logger.exception("approval message ref store failed mid=%s request_id=%s", mid, rid)
+
+
+def lookup_approval_request_from_message_id(message_id: str) -> str:
+    d = _require()
+    mid = (message_id or "").strip()
+    if not mid:
+        return ""
+    try:
+        snap = d.db.collection(_APPROVAL_MSG_REF_COLLECTION).document(mid[:1500]).get()
+        if snap.exists:
+            return normalize_callback_request_id(
+                (snap.to_dict() or {}).get("request_id") or ""
+            )
+    except Exception:
+        logger.exception("approval message ref lookup failed mid=%s", mid)
+    return ""
+
+
+def _register_pending_approval(recipient: str, request_id: str) -> None:
+    """Track all open approval messages for this approver (not only the latest)."""
+    d = _require()
+    rid = (request_id or "").strip()
+    if not rid:
+        return
+    snap = d.session_ref(recipient).get()
+    data = snap.to_dict() if snap.exists else {}
+    pending = [str(x).strip() for x in (data.get("pending_approval_ids") or []) if str(x).strip()]
+    if rid in pending:
+        pending.remove(rid)
+    pending.append(rid)
+    if len(pending) > _MAX_PENDING_APPROVALS:
+        pending = pending[-_MAX_PENDING_APPROVALS:]
+    d.session_merge(
+        recipient,
+        state="WAITING_APPROVAL_ACTION",
+        approval_request_id=rid,
+        pending_approval_ids=pending,
     )
 
 
 def _set_pending_approval(recipient: str, request_id: str) -> None:
-    d = _require()
-    d.session_merge(
-        recipient,
-        state="WAITING_APPROVAL_ACTION",
-        approval_request_id=request_id,
-    )
+    _register_pending_approval(recipient, request_id)
 
 
 def _approval_button_action(raw: str) -> bool | None:
@@ -1018,14 +1096,25 @@ def _is_manage_label(raw: str) -> bool:
 
 
 def _pending_approval_request_id(approver: str) -> str:
+    pending = _pending_approval_request_ids(approver)
+    return pending[-1] if pending else ""
+
+
+def _pending_approval_request_ids(approver: str) -> list[str]:
     d = _require()
     snap = d.session_ref(approver).get()
     if not snap.exists:
-        return ""
+        return []
     data = snap.to_dict() or {}
     if data.get("state") != "WAITING_APPROVAL_ACTION":
-        return ""
-    return (data.get("approval_request_id") or "").strip()
+        return []
+    raw_list = data.get("pending_approval_ids")
+    if isinstance(raw_list, list) and raw_list:
+        out = [str(x).strip() for x in raw_list if str(x).strip()]
+        if out:
+            return out
+    legacy = (data.get("approval_request_id") or "").strip()
+    return [legacy] if legacy else []
 
 
 def resolve_approval(
@@ -1034,33 +1123,66 @@ def resolve_approval(
     *,
     callback_request_id: str = "",
 ):
-    d = _require()
     raw = (incoming or "").strip()
     upper = raw.upper()
-    cb_rid = (callback_request_id or "").strip()
+    cb_rid = normalize_callback_request_id(callback_request_id)
 
     if upper.startswith("APPROVE_"):
-        rid = raw.split("_", 1)[1].strip()
+        rid = normalize_callback_request_id(raw.split("_", 1)[1].strip())
         return (True, rid) if rid else (None, None)
     if upper.startswith("DENY_"):
-        rid = raw.split("_", 1)[1].strip()
+        rid = normalize_callback_request_id(raw.split("_", 1)[1].strip())
         return (False, rid) if rid else (None, None)
 
     action = _approval_button_action(raw)
     if cb_rid and action is not None:
         return action, cb_rid
 
-    if upper in ("APPROVE", "DENY"):
-        rid = _pending_approval_request_id(approver)
-        if rid:
-            return upper == "APPROVE", rid
-
-    if action is not None:
-        rid = _pending_approval_request_id(approver)
-        if rid:
-            return action, rid
+    pending = _pending_approval_request_ids(approver)
+    if action is not None or upper in ("APPROVE", "DENY"):
+        approve = action if action is not None else upper == "APPROVE"
+        if len(pending) == 1:
+            return approve, pending[0]
+        if len(pending) > 1:
+            logger.warning(
+                "ambiguous approval sender=%s incoming=%s pending=%s callback=%s",
+                approver,
+                raw,
+                len(pending),
+                cb_rid or "(none)",
+            )
+        return None, None
 
     return None, None
+
+
+def try_notify_ambiguous_approval(
+    sender: str,
+    incoming: str,
+    *,
+    callback_request_id: str = "",
+) -> bool:
+    """Tell approver when Approve/Deny could not be matched to one request."""
+    if _approval_button_action(incoming) is None:
+        return False
+    if resolve_approval(incoming, sender, callback_request_id=callback_request_id)[0] is not None:
+        return False
+    d = _require()
+    pending = _pending_approval_request_ids(sender)
+    if len(pending) > 1:
+        d.send_to(
+            sender,
+            "You have several pending approvals. Tap Approve on each request message "
+            "(do not type Approve). Handle oldest first.",
+        )
+        return True
+    if not normalize_callback_request_id(callback_request_id) and pending:
+        d.send_to(
+            sender,
+            "Could not match this approval. Tap the Approve button on that request message.",
+        )
+        return True
+    return False
 
 
 def resolve_leave_manage_request_id(
@@ -2159,6 +2281,11 @@ def handle_approval_gate(
             request_id,
             rd.get("jmd_status"),
             rd.get("md_status"),
+        )
+        d.send_to(
+            sender,
+            "This approval could not be applied (wrong approver step or already handled). "
+            "JMD must approve before MD.",
         )
         return True
 
