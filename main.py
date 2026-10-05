@@ -9,6 +9,7 @@ Request flows live in separate modules:
   - it_request.py
   - vehicle_request.py
   - maintenance_request.py
+  - tool_breakdown_request.py
   - approval.py (shared JMD → MD)
 """
 
@@ -37,6 +38,7 @@ import it_request
 import leave_request
 import vehicle_request
 import maintenance_request
+import tool_breakdown_request
 import od_request
 import permission_request
 import visitor_request
@@ -173,6 +175,11 @@ _ROW_IDS = {
     "maintenance_-_manage": "MAINTENANCE_MANAGE",
     "maintenance_list": "MAINTENANCE_LIST",
     "maintenance_-_list": "MAINTENANCE_LIST",
+    "tool_breakdown_form": "TOOL_BREAKDOWN_FORM",
+    "tool_-_breakdown_form": "TOOL_BREAKDOWN_FORM",
+    "tool_breakdown": "TOOL_BREAKDOWN_FORM",
+    "tool_breakdown_list": "TOOL_BREAKDOWN_LIST",
+    "tool_-_breakdown_list": "TOOL_BREAKDOWN_LIST",
     "unit_i": "UNIT_I",
     "unit_ii": "UNIT_II",
     "unit_1": "UNIT_I",
@@ -506,6 +513,18 @@ MAINTENANCE_DEPS = maintenance_request.MaintenanceDeps(
     has_active_whatsapp_session=_has_active_whatsapp_session,
 )
 
+TOOL_BREAKDOWN_DEPS = tool_breakdown_request.ToolBreakdownDeps(
+    db=db,
+    send_to=_send_to,
+    session_merge=_session_merge,
+    session_ref=_session_ref,
+    utcnow=_utcnow,
+    clear_session=lambda sender: _session_ref(sender).delete(),
+    go_main_menu=_go_main_menu_for_employee,
+    same_whatsapp=_same_whatsapp,
+    has_active_whatsapp_session=_has_active_whatsapp_session,
+)
+
 
 def _request_menu_items(
     user_data: dict | None, wa_id: str = ""
@@ -527,6 +546,14 @@ def _request_menu_items(
     if maintenance_request.show_maintenance_list_menu(wa_id, _same_whatsapp, user_data):
         items.append(
             (str(len(items) + 1), "maintenance_list", "Maintenance - List")
+        )
+    if tool_breakdown_request.show_tool_breakdown_menu_for_user(user_data):
+        items.append(
+            (str(len(items) + 1), "tool_breakdown_form", "Tool - Breakdown")
+        )
+    if tool_breakdown_request.show_tool_breakdown_list_menu(wa_id, _same_whatsapp):
+        items.append(
+            (str(len(items) + 1), "tool_breakdown_list", "Tool - Breakdown List")
         )
     if vehicle_request.show_vehicle_menu_for_user(
         user_data, wa_id, _same_whatsapp
@@ -712,6 +739,11 @@ def _normalize_choice(raw: str) -> str:
         "maintenance manage": "MAINTENANCE_MANAGE",
         "maintenance - list": "MAINTENANCE_LIST",
         "maintenance list": "MAINTENANCE_LIST",
+        "tool - breakdown": "TOOL_BREAKDOWN_FORM",
+        "tool breakdown": "TOOL_BREAKDOWN_FORM",
+        "tool - breakdown form": "TOOL_BREAKDOWN_FORM",
+        "tool - breakdown list": "TOOL_BREAKDOWN_LIST",
+        "tool breakdown list": "TOOL_BREAKDOWN_LIST",
     }
     return titles.get(s.lower(), s)
 
@@ -841,6 +873,12 @@ def _flow_callback_kind(body: dict) -> str:
         return "it-flow"
     if callback in ("maintenance-flow", "maintenance_form", "maintenance"):
         return "maintenance-flow"
+    if callback in (
+        "tool-breakdown-flow",
+        "tool_breakdown_form",
+        "tool_breakdown",
+    ):
+        return "tool-breakdown-flow"
     if callback in ("vehicle-request-flow", "vehicle_request_form", "vehicle_request"):
         return "vehicle-request-flow"
     return callback
@@ -857,6 +895,7 @@ def _is_flow_reply_webhook(body: dict) -> bool:
         "permission-flow",
         "it-flow",
         "maintenance-flow",
+        "tool-breakdown-flow",
         "vehicle-request-flow",
     ):
         return True
@@ -1108,6 +1147,8 @@ def _parse_flow_webhook(body: dict) -> tuple[str, dict | str, str] | None:
             callback = "permission-flow"
         elif keys & {"it_category", "issue_type"}:
             callback = "it-flow"
+        elif keys & {"tool_name", "line_stop_threat"}:
+            callback = "tool-breakdown-flow"
         elif keys & {"machine_type", "machine_no", "issue_category"}:
             callback = "maintenance-flow"
         elif keys & {"request_type", "destination_category", "load_size"}:
@@ -1278,6 +1319,22 @@ def _process(
     ):
         return
 
+    if tool_breakdown_request.handle_tool_breakdown_list_gate(
+        sender,
+        incoming,
+        TOOL_BREAKDOWN_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if tool_breakdown_request.handle_tool_breakdown_tool_room_close_gate(
+        sender,
+        incoming,
+        TOOL_BREAKDOWN_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
     if vehicle_request.handle_assignee_gate(sender, incoming, VEHICLE_REQUEST_DEPS):
         return
 
@@ -1293,6 +1350,14 @@ def _process(
         sender,
         incoming,
         MAINTENANCE_DEPS,
+        callback_request_id=callback_request_id,
+    ):
+        return
+
+    if tool_breakdown_request.handle_tool_breakdown_manager_gate(
+        sender,
+        incoming,
+        TOOL_BREAKDOWN_DEPS,
         callback_request_id=callback_request_id,
     ):
         return
@@ -1387,6 +1452,36 @@ def _process(
         _send_to(
             sender,
             "Tap Assign on the maintenance ticket, or use Maintenance - List.",
+        )
+        return
+
+    if tool_breakdown_request.is_tool_breakdown_tool_room_close_state(state):
+        if tool_breakdown_request.handle_tool_breakdown_tool_room_close_input(
+            sender,
+            incoming,
+            session or {},
+            TOOL_BREAKDOWN_DEPS,
+            callback_request_id=callback_request_id,
+        ):
+            return
+        _send_to(
+            sender,
+            "Tap Closed on the Tool Breakdown ticket, or use Tool - Breakdown List.",
+        )
+        return
+
+    if tool_breakdown_request.is_tool_breakdown_manager_priority_state(state):
+        if tool_breakdown_request.handle_tool_breakdown_manager_priority_input(
+            sender,
+            incoming,
+            session or {},
+            TOOL_BREAKDOWN_DEPS,
+            callback_request_id=callback_request_id,
+        ):
+            return
+        _send_to(
+            sender,
+            "Tap High, Medium, or Low on the Tool Breakdown ticket.",
         )
         return
 
@@ -1501,6 +1596,12 @@ def _process(
             maintenance_request.try_start_maintenance_list(sender, MAINTENANCE_DEPS)
         elif menu_form == "MAINTENANCE_LIST":
             maintenance_request.try_start_maintenance_list(sender, MAINTENANCE_DEPS)
+        elif menu_form == "TOOL_BREAKDOWN_FORM":
+            tool_breakdown_request.try_start_form(sender, TOOL_BREAKDOWN_DEPS)
+        elif menu_form == "TOOL_BREAKDOWN_LIST":
+            tool_breakdown_request.try_start_tool_breakdown_list(
+                sender, TOOL_BREAKDOWN_DEPS
+            )
         elif menu_form == "VEHICLE_MANAGE":
             vehicle_request.try_start_manage(sender, VEHICLE_REQUEST_DEPS)
         elif menu_form == "VEHICLE_REQUEST_FORM":
@@ -1595,6 +1696,8 @@ def health():
         "vehicle_request_flow_template": vehicle_request.vehicle_request_flow_template_name(),
         "maintenance_form_configured": maintenance_request.maintenance_flow_enabled(),
         "maintenance_flow_template": maintenance_request.maintenance_flow_template_name(),
+        "tool_breakdown_form_configured": tool_breakdown_request.tool_breakdown_flow_enabled(),
+        "tool_breakdown_flow_template": tool_breakdown_request.tool_breakdown_flow_template_name(),
     }
 
 
@@ -1702,6 +1805,24 @@ async def webhook(request: Request):
                     )
                 except Exception:
                     logger.exception("could not notify user after maintenance flow error")
+        elif flow_kind in (
+            "tool-breakdown-flow",
+            "tool_breakdown_form",
+            "tool_breakdown",
+        ):
+            try:
+                tool_breakdown_request.handle_flow_submission(
+                    sender, response_json, TOOL_BREAKDOWN_DEPS
+                )
+            except Exception:
+                logger.exception("tool breakdown flow submit failed sender=%s", sender)
+                try:
+                    _send_to(
+                        sender,
+                        "Sorry, we could not save your Tool Breakdown form. Please send Hi and try again.",
+                    )
+                except Exception:
+                    logger.exception("could not notify user after tool breakdown flow error")
         elif flow_kind == "flow" and isinstance(response_json, dict):
             keys = {str(k).lower() for k in response_json.keys()}
             if keys & {"od_reason", "company_vehicle", "vehicle"}:
@@ -1730,6 +1851,13 @@ async def webhook(request: Request):
                     it_request.handle_flow_submission(sender, response_json, IT_DEPS)
                 except Exception:
                     logger.exception("IT flow submit failed sender=%s", sender)
+            elif keys & {"tool_name", "line_stop_threat"}:
+                try:
+                    tool_breakdown_request.handle_flow_submission(
+                        sender, response_json, TOOL_BREAKDOWN_DEPS
+                    )
+                except Exception:
+                    logger.exception("tool breakdown flow submit failed sender=%s", sender)
             elif keys & {"machine_type", "machine_no", "issue_category"}:
                 try:
                     maintenance_request.handle_flow_submission(

@@ -40,6 +40,10 @@ $modules = @(
 
     "maintenance_request.py",
 
+    "tool_breakdown_request.py",
+
+    "tool_breakdown_data.py",
+
     "maintenance_data.py",
 
     "it_flow_media.py",

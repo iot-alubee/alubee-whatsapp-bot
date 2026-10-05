@@ -1144,13 +1144,17 @@ def resolve_approval(
         if len(pending) == 1:
             return approve, pending[0]
         if len(pending) > 1:
+            # Button text is only "Approve"/"Deny". When the request id is missing,
+            # apply it to the oldest open ticket instead of rejecting the tap.
             logger.warning(
-                "ambiguous approval sender=%s incoming=%s pending=%s callback=%s",
+                "approval without request id; using oldest sender=%s incoming=%s "
+                "pending=%s request_id=%s",
                 approver,
                 raw,
                 len(pending),
-                cb_rid or "(none)",
+                pending[0],
             )
+            return approve, pending[0]
         return None, None
 
     return None, None
@@ -1170,12 +1174,7 @@ def try_notify_ambiguous_approval(
     d = _require()
     pending = _pending_approval_request_ids(sender)
     if len(pending) > 1:
-        d.send_to(
-            sender,
-            "You have several pending approvals. Tap Approve on each request message "
-            "(do not type Approve). Handle oldest first.",
-        )
-        return True
+        return False
     if not normalize_callback_request_id(callback_request_id) and pending:
         d.send_to(
             sender,

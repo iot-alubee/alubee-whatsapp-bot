@@ -724,6 +724,64 @@ def send_maintenance_flow_form(
         return False
 
 
+def send_tool_breakdown_flow_form(
+    phone: str,
+    *,
+    employee_name: str = "",
+    body_values: list[str] | None = None,
+    department: str = "",
+    jmd_route: str = "",
+) -> bool:
+    """Send Tool Breakdown WhatsApp Form (env TOOL_BREAKDOWN_FLOW_TEMPLATE_NAME)."""
+    template_name = (os.getenv("TOOL_BREAKDOWN_FLOW_TEMPLATE_NAME") or "").strip()
+    if not template_name:
+        logger.warning(
+            "TOOL_BREAKDOWN_FLOW_TEMPLATE_NAME not set — cannot send tool breakdown form"
+        )
+        return False
+    lang = (os.getenv("TOOL_BREAKDOWN_FLOW_TEMPLATE_LANGUAGE_CODE") or "en").strip()
+    if body_values is None:
+        spec = (os.getenv("TOOL_BREAKDOWN_FLOW_TEMPLATE_BODY_FIELDS") or "name").strip()
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        vals = {"name": (employee_name or "Employee")[:50]}
+        body_values = [str(vals.get(k, ""))[:1024] for k in keys] if keys else None
+    phone_10 = phone_to_10(phone)
+    dept_key = (department or "").strip().upper()
+    if dept_key == "FET":
+        dept_key = "FETTLING"
+    route_raw = (jmd_route or "").strip().upper()
+    if route_raw in ("JMD1", "UNIT_I", "UNIT1", "UNIT-1", "UNIT 1"):
+        route_key = "jmd1"
+    elif route_raw in ("JMD2", "UNIT_II", "UNIT2", "UNIT-2", "UNIT 2"):
+        route_key = "jmd2"
+    else:
+        route_key = route_raw.lower()
+    if dept_key in ("PDC", "FETTLING", "SECONDARY") and route_key in ("jmd1", "jmd2"):
+        flow_token = f"tool_breakdown_{phone_10}_{dept_key.lower()}_{route_key}"[:256]
+    else:
+        flow_token = f"tool_breakdown_{phone_10}"[:256]
+    try:
+        send_flow_template(
+            phone,
+            template_name,
+            language_code=lang,
+            body_values=body_values,
+            callback_data="tool-breakdown-flow",
+            flow_token=flow_token,
+            ensure_contact=True,
+            contact_name=(employee_name or "Employee")[:50],
+        )
+        logger.info(
+            "tool breakdown flow template sent phone=%s template=%s",
+            phone_to_10(phone),
+            template_name,
+        )
+        return True
+    except Exception:
+        logger.exception("tool breakdown flow template failed phone=%s", phone_to_10(phone))
+        return False
+
+
 def send_visitor_flow_form(
     phone: str,
     *,
