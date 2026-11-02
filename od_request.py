@@ -298,27 +298,15 @@ def _find_open_od_for_employee(deps: OdDeps, employee: str) -> dict | None:
     return None
 
 
-def _vehicles_out_ids(deps: OdDeps):
-    from bot_shared import query_requests_by_type
-
-    out = set()
-    for snap in query_requests_by_type(deps.db, "OD"):
-        d = snap.to_dict() or {}
-        vid = (d.get("company_vehicle_id") or "").strip().upper()
-        if vid and d.get("security_out_at") and not d.get("security_in_at"):
-            out.add(vid)
-    return out
-
-
 def _fetch_vehicles(deps: OdDeps):
-    out_ids = _vehicles_out_ids(deps)
+    """All active vehicles, including ones already out on another OD."""
     available = []
     for snap in deps.db.collection("vehicles").stream():
         d = snap.to_dict() or {}
         if d.get("active") is False:
             continue
         vid = (d.get("vehicle_id") or snap.id or "").strip().upper()
-        if not vid or vid in out_ids:
+        if not vid:
             continue
         available.append({
             "vehicle_id": vid,

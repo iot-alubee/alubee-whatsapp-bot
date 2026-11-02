@@ -703,21 +703,56 @@ def _estimated_distance_km(category: str, destination: str) -> int | None:
     return DESTINATION_DISTANCE_KM.get(dest_id)
 
 
-def _logistics_manager_wa() -> str:
-    raw = (
-        os.getenv("LOGISTICS_MANAGER_WHATSAPP_NUMBER")
-        or os.getenv("VEHICLE_REQUEST_NOTIFY_WHATSAPP_NUMBER")
-        or os.getenv("LOGISTICS_WHATSAPP_NUMBER")
-        or ""
-    ).strip()
+def _logistics_manager_wa(from_unit: str = "") -> str:
+    """Unit I / Unit II logistics manager. Falls back to legacy single-manager env."""
+    unit = _normalize_from_unit(from_unit)
+    if unit == "unit_ii":
+        raw = (
+            os.getenv("LOGISTICS_MANAGER_UNIT_II_WHATSAPP_NUMBER")
+            or os.getenv("LOGISTICS_MANAGER_2_WHATSAPP_NUMBER")
+            or ""
+        ).strip()
+    else:
+        # unit_i / blank → Unit I (legacy single number still maps here)
+        raw = (
+            os.getenv("LOGISTICS_MANAGER_UNIT_I_WHATSAPP_NUMBER")
+            or os.getenv("LOGISTICS_MANAGER_1_WHATSAPP_NUMBER")
+            or os.getenv("LOGISTICS_MANAGER_WHATSAPP_NUMBER")
+            or os.getenv("VEHICLE_REQUEST_NOTIFY_WHATSAPP_NUMBER")
+            or os.getenv("LOGISTICS_WHATSAPP_NUMBER")
+            or ""
+        ).strip()
     if not raw:
         return ""
     return wa_from_10(wa_id_to_phone(raw)[-10:])
 
 
+def _manager_from_unit_for_sender(
+    sender: str, same_whatsapp: Callable[[str, str], bool]
+) -> str:
+    if same_whatsapp(sender, _logistics_manager_wa("unit_i")):
+        return "unit_i"
+    if same_whatsapp(sender, _logistics_manager_wa("unit_ii")):
+        return "unit_ii"
+    return ""
+
+
 def is_logistics_manager(sender: str, same_whatsapp: Callable[[str, str], bool]) -> bool:
-    mgr = _logistics_manager_wa()
-    return bool(mgr and same_whatsapp(sender, mgr))
+    return bool(_manager_from_unit_for_sender(sender, same_whatsapp))
+
+
+def _request_from_unit(rd: dict) -> str:
+    return _normalize_from_unit(rd.get("from_unit") or "")
+
+
+def _manager_owns_request(
+    sender: str, rd: dict, same_whatsapp: Callable[[str, str], bool]
+) -> bool:
+    mgr_unit = _manager_from_unit_for_sender(sender, same_whatsapp)
+    req_unit = _request_from_unit(rd)
+    if not mgr_unit or not req_unit:
+        return False
+    return mgr_unit == req_unit
 
 
 def find_open_vehicle_request(employee: str, db: object) -> tuple[str, dict] | None:
@@ -914,10 +949,12 @@ def _template_body_values(rd: dict) -> list[str]:
 
 
 def _notify_logistics_manager(deps: VehicleRequestDeps, rd: dict, request_id: str) -> None:
-    mgr = _logistics_manager_wa()
+    from_unit = _request_from_unit(rd)
+    mgr = _logistics_manager_wa(from_unit)
     if not mgr:
         logger.warning(
-            "LOGISTICS_MANAGER_WHATSAPP_NUMBER not set — skip vehicle request notify"
+            "logistics manager WA not set for from_unit=%s — skip vehicle request notify",
+            from_unit or "(blank)",
         )
         return
 
@@ -1732,12 +1769,24 @@ def handle_logistics_manager_gate(
     return False
 
 
+def _reject_other_unit_request(
+    sender: str, rd: dict, deps: VehicleRequestDeps
+) -> bool:
+    """True if sender was told this ticket belongs to the other unit."""
+    if _manager_owns_request(sender, rd, deps.same_whatsapp):
+        return False
+    deps.send_to(sender, "This request belongs to the other unit.")
+    return True
+
+
 def _handle_assign_click(sender: str, request_id: str, deps: VehicleRequestDeps) -> bool:
     loaded = _load_request(deps.db, request_id)
     if not loaded:
         deps.send_to(sender, "Vehicle request not found.")
         return True
     _ref, rd = loaded
+    if _reject_other_unit_request(sender, rd, deps):
+        return True
     if _request_status(rd) != "PENDING":
         deps.send_to(sender, f"Request already {_request_status(rd).lower()}.")
         return True
@@ -1751,6 +1800,8 @@ def _handle_cancel_click(sender: str, request_id: str, deps: VehicleRequestDeps)
         deps.send_to(sender, "Vehicle request not found.")
         return True
     ref, rd = loaded
+    if _reject_other_unit_request(sender, rd, deps):
+        return True
     status = _request_status(rd)
     if status != "PENDING":
         deps.send_to(sender, f"Request already {status.lower()}.")
@@ -1918,9 +1969,12 @@ def handle_vehicle_fleet_pick(
     )
 
 
-def _fetch_today_vehicle_requests(db: object) -> list[tuple[str, dict]]:
+def _fetch_today_vehicle_requests(
+    db: object, *, from_unit: str = ""
+) -> list[tuple[str, dict]]:
     """Today's vehicle requests with status Assigned (Manage list)."""
     today = _ist_now().date()
+    want_unit = _normalize_from_unit(from_unit) if from_unit else ""
     rows: list[tuple[str, dict]] = []
     try:
         snaps = db.collection("requests").where("type", "==", "VEHICLE_REQUEST").stream()
@@ -1932,6 +1986,8 @@ def _fetch_today_vehicle_requests(db: object) -> list[tuple[str, dict]]:
         if _request_status(rd) != "ASSIGNED":
             continue
         if not _request_on_ist_day(rd, today):
+            continue
+        if want_unit and _request_from_unit(rd) != want_unit:
             continue
         rows.append((snap.id, rd))
     rows.sort(
@@ -1945,11 +2001,13 @@ def try_start_manage(sender: str, deps: VehicleRequestDeps) -> None:
     if not is_logistics_manager(sender, deps.same_whatsapp):
         deps.send_to(sender, "Not authorized.")
         return
-    rows = _fetch_today_vehicle_requests(deps.db)
+    mgr_unit = _manager_from_unit_for_sender(sender, deps.same_whatsapp)
+    rows = _fetch_today_vehicle_requests(deps.db, from_unit=mgr_unit)
     if not rows:
+        unit_label = FROM_UNIT_LABELS.get(mgr_unit, "your unit")
         deps.send_to(
             sender,
-            "No assigned vehicle requests for today.\n"
+            f"No assigned vehicle requests for today ({unit_label}).\n"
             "New requests will arrive here with Assign / Cancel buttons.",
         )
         return
@@ -2045,6 +2103,8 @@ def handle_manager_manage_gate(
             deps.send_to(sender, "Vehicle request not found.")
             return True
         _ref, rd = loaded
+        if _reject_other_unit_request(sender, rd, deps):
+            return True
         _send_manage_actions(sender, deps, request_id, rd)
         return True
 
@@ -2122,6 +2182,8 @@ def _handle_manage_cancel(
         deps.send_to(sender, "Vehicle request not found.")
         return True
     ref, rd = loaded
+    if _reject_other_unit_request(sender, rd, deps):
+        return True
     if _trip_started(rd):
         deps.send_to(
             sender,
@@ -2170,6 +2232,8 @@ def _handle_manage_reassign_click(
         deps.send_to(sender, "Vehicle request not found.")
         return True
     _ref, rd = loaded
+    if _reject_other_unit_request(sender, rd, deps):
+        return True
     if _trip_started(rd):
         deps.send_to(
             sender,
