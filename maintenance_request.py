@@ -59,7 +59,6 @@ _PDC_ASSIGNEES: tuple[tuple[str, str], ...] = (
 _CNC_FET_SEC_ASSIGNEES: tuple[tuple[str, str], ...] = (
     ("adc012", "MURUGESAN"),
     ("adc093", "KANDAN"),
-    ("sri079", "MANIKANDAN C"),
 )
 
 UNSUPPORTED_DEPT_MSG = (

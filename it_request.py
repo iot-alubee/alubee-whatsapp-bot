@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _IST = ZoneInfo("Asia/Kolkata")
 
+# Slot order: 1 Dinesh S, 2 Manikandan C, 3 Ajay Senthilkumar
 IT_ENGINEER_PHONES: tuple[str, ...] = (
     "9994246682",
     "7339221730",
